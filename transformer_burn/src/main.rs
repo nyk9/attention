@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 mod config;
 mod data;
 mod model;
@@ -5,8 +6,6 @@ mod vocabulary;
 
 use crate::config::{BATCH_SIZE, SEQ_LEN};
 use burn::backend::Autodiff;
-use burn::backend::NdArray;
-use burn::backend::ndarray::NdArrayDevice;
 use burn::backend::wgpu::{Wgpu, WgpuDevice};
 use burn::optim::GradientsParams;
 use burn::optim::{AdamConfig, Optimizer};
@@ -17,8 +16,8 @@ use std::time::Instant;
 
 // 推論用バックエンド（GPU）
 type InferenceBackend = Wgpu;
-// 訓練用バックエンド（CPU、安定した訓練）
-type TrainingBackend = Autodiff<NdArray>;
+// 訓練用バックエンド（GPU, 高速訓練）
+type TrainingBackend = Autodiff<Wgpu>;
 
 fn generate_text(
     model: &model::TransformerModel<TrainingBackend>,
@@ -150,7 +149,7 @@ fn main() {
     println!("\n===== 訓練開始 =====");
 
     // 訓練用デバイス（CPU、Autodiff対応）
-    let training_device = NdArrayDevice::default();
+    let training_device = WgpuDevice::default();
 
     // 訓練用モデルを初期化
     let training_model = model::TransformerModel::<TrainingBackend>::new(&training_device);

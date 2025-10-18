@@ -12,3 +12,8 @@ pub const PAD_TOKEN: usize = 99; // パディングトークン
 pub const LEARNING_RATE: f64 = 0.0005; // 学習率
 pub const EPOCHS: usize = 10; // エポック数（動作確認用に一時的に削減）
 pub const BATCH_SIZE: usize = 128; // バッチサイズ
+
+// JSL（日本語→手話タグ翻訳）用設定
+pub const JSL_VOCAB_SIZE: usize = 79; // タグの種類数（78タグ + PAD）
+pub const JSL_SEQ_LEN: usize = 5; // 最大タグ数
+pub const JSL_PAD_TOKEN: usize = 78; // JSL用パディングトークン

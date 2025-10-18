@@ -1,6 +1,8 @@
 #![recursion_limit = "256"]
 mod config;
 mod data;
+mod jsl_data;
+mod jsl_vocabulary;
 mod model;
 mod vocabulary;
 
@@ -127,6 +129,28 @@ fn train(
 
 fn main() {
     let start_time = Instant::now();
+
+    // ===== JSL（日本語→手話タグ翻訳）の動作確認 =====
+    println!("===== JSL語彙とデータローダーの動作確認 =====");
+
+    let jsl_vocab = jsl_vocabulary::JslVocabulary::new();
+    println!("JSL語彙サイズ: {}", jsl_vocab.vocab_size);
+    println!("タグ開始ID: {}", jsl_vocab.tag_start_id);
+
+    // エンコード・デコードのテスト
+    let test_combined = "私は食べます<私><食べる>";
+    let encoded = jsl_vocab.encode(test_combined);
+    let decoded = jsl_vocab.decode(&encoded);
+    println!("\nエンコード・デコードテスト:");
+    println!("入力: {}", test_combined);
+    println!("エンコード: {:?}", encoded);
+    println!("デコード: {}", decoded);
+
+    // JSL訓練データのロード
+    let jsl_data = jsl_data::JslTrainingData::load(&jsl_vocab, "data/training_data_jsl.txt");
+    println!("\nJSL訓練データ準備完了: {}サンプル", jsl_data.len());
+
+    println!("\n===== 文字予測モデルの訓練に戻ります =====\n");
 
     // デバイス初期化
     // let device: WgpuDevice = Default::default();

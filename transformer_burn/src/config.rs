@@ -11,4 +11,4 @@ pub const PAD_TOKEN: usize = 99; // パディングトークン
 // 訓練設定
 pub const LEARNING_RATE: f64 = 0.0005; // 学習率
 pub const EPOCHS: usize = 10; // エポック数（動作確認用に一時的に削減）
-pub const BATCH_SIZE: usize = 32; // バッチサイズ
+pub const BATCH_SIZE: usize = 128; // バッチサイズ

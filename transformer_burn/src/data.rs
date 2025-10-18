@@ -40,4 +40,22 @@ impl TrainingData {
     pub fn len(&self) -> usize {
         self.samples.len()
     }
+
+    pub fn batches(&self, batch_size: usize) -> Vec<(Vec<Vec<i32>>, Vec<i32>)> {
+        let mut batches = Vec::new();
+
+        for chunk in self.samples.chunks(batch_size) {
+            let mut batch_inputs = Vec::new();
+            let mut batch_targets = Vec::new();
+
+            for (input, target) in chunk {
+                batch_inputs.push(input.clone());
+                batch_targets.push(*target);
+            }
+
+            batches.push((batch_inputs, batch_targets));
+        }
+
+        batches
+    }
 }

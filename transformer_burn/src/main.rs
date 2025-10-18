@@ -3,7 +3,7 @@ mod data;
 mod model;
 mod vocabulary;
 
-use crate::config::SEQ_LEN;
+use crate::config::{BATCH_SIZE, SEQ_LEN};
 use burn::backend::Autodiff;
 use burn::backend::NdArray;
 use burn::backend::ndarray::NdArrayDevice;
@@ -79,30 +79,31 @@ fn train(
         let mut total_loss = 0.0;
         let mut batch_count = 0;
 
-        // 各訓練サンプルを処理
-        for (input_tokens, target_token) in &training_data.samples {
-            // Tensorに変換
+        // バッチごとに処理
+        for (batch_inputs, batch_targets) in training_data.batches(BATCH_SIZE) {
+            let batch_size = batch_inputs.len();
+
+            // Vec<Vec<i32>> を flatten して Tensor に変換
+            let flattened: Vec<i32> = batch_inputs.iter().flatten().copied().collect();
             let input_tensor =
-                Tensor::<TrainingBackend, 1, Int>::from_data(input_tokens.as_slice(), device)
-                    .reshape([1, SEQ_LEN]);
+                Tensor::<TrainingBackend, 1, Int>::from_data(flattened.as_slice(), device)
+                    .reshape([batch_size, SEQ_LEN]);
 
             let target_tensor =
-                Tensor::<TrainingBackend, 1, Int>::from_data([*target_token], device);
+                Tensor::<TrainingBackend, 1, Int>::from_data(batch_targets.as_slice(), device);
 
             // フォワードパス
             let logits = model.forward(input_tensor);
 
-            // logits: [batch=1, seq_len=10, vocab=100]
-            // target_tensor: [1] (次のトークンID)
-            //
-            // ヒント:
-            // 1. logitsから最後のトークン位置の予測を取得 [1, vocab]
+            // logits: [batch_size, seq_len, vocab_size]
+            // 最後のトークン位置を取得:[batch_size, vocab_size]
             let logits_last = logits
-                .slice([0..1, SEQ_LEN - 1..SEQ_LEN, 0..config::VOCAB_SIZE])
-                .reshape([1, config::VOCAB_SIZE]);
-            // 2. CrossEntropyLossを計算
+                .slice([0..batch_size, SEQ_LEN - 1..SEQ_LEN, 0..config::VOCAB_SIZE])
+                .reshape([batch_size, config::VOCAB_SIZE]);
+
+            // CrossEntropyLoss
             let loss = burn::nn::loss::CrossEntropyLoss::new(Some(config::PAD_TOKEN), device)
-                .forward(logits_last, target_tensor); // 仮の実装
+                .forward(logits_last, target_tensor);
 
             // バックプロパゲーション
             let grads = loss.backward();

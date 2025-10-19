@@ -1,15 +1,14 @@
-use crate::jsl_vocabulary::JslVocabulary;
 use crate::config::SEQ_LEN;
+use crate::jsl_vocabulary::JslVocabulary;
 use std::fs;
 
 pub struct JslTrainingData {
-    pub samples: Vec<(Vec<i32>, i32)>, // (入力トークン列, 次トークン)
+    pub samples: Vec<(Vec<i32>, [i32; 5])>, // (入力: 日本語文, 出力: 5タグ位置)
 }
 
 impl JslTrainingData {
     pub fn load(vocab: &JslVocabulary, file_path: &str) -> Self {
-        let content = fs::read_to_string(file_path)
-            .expect("JSL訓練データファイルが読み込めません");
+        let content = fs::read_to_string(file_path).expect("JSL訓練データファイルが読み込めません");
 
         let mut samples = Vec::new();
 
@@ -24,31 +23,53 @@ impl JslTrainingData {
             // タブ区切りで分割：日本語文\tタグ列
             let parts: Vec<&str> = line.split('\t').collect();
             if parts.len() != 2 {
-                eprintln!("Warning: Invalid line format (expected TAB-separated): {}", line);
+                eprintln!(
+                    "Warning: Invalid line format (expected TAB-separated): {}",
+                    line
+                );
                 continue;
             }
 
             let japanese_text = parts[0].trim();
             let tag_sequence = parts[1].trim();
 
-            // 日本語文とタグ列を結合
-            // 例: "私は食べます" + "<私> <食べる>" -> "私は食べます<私><食べる>"
-            let combined = format!("{}{}", japanese_text, tag_sequence.replace(" ", ""));
+            // 日本語文をエンコード（入力シーケンス）
+            let japanese_tokens = vocab.encode(japanese_text);
+            let padded_input = vocab.pad_sequence(&japanese_tokens, SEQ_LEN);
 
-            // トークン化
-            let tokens = vocab.encode(&combined);
+            // タグをスペース区切りで分割し、各タグの最初のIDを取得
+            let tag_ids: Vec<i32> = tag_sequence
+                .split(' ')
+                .filter(|s| !s.is_empty()) // 空文字列を除外
+                .filter_map(|tag| {
+                    let encoded = vocab.encode(tag);
+                    if encoded.is_empty() {
+                        eprintln!("Warning: Empty encoding for tag '{}'", tag);
+                        None
+                    } else {
+                        Some(encoded[0]) // 最初のトークンIDを取得
+                    }
+                })
+                .collect();
 
-            // 次トークン予測のサンプルを生成
-            // 各位置について、前のトークン列から次のトークンを予測
-            for i in 1..tokens.len() {
-                let input = tokens[0..i].to_vec();
-                let target = tokens[i];
-
-                // パディング（config::SEQ_LENを使用）
-                let padded_input = vocab.pad_sequence(&input, SEQ_LEN);
-
-                samples.push((padded_input, target));
+            // 5個を超える場合は警告
+            if tag_ids.len() > 5 {
+                eprintln!(
+                    "Warning: Tag count {} exceeds 5, truncating: {}",
+                    tag_ids.len(),
+                    tag_sequence
+                );
             }
+
+            // 固定5位置の配列を作成
+            let pad_id = (vocab.vocab_size - 1) as i32; // PADトークンID
+            let mut tag_output: [i32; 5] = [pad_id; 5]; // PADで初期化
+
+            for (i, &id) in tag_ids.iter().take(5).enumerate() {
+                tag_output[i] = id;
+            }
+
+            samples.push((padded_input, tag_output));
         }
 
         println!("JSL訓練サンプル数: {}", samples.len());
@@ -60,7 +81,7 @@ impl JslTrainingData {
         self.samples.len()
     }
 
-    pub fn batches(&self, batch_size: usize) -> Vec<(Vec<Vec<i32>>, Vec<i32>)> {
+    pub fn batches(&self, batch_size: usize) -> Vec<(Vec<Vec<i32>>, Vec<[i32; 5]>)> {
         let mut batches = Vec::new();
 
         for chunk in self.samples.chunks(batch_size) {

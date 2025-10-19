@@ -47,21 +47,46 @@ fn train_jsl(
                 Tensor::<TrainingBackend, 1, Int>::from_data(flattened.as_slice(), device)
                     .reshape([batch_size, SEQ_LEN]);
 
+            // Vec<[i32; 5]> を平坦化して [batch_size, 5] のTensorに変換
+            let targets_flat: Vec<i32> = batch_targets.iter().flatten().copied().collect();
             let target_tensor =
-                Tensor::<TrainingBackend, 1, Int>::from_data(batch_targets.as_slice(), device);
+                Tensor::<TrainingBackend, 1, Int>::from_data(targets_flat.as_slice(), device)
+                    .reshape([batch_size, 5]);
 
             // フォワードパス
             let logits = model.forward(input_tensor);
 
-            // logits: [batch_size, seq_len, vocab_size]
-            // 最後のトークン位置を取得:[batch_size, vocab_size]
-            let logits_last = logits
-                .slice([0..batch_size, SEQ_LEN - 1..SEQ_LEN, 0..config::VOCAB_SIZE])
-                .reshape([batch_size, config::VOCAB_SIZE]);
+            // logits: [batch_size, SEQ_LEN, vocab_size]
+            // target_tensor: [batch_size, 5]
+            // 最後の5位置を取得: [batch_size, 5, vocab_size]
+            let logits_last_5 = logits
+                .slice([0..batch_size, SEQ_LEN - 5..SEQ_LEN, 0..config::VOCAB_SIZE])
+                .reshape([batch_size, 5, config::VOCAB_SIZE]);
 
-            // CrossEntropyLoss
-            let loss = burn::nn::loss::CrossEntropyLoss::new(Some(config::PAD_TOKEN), device)
-                .forward(logits_last, target_tensor);
+            // 5タグ位置それぞれで損失を計算して合計
+            let mut total_position_loss = Tensor::<TrainingBackend, 1>::from_data([0.0], device);
+
+            for tag_pos in 0..5 {
+                // 各タグ位置のlogits: [batch_size, vocab_size]
+                let logits_at_pos = logits_last_5
+                    .clone()
+                    .slice([0..batch_size, tag_pos..tag_pos + 1, 0..config::VOCAB_SIZE])
+                    .reshape([batch_size, config::VOCAB_SIZE]);
+
+                // 各タグ位置のターゲット: [batch_size]
+                let targets_at_pos = target_tensor
+                    .clone()
+                    .slice([0..batch_size, tag_pos..tag_pos + 1])
+                    .reshape([batch_size]);
+
+                // CrossEntropyLoss
+                let loss_at_pos = burn::nn::loss::CrossEntropyLoss::new(Some(config::PAD_TOKEN), device)
+                    .forward(logits_at_pos, targets_at_pos);
+
+                total_position_loss = total_position_loss + loss_at_pos;
+            }
+
+            let loss = total_position_loss;
 
             // バックプロパゲーション
             let grads = loss.backward();

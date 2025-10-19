@@ -74,6 +74,7 @@ impl JslVocabulary {
         tokens.push("読む".to_string());
         tokens.push("書く".to_string());
         tokens.push("やる".to_string());
+        tokens.push("いる".to_string());
 
         // 3. 場所関連
         tokens.push("家".to_string());
@@ -282,10 +283,5 @@ impl JslVocabulary {
         }
 
         tags.join(" ")
-    }
-
-    /// PADトークンのIDを返す
-    pub fn pad_token_id(&self) -> usize {
-        self.vocab_size - 1
     }
 }

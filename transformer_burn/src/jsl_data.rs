@@ -1,4 +1,5 @@
 use crate::jsl_vocabulary::JslVocabulary;
+use crate::config::SEQ_LEN;
 use std::fs;
 
 pub struct JslTrainingData {
@@ -43,10 +44,8 @@ impl JslTrainingData {
                 let input = tokens[0..i].to_vec();
                 let target = tokens[i];
 
-                // パディング（SEQ_LENは可変なので、ここでは最大長を決める必要がある）
-                // 今回は日本語文（最大10文字程度）+ タグ（最大5個）= 最大15トークン程度を想定
-                let max_len = 20;
-                let padded_input = vocab.pad_sequence(&input, max_len);
+                // パディング（config::SEQ_LENを使用）
+                let padded_input = vocab.pad_sequence(&input, SEQ_LEN);
 
                 samples.push((padded_input, target));
             }

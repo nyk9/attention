@@ -5,15 +5,10 @@ pub const D_HEAD: usize = D_MODEL / NUM_HEADS; // 各ヘッドの数
 pub const D_FF: usize = D_MODEL * 4; // Feed-forward中間層の次元数
 pub const SEQ_LEN: usize = 10; // シーケンス長
 pub const NUM_LAYERS: usize = 4; // Transformerのレイヤー数
-pub const VOCAB_SIZE: usize = 100; // 単語の種類数
-pub const PAD_TOKEN: usize = 99; // パディングトークン
+pub const VOCAB_SIZE: usize = 165; // 語彙サイズ（JSL: ひらがな86 + タグ78 + PAD 1）
+pub const PAD_TOKEN: usize = 164; // パディングトークン
 
 // 訓練設定
 pub const LEARNING_RATE: f64 = 0.0005; // 学習率
-pub const EPOCHS: usize = 10; // エポック数（動作確認用に一時的に削減）
-pub const BATCH_SIZE: usize = 128; // バッチサイズ
-
-// JSL（日本語→手話タグ翻訳）用設定
-pub const JSL_VOCAB_SIZE: usize = 79; // タグの種類数（78タグ + PAD）
-pub const JSL_SEQ_LEN: usize = 5; // 最大タグ数
-pub const JSL_PAD_TOKEN: usize = 78; // JSL用パディングトークン
+pub const EPOCHS: usize = 100; // エポック数
+pub const BATCH_SIZE: usize = 32; // バッチサイズ

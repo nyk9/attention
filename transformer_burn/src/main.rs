@@ -127,19 +127,37 @@ fn predict_tags(
 
     // 予測
     let output = model.forward(input_tensor);
-    let last_logits = output
-        .slice([0..1, SEQ_LEN - 1..SEQ_LEN, 0..config::VOCAB_SIZE])
-        .reshape([config::VOCAB_SIZE]);
 
-    // 最も確率の高いトークンを取得
-    let predicted_id = last_logits.argmax(0).into_scalar() as usize;
+    // 最後の5位置を取得: [1, 5, vocab_size]
+    let last_5_logits = output
+        .slice([0..1, SEQ_LEN - 5..SEQ_LEN, 0..config::VOCAB_SIZE])
+        .reshape([5, config::VOCAB_SIZE]);
 
-    // タグとして解釈（タグIDのみをデコード）
-    if predicted_id >= vocab.tag_start_id {
-        format!("<{}>", vocab.id_to_token[predicted_id])
-    } else {
-        vocab.id_to_token[predicted_id].clone()
+    // 5タグ位置それぞれで最も確率の高いトークンを取得
+    let mut predicted_tags = Vec::new();
+    let pad_id = vocab.vocab_size - 1;
+
+    for tag_pos in 0..5 {
+        let logits_at_pos = last_5_logits
+            .clone()
+            .slice([tag_pos..tag_pos + 1, 0..config::VOCAB_SIZE])
+            .reshape([config::VOCAB_SIZE]);
+
+        let predicted_id = logits_at_pos.argmax(0).into_scalar() as usize;
+
+        // PADトークンは出力から除外
+        if predicted_id != pad_id {
+            if predicted_id >= vocab.tag_start_id {
+                predicted_tags.push(format!("<{}>", vocab.id_to_token[predicted_id]));
+            } else {
+                // タグ以外の文字が予測された場合（通常は起こらないが念のため）
+                predicted_tags.push(vocab.id_to_token[predicted_id].clone());
+            }
+        }
     }
+
+    // タグをスペース区切りで結合
+    predicted_tags.join(" ")
 }
 
 

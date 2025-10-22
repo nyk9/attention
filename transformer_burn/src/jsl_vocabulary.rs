@@ -5,6 +5,9 @@ pub struct JslVocabulary {
     pub id_to_token: Vec<String>,
     pub vocab_size: usize,
     pub tag_start_id: usize, // タグの開始ID（日本語文字とタグを区別するため）
+    pub sos_id: usize,       // Start of Sequence トークンID
+    pub eos_id: usize,       // End of Sequence トークンID
+    pub pad_id: usize,       // Padding トークンID
 }
 
 impl JslVocabulary {
@@ -145,8 +148,10 @@ impl JslVocabulary {
         tokens.push("週".to_string());
         tokens.push("年".to_string());
 
-        // PADトークン（最後に追加）
-        tokens.push("PAD".to_string());
+        // 特殊トークン（SOS、EOS、PAD）
+        tokens.push("SOS".to_string()); // Start of Sequence
+        tokens.push("EOS".to_string()); // End of Sequence
+        tokens.push("PAD".to_string()); // Padding
 
         // token_to_id の構築
         let mut token_to_id = HashMap::new();
@@ -156,11 +161,19 @@ impl JslVocabulary {
 
         let vocab_size = tokens.len();
 
+        // 特殊トークンのIDを設定
+        let sos_id = vocab_size - 3; // SOS
+        let eos_id = vocab_size - 2; // EOS
+        let pad_id = vocab_size - 1; // PAD
+
         JslVocabulary {
             token_to_id,
             id_to_token: tokens,
             vocab_size,
             tag_start_id,
+            sos_id,
+            eos_id,
+            pad_id,
         }
     }
 
@@ -216,7 +229,7 @@ impl JslVocabulary {
     /// トークンIDのベクトルをPADで埋めてmax_lengthに調整
     pub fn pad_sequence(&self, tokens: &[i32], max_length: usize) -> Vec<i32> {
         let mut padded = tokens.to_vec();
-        let pad_id = self.vocab_size - 1; // PADは最後のID
+        let pad_id = self.pad_id;
 
         // max_lengthに満たない場合はPADで埋める
         while padded.len() < max_length {
@@ -235,7 +248,7 @@ impl JslVocabulary {
     /// 例: [35, 36, 37, 100, 105] -> "私は食<私><食べる>"
     pub fn decode(&self, token_ids: &[i32]) -> String {
         let mut result = String::new();
-        let pad_id = self.vocab_size - 1;
+        let pad_id = self.pad_id;
 
         for &id in token_ids {
             // PADトークンはスキップ
@@ -265,7 +278,7 @@ impl JslVocabulary {
     /// 例: [35, 36, 37, 100, 105] -> "<私> <食べる>"
     pub fn decode_tags_only(&self, token_ids: &[i32]) -> String {
         let mut tags = Vec::new();
-        let pad_id = self.vocab_size - 1;
+        let pad_id = self.pad_id;
 
         for &id in token_ids {
             // PADトークンはスキップ

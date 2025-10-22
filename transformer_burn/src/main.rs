@@ -16,10 +16,11 @@ use std::time::Instant;
 type TrainingBackend = Autodiff<Wgpu>;
 
 fn train_jsl(
-    model: model::TransformerModel<TrainingBackend>,
+    model: model::Seq2SeqModel<TrainingBackend>,
     training_data: &jsl_data::JslTrainingData,
+    vocab: &jsl_vocabulary::JslVocabulary,
     device: &<TrainingBackend as Backend>::Device,
-) -> model::TransformerModel<TrainingBackend> {
+) -> model::Seq2SeqModel<TrainingBackend> {
     use config::{EPOCHS, LEARNING_RATE};
 
     // Adamオプティマイザーの初期化
@@ -38,50 +39,58 @@ fn train_jsl(
         let mut batch_count = 0;
 
         // バッチごとに処理
-        for (batch_inputs, batch_targets) in training_data.batches(BATCH_SIZE) {
+        for (batch_inputs, batch_targets) in training_data.batches(BATCH_SIZE, vocab.pad_id) {
             let batch_size = batch_inputs.len();
+            let target_len = batch_targets[0].len();
 
-            // Vec<Vec<i32>> を flatten して Tensor に変換
-            let flattened: Vec<i32> = batch_inputs.iter().flatten().copied().collect();
-            let input_tensor =
-                Tensor::<TrainingBackend, 1, Int>::from_data(flattened.as_slice(), device)
+            // 入力: Vec<Vec<i32>> を flatten して Tensor に変換
+            let flattened_inputs: Vec<i32> = batch_inputs.iter().flatten().copied().collect();
+            let src_tokens =
+                Tensor::<TrainingBackend, 1, Int>::from_data(flattened_inputs.as_slice(), device)
                     .reshape([batch_size, SEQ_LEN]);
 
-            // Vec<[i32; 5]> を平坦化して [batch_size, 5] のTensorに変換
-            let targets_flat: Vec<i32> = batch_targets.iter().flatten().copied().collect();
-            let target_tensor =
-                Tensor::<TrainingBackend, 1, Int>::from_data(targets_flat.as_slice(), device)
-                    .reshape([batch_size, 5]);
+            // ターゲット: Vec<Vec<i32>> を flatten して Tensor に変換
+            let flattened_targets: Vec<i32> = batch_targets.iter().flatten().copied().collect();
+            let full_target_tensor =
+                Tensor::<TrainingBackend, 1, Int>::from_data(flattened_targets.as_slice(), device)
+                    .reshape([batch_size, target_len]);
+
+            // Teacher Forcing: デコーダー入力は [SOS, tag1, ..., tagN]（EOSを除く）
+            let tgt_input = full_target_tensor
+                .clone()
+                .slice([0..batch_size, 0..target_len - 1]);
+
+            // ターゲット出力は [tag1, ..., tagN, EOS]（SOSを除く）
+            let tgt_output = full_target_tensor
+                .clone()
+                .slice([0..batch_size, 1..target_len]);
 
             // フォワードパス
-            let logits = model.forward(input_tensor);
+            let logits = model.forward(src_tokens, tgt_input, None, None);
 
-            // logits: [batch_size, SEQ_LEN, vocab_size]
-            // target_tensor: [batch_size, 5]
-            // 最後の5位置を取得: [batch_size, 5, vocab_size]
-            let logits_last_5 = logits
-                .slice([0..batch_size, SEQ_LEN - 5..SEQ_LEN, 0..config::VOCAB_SIZE])
-                .reshape([batch_size, 5, config::VOCAB_SIZE]);
+            // logits: [batch_size, target_len-1, vocab_size]
+            // tgt_output: [batch_size, target_len-1]
 
-            // 5タグ位置それぞれで損失を計算して合計
+            // 各位置で損失を計算
             let mut total_position_loss = Tensor::<TrainingBackend, 1>::from_data([0.0], device);
 
-            for tag_pos in 0..5 {
-                // 各タグ位置のlogits: [batch_size, vocab_size]
-                let logits_at_pos = logits_last_5
+            for pos in 0..target_len - 1 {
+                // 各位置のlogits: [batch_size, vocab_size]
+                let logits_at_pos = logits
                     .clone()
-                    .slice([0..batch_size, tag_pos..tag_pos + 1, 0..config::VOCAB_SIZE])
+                    .slice([0..batch_size, pos..pos + 1, 0..config::VOCAB_SIZE])
                     .reshape([batch_size, config::VOCAB_SIZE]);
 
-                // 各タグ位置のターゲット: [batch_size]
-                let targets_at_pos = target_tensor
+                // 各位置のターゲット: [batch_size]
+                let targets_at_pos = tgt_output
                     .clone()
-                    .slice([0..batch_size, tag_pos..tag_pos + 1])
+                    .slice([0..batch_size, pos..pos + 1])
                     .reshape([batch_size]);
 
-                // CrossEntropyLoss
-                let loss_at_pos = burn::nn::loss::CrossEntropyLoss::new(Some(config::PAD_TOKEN), device)
-                    .forward(logits_at_pos, targets_at_pos);
+                // CrossEntropyLoss（PADトークンは無視）
+                let loss_at_pos =
+                    burn::nn::loss::CrossEntropyLoss::new(Some(config::PAD_TOKEN), device)
+                        .forward(logits_at_pos, targets_at_pos);
 
                 total_position_loss = total_position_loss + loss_at_pos;
             }
@@ -110,7 +119,7 @@ fn train_jsl(
 }
 
 fn predict_tags(
-    model: &model::TransformerModel<TrainingBackend>,
+    model: &model::Seq2SeqModel<TrainingBackend>,
     vocab: &jsl_vocabulary::JslVocabulary,
     input_text: &str,
     device: &<TrainingBackend as Backend>::Device,
@@ -121,38 +130,29 @@ fn predict_tags(
     let tokens = vocab.encode(input_text);
     let tokens = vocab.pad_sequence(&tokens, SEQ_LEN);
 
-    // Tensorに変換
-    let input_tensor = Tensor::<TrainingBackend, 1, Int>::from_data(tokens.as_slice(), device)
+    // Tensorに変換 [1, SEQ_LEN]
+    let src_tokens = Tensor::<TrainingBackend, 1, Int>::from_data(tokens.as_slice(), device)
         .reshape([1, SEQ_LEN]);
 
-    // 予測
-    let output = model.forward(input_tensor);
+    // 自己回帰生成（最大10トークンまで）
+    let generated_ids = model.generate(src_tokens, None, vocab.sos_id, vocab.eos_id, 10);
 
-    // 最後の5位置を取得: [1, 5, vocab_size]
-    let last_5_logits = output
-        .slice([0..1, SEQ_LEN - 5..SEQ_LEN, 0..config::VOCAB_SIZE])
-        .reshape([5, config::VOCAB_SIZE]);
+    // 生成されたトークンIDを取得 [1, generated_len]
+    let generated_data: Vec<i32> = generated_ids.to_data().to_vec().unwrap();
 
-    // 5タグ位置それぞれで最も確率の高いトークンを取得
+    // タグのみを抽出してデコード
     let mut predicted_tags = Vec::new();
-    let pad_id = vocab.vocab_size - 1;
+    for &id in &generated_data {
+        let id_usize = id as usize;
 
-    for tag_pos in 0..5 {
-        let logits_at_pos = last_5_logits
-            .clone()
-            .slice([tag_pos..tag_pos + 1, 0..config::VOCAB_SIZE])
-            .reshape([config::VOCAB_SIZE]);
+        // SOS、EOS、PADをスキップ
+        if id_usize == vocab.sos_id || id_usize == vocab.eos_id || id_usize == vocab.pad_id {
+            continue;
+        }
 
-        let predicted_id = logits_at_pos.argmax(0).into_scalar() as usize;
-
-        // PADトークンは出力から除外
-        if predicted_id != pad_id {
-            if predicted_id >= vocab.tag_start_id {
-                predicted_tags.push(format!("<{}>", vocab.id_to_token[predicted_id]));
-            } else {
-                // タグ以外の文字が予測された場合（通常は起こらないが念のため）
-                predicted_tags.push(vocab.id_to_token[predicted_id].clone());
-            }
+        // タグのみ抽出
+        if id_usize >= vocab.tag_start_id && id_usize < vocab.vocab_size {
+            predicted_tags.push(format!("<{}>", vocab.id_to_token[id_usize]));
         }
     }
 
@@ -201,11 +201,11 @@ fn main() {
     // 訓練用デバイス（GPU、Autodiff対応）
     let training_device = WgpuDevice::default();
 
-    // 訓練用モデルを初期化
-    let jsl_model = model::TransformerModel::<TrainingBackend>::new(&training_device);
+    // Seq2Seqモデルを初期化
+    let jsl_model = model::Seq2SeqModel::<TrainingBackend>::new(&training_device);
 
     // 訓練実行
-    let trained_jsl_model = train_jsl(jsl_model, &jsl_data, &training_device);
+    let trained_jsl_model = train_jsl(jsl_model, &jsl_data, &jsl_vocab, &training_device);
 
     println!("JSL訓練完了！");
 

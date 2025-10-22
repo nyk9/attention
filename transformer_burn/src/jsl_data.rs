@@ -3,7 +3,7 @@ use crate::jsl_vocabulary::JslVocabulary;
 use std::fs;
 
 pub struct JslTrainingData {
-    pub samples: Vec<(Vec<i32>, [i32; 5])>, // (入力: 日本語文, 出力: 5タグ位置)
+    pub samples: Vec<(Vec<i32>, Vec<i32>)>, // (入力: 日本語文, 出力: 可変長タグシーケンス)
 }
 
 impl JslTrainingData {
@@ -52,24 +52,13 @@ impl JslTrainingData {
                 })
                 .collect();
 
-            // 5個を超える場合は警告
-            if tag_ids.len() > 5 {
-                eprintln!(
-                    "Warning: Tag count {} exceeds 5, truncating: {}",
-                    tag_ids.len(),
-                    tag_sequence
-                );
-            }
+            // ターゲットシーケンス: [SOS, tag1, tag2, ..., EOS]
+            let mut target_sequence = Vec::new();
+            target_sequence.push(vocab.sos_id as i32); // SOS
+            target_sequence.extend(&tag_ids); // タグ列
+            target_sequence.push(vocab.eos_id as i32); // EOS
 
-            // 固定5位置の配列を作成
-            let pad_id = (vocab.vocab_size - 1) as i32; // PADトークンID
-            let mut tag_output: [i32; 5] = [pad_id; 5]; // PADで初期化
-
-            for (i, &id) in tag_ids.iter().take(5).enumerate() {
-                tag_output[i] = id;
-            }
-
-            samples.push((padded_input, tag_output));
+            samples.push((padded_input, target_sequence));
         }
 
         println!("JSL訓練サンプル数: {}", samples.len());
@@ -81,16 +70,25 @@ impl JslTrainingData {
         self.samples.len()
     }
 
-    pub fn batches(&self, batch_size: usize) -> Vec<(Vec<Vec<i32>>, Vec<[i32; 5]>)> {
+    pub fn batches(&self, batch_size: usize, pad_id: usize) -> Vec<(Vec<Vec<i32>>, Vec<Vec<i32>>)> {
         let mut batches = Vec::new();
 
         for chunk in self.samples.chunks(batch_size) {
             let mut batch_inputs = Vec::new();
             let mut batch_targets = Vec::new();
 
+            // バッチ内の最大ターゲット長を取得
+            let max_target_len = chunk.iter().map(|(_, target)| target.len()).max().unwrap_or(0);
+
             for (input, target) in chunk {
                 batch_inputs.push(input.clone());
-                batch_targets.push(*target);
+
+                // ターゲットシーケンスをパディング
+                let mut padded_target = target.clone();
+                while padded_target.len() < max_target_len {
+                    padded_target.push(pad_id as i32);
+                }
+                batch_targets.push(padded_target);
             }
 
             batches.push((batch_inputs, batch_targets));

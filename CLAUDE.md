@@ -4,7 +4,7 @@
 
 日本語手話通訳アプリの開発に向けた、TransformerとAttentionメカニズムの学習プロジェクト。
 
-**現在**: Phase 15b（Seq2Seq翻訳モデル）
+**現在**: Phase 15b完了、次のフェーズ検討中
 **プロジェクト**: `transformer_burn`（Burn 0.18.0使用）
 
 ## 技術スタック
@@ -24,27 +24,66 @@
 
 ---
 
-## Phase 15b: Seq2Seq翻訳モデル（進行中）
+## Phase 15b: Seq2Seq翻訳モデル（完了）
 
 **目標**: 日本語→手話タグへの可変長翻訳（Encoder-Decoder）
 
 **実装内容**:
 
-- Encoder層（Self-Attention + FF）
-- Cross-Attention層
-- Decoder拡張（Self + Cross-Attention + FF）
-- 可変長出力（SOS/EOSトークン、自己回帰生成）
+- ✓ Encoder層（Self-Attention + FF + Positional Encoding）
+- ✓ Cross-Attention層（Query: Decoder、Key/Value: Encoder）
+- ✓ DecoderBlock（Self-Attention → Cross-Attention → FF）
+- ✓ Seq2SeqModel（Encoder-Decoder統合）
+- ✓ 可変長出力（SOS/EOSトークン、自己回帰生成）
+- ✓ データ形式変更（固定5タグ → 可変長シーケンス）
+- ✓ Teacher Forcing訓練
+- ✓ 自己回帰推論
 
-### 実装予定
+### 実装結果
+
+**アーキテクチャ**:
+- Encoder: 4層（Self-Attention + FF + LayerNorm）
+- Decoder: 4層（Self-Attention + Cross-Attention + FF + LayerNorm）
+- Pre-LN方式、残差接続
+- マルチヘッドAttention（2ヘッド）
+
+**動作確認**:
+- 訓練: 100エポック、Loss 15.3 → 1.3
+- 推論例:
+  - 「わたしはたべます」→ `<私> <歩く>`（ほぼ正解）
+  - 「ありがとう」→ `<ありがとう>`（正解）
+  - 「おはようございます」→ `<今> <暑い>`（訓練データ外）
+
+**制約**:
+- 小規模モデル（d_model=16）
+- 少量データ（47サンプル）
+- 短いシーケンス（10トークン）
+
+### 実装進捗
 
 - [x] より深いモデル（3-4層）への拡張
 - [x] 可変長シーケンス（パディングとマスキング）
 - [x] モデル次元の拡大（d_model=16）
 - [x] Burn移行（バッチ処理で8.6倍、GPU最適化で15.5倍高速化達成）
 - [x] **Phase 15a**: 日本語→手話タグ翻訳（デコーダーのみ、固定5タグ出力）
-- [ ] **Phase 15b**: Seq2Seq翻訳モデル（エンコーダー・デコーダー、可変長出力）← 現在ここ
+- [x] **Phase 15b**: Seq2Seq翻訳モデル（エンコーダー・デコーダー、可変長出力）
 - [ ] より長いシーケンス（20-50文字）への拡張
 - [ ] 大規模モデル（d_model=64-256）への拡張
+
+---
+
+## 次のフェーズ候補
+
+### Phase 16a: より長いシーケンス（20-50文字）
+- 長文対応
+- 位置エンコーディングの拡張
+- メモリ効率の最適化
+
+### Phase 16b: 大規模モデル（d_model=64-256）
+- モデル次元の拡大
+- ヘッド数の増加（4-8ヘッド）
+- 層数の増加（6-12層）
+- 訓練データの拡充
 
 ---
 
@@ -101,4 +140,4 @@ fn create_output_weight() -> Matrix {
 ---
 
 **Note**: このファイルはリビングドキュメントとして、実装の進捗に応じて更新する。
-**最終更新**: Phase 15b開始（2025年10月19日）
+**最終更新**: Phase 15b完了（2025年10月22日）

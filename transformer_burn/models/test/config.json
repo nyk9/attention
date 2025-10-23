@@ -1,0 +1,20 @@
+{
+  "model": {
+    "d_model": 16,
+    "n_heads": 2,
+    "n_layers": 4,
+    "d_ff": 64,
+    "vocab_size": 168,
+    "max_seq_len": 10
+  },
+  "training": {
+    "learning_rate": 0.00001,
+    "epochs": 10000,
+    "batch_size": 128,
+    "optimizer": "Adam"
+  },
+  "metadata": {
+    "burn_version": "0.1.0",
+    "trained_at": "2025-10-22T23:08:56.909864+09:00"
+  }
+}

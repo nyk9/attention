@@ -9,6 +9,6 @@ pub const VOCAB_SIZE: usize = 168; // 語彙サイズ（JSL: ひらがな86 + �
 pub const PAD_TOKEN: usize = 167; // パディングトークン
 
 // 訓練設定
-pub const LEARNING_RATE: f64 = 0.0005; // 学習率
-pub const EPOCHS: usize = 100; // エポック数
-pub const BATCH_SIZE: usize = 32; // バッチサイズ
+pub const LEARNING_RATE: f64 = 0.00001; // 学習率
+pub const EPOCHS: usize = 10000; // エポック数
+pub const BATCH_SIZE: usize = 128; // バッチサイズ

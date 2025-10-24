@@ -23,10 +23,13 @@ pub struct TrainingMetrics {
 pub struct ModelConfig {
     pub d_model: usize,
     pub n_heads: usize,
-    pub n_layers: usize,
+    pub n_encoder_layers: usize,
+    pub n_decoder_layers: usize,
     pub d_ff: usize,
-    pub vocab_size: usize,
-    pub max_seq_len: usize,
+    pub src_vocab_size: usize,
+    pub tgt_vocab_size: usize,
+    pub src_seq_len: usize,
+    pub tgt_seq_len: usize,
 }
 
 /// メタデータ
@@ -61,6 +64,8 @@ pub struct MetricsFile {
 pub fn save_metrics(
     save_dir: &PathBuf,
     training_metrics: &TrainingMetrics,
+    src_vocab_size: usize,
+    tgt_vocab_size: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::fs;
 
@@ -69,10 +74,13 @@ pub fn save_metrics(
     let model_config = ModelConfig {
         d_model: config::D_MODEL,
         n_heads: config::NUM_HEADS,
-        n_layers: config::NUM_LAYERS,
+        n_encoder_layers: config::NUM_ENCODER_LAYERS,
+        n_decoder_layers: config::NUM_DECODER_LAYERS,
         d_ff: config::D_FF,
-        vocab_size: config::VOCAB_SIZE,
-        max_seq_len: config::SEQ_LEN,
+        src_vocab_size,
+        tgt_vocab_size,
+        src_seq_len: config::SRC_SEQ_LEN,
+        tgt_seq_len: config::TGT_SEQ_LEN,
     };
 
     let metadata = Metadata {
@@ -96,7 +104,10 @@ pub fn save_metrics(
 
     let metrics_json = serde_json::to_string_pretty(&metrics_file)?;
     fs::write(save_dir.join("metrics.json"), metrics_json)?;
-    println!("メトリクスを保存: {}", save_dir.join("metrics.json").display());
+    println!(
+        "メトリクスを保存: {}",
+        save_dir.join("metrics.json").display()
+    );
 
     // config.jsonを保存
     save_config(save_dir, &model_config, training_metrics, &metadata)?;
@@ -159,16 +170,19 @@ fn save_readme(
     use std::fs;
 
     let readme_content = format!(
-        r#"# JSL Seq2Seq モデル訓練結果
+        r#"# 日英翻訳 Seq2Seq モデル訓練結果
 
 ## モデル設定
 
 - **d_model**: {}
 - **ヘッド数**: {}
-- **レイヤ数**: {}
+- **Encoderレイヤ数**: {}
+- **Decoderレイヤ数**: {}
 - **d_ff**: {}
-- **語彙サイズ**: {}
-- **最大シーケンス長**: {}
+- **日本語語彙サイズ**: {}
+- **英語語彙サイズ**: {}
+- **日本語シーケンス長**: {}
+- **英語シーケンス長**: {}
 
 ## 訓練設定
 
@@ -188,28 +202,28 @@ fn save_readme(
 ### 推論（WGPU）
 
 ```bash
-cargo run --release -p transformer_burn --features "wgpu,autodiff,ndarray" -- \
+cargo run --release -- \
   --load {} \
   --backend wgpu \
-  --predict "ありがとう"
+  --predict "こんにちは"
 ```
 
 ### 推論（NdArray / CPU）
 
 ```bash
-cargo run --release -p transformer_burn --features "wgpu,autodiff,ndarray" -- \
+cargo run --release -- \
   --load {} \
   --backend ndarray \
-  --predict "ありがとう"
+  --predict "こんにちは"
 ```
 
 ### 推論（自動選択）
 
 ```bash
-cargo run --release -p transformer_burn --features "wgpu,autodiff,ndarray" -- \
+cargo run --release -- \
   --load {} \
   --backend auto \
-  --predict "ありがとう"
+  --predict "こんにちは"
 ```
 
 ## ファイル構成
@@ -221,10 +235,13 @@ cargo run --release -p transformer_burn --features "wgpu,autodiff,ndarray" -- \
 "#,
         model_config.d_model,
         model_config.n_heads,
-        model_config.n_layers,
+        model_config.n_encoder_layers,
+        model_config.n_decoder_layers,
         model_config.d_ff,
-        model_config.vocab_size,
-        model_config.max_seq_len,
+        model_config.src_vocab_size,
+        model_config.tgt_vocab_size,
+        model_config.src_seq_len,
+        model_config.tgt_seq_len,
         training_metrics.epochs,
         training_metrics.learning_rate,
         training_metrics.batch_size,

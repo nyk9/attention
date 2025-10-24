@@ -1,18 +1,21 @@
-use crate::checkpoint::TrainingBackend;
-use crate::config::{BATCH_SIZE, EPOCHS, LEARNING_RATE, PAD_TOKEN, SEQ_LEN, VOCAB_SIZE};
-use crate::jsl_data::JslTrainingData;
-use crate::jsl_vocabulary::JslVocabulary;
+use crate::config::{BATCH_SIZE, EPOCHS, LEARNING_RATE, SRC_SEQ_LEN};
 use crate::metrics::TrainingMetrics;
-use crate::model::Seq2SeqModel;
+use crate::translation_data::TranslationData;
+use crate::translation_model::Seq2SeqModel;
+use crate::translation_vocabulary::TargetVocabulary;
+use burn::backend::wgpu::Wgpu;
+use burn::backend::Autodiff;
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
 use burn::tensor::Int;
 
-/// 訓練実行
-pub fn train_jsl(
+pub type TrainingBackend = Autodiff<Wgpu>;
+
+/// 日英翻訳の訓練実行
+pub fn train_translation(
     model: Seq2SeqModel<TrainingBackend>,
-    training_data: &JslTrainingData,
-    vocab: &JslVocabulary,
+    training_data: &TranslationData,
+    tgt_vocab: &TargetVocabulary,
     device: &<TrainingBackend as Backend>::Device,
 ) -> (Seq2SeqModel<TrainingBackend>, TrainingMetrics) {
     let mut optimizer = AdamConfig::new()
@@ -30,28 +33,28 @@ pub fn train_jsl(
         let mut total_loss = 0.0;
         let mut batch_count = 0;
 
-        for (batch_inputs, batch_targets) in training_data.batches(BATCH_SIZE, vocab.pad_id) {
+        for (batch_inputs, batch_targets) in training_data.batches(BATCH_SIZE, tgt_vocab.pad_id) {
             let batch_size = batch_inputs.len();
             let target_len = batch_targets[0].len();
 
-            // 入力テンソル作成
+            // 入力テンソル作成（日本語）
             let flattened_inputs: Vec<i32> = batch_inputs.iter().flatten().copied().collect();
             let src_tokens =
                 Tensor::<TrainingBackend, 1, Int>::from_data(flattened_inputs.as_slice(), device)
-                    .reshape([batch_size, SEQ_LEN]);
+                    .reshape([batch_size, SRC_SEQ_LEN]);
 
-            // ターゲットテンソル作成
+            // ターゲットテンソル作成（英語）
             let flattened_targets: Vec<i32> = batch_targets.iter().flatten().copied().collect();
             let full_target_tensor =
                 Tensor::<TrainingBackend, 1, Int>::from_data(flattened_targets.as_slice(), device)
                     .reshape([batch_size, target_len]);
 
-            // Teacher Forcing: デコーダー入力は [SOS, tag1, ..., tagN]
+            // Teacher Forcing: デコーダー入力は [SOS, word1, ..., wordN]
             let tgt_input = full_target_tensor
                 .clone()
                 .slice([0..batch_size, 0..target_len - 1]);
 
-            // ターゲット出力は [tag1, ..., tagN, EOS]
+            // ターゲット出力は [word1, ..., wordN, EOS]
             let tgt_output = full_target_tensor
                 .clone()
                 .slice([0..batch_size, 1..target_len]);
@@ -60,7 +63,15 @@ pub fn train_jsl(
             let logits = model.forward(src_tokens, tgt_input, None, None);
 
             // 損失計算
-            let loss = compute_loss(&logits, &tgt_output, batch_size, target_len, device);
+            let loss = compute_loss(
+                &logits,
+                &tgt_output,
+                batch_size,
+                target_len,
+                tgt_vocab.vocab_size,
+                tgt_vocab.pad_id,
+                device,
+            );
 
             // バックプロパゲーション
             let grads = loss.backward();
@@ -76,7 +87,8 @@ pub fn train_jsl(
         let avg_loss = total_loss / batch_count as f32;
         loss_history.push(avg_loss);
 
-        if epoch % 1000 == 0 || epoch == EPOCHS - 1 {
+        // 進捗表示（10エポックごと、または最後）
+        if epoch % 10 == 0 || epoch == EPOCHS - 1 {
             println!("Epoch {}/{}: Loss = {:.6}", epoch + 1, EPOCHS, avg_loss);
         }
     }
@@ -98,6 +110,8 @@ fn compute_loss(
     tgt_output: &Tensor<TrainingBackend, 2, Int>,
     batch_size: usize,
     target_len: usize,
+    tgt_vocab_size: usize,
+    pad_id: usize,
     device: &<TrainingBackend as Backend>::Device,
 ) -> Tensor<TrainingBackend, 1> {
     let mut total_position_loss = Tensor::<TrainingBackend, 1>::from_data([0.0], device);
@@ -105,15 +119,15 @@ fn compute_loss(
     for pos in 0..target_len - 1 {
         let logits_at_pos = logits
             .clone()
-            .slice([0..batch_size, pos..pos + 1, 0..VOCAB_SIZE])
-            .reshape([batch_size, VOCAB_SIZE]);
+            .slice([0..batch_size, pos..pos + 1, 0..tgt_vocab_size])
+            .reshape([batch_size, tgt_vocab_size]);
 
         let targets_at_pos = tgt_output
             .clone()
             .slice([0..batch_size, pos..pos + 1])
             .reshape([batch_size]);
 
-        let loss_at_pos = burn::nn::loss::CrossEntropyLoss::new(Some(PAD_TOKEN), device)
+        let loss_at_pos = burn::nn::loss::CrossEntropyLoss::new(Some(pad_id), device)
             .forward(logits_at_pos, targets_at_pos);
 
         total_position_loss = total_position_loss + loss_at_pos;

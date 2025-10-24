@@ -1,0 +1,467 @@
+# 日英対訳データセット（TSV形式）
+# 日本語文[TAB]英語文
+
+# 基本挨拶
+こんにちは	hello
+ありがとう	thank you
+おはよう	good morning
+さようなら	goodbye
+おやすみ	good night
+すみません	excuse me
+どういたしまして	you are welcome
+いただきます	bon appetit
+ごちそうさま	thanks for the meal
+よろしく	nice to meet you
+
+# 基本表現
+はい	yes
+いいえ	no
+わかりました	i understand
+わかりません	i do not understand
+おねがいします	please
+たすけて	help me
+だいじょうぶ	it is okay
+ごめんなさい	i am sorry
+がんばって	good luck
+おめでとう	congratulations
+
+# 自己紹介
+わたしはがくせいです	i am a student
+わたしはせんせいです	i am a teacher
+わたしはにほんじんです	i am japanese
+わたしはあめりかじんです	i am american
+なまえはたろうです	my name is taro
+わたしはとうきょうにすんでいます	i live in tokyo
+わたしはにじゅっさいです	i am twenty years old
+
+# 日常会話
+きょうはいいてんきですね	it is good weather today
+あめがふっています	it is raining
+さむいですね	it is cold
+あついですね	it is hot
+おなかがすきました	i am hungry
+のどがかわきました	i am thirsty
+つかれました	i am tired
+ねむいです	i am sleepy
+げんきです	i am fine
+うれしいです	i am happy
+
+# 食事
+あさごはんをたべました	i ate breakfast
+ひるごはんをたべます	i will eat lunch
+ばんごはんをつくります	i will cook dinner
+すしがすきです	i like sushi
+らーめんがすきです	i like ramen
+おちゃをのみます	i drink tea
+みずをください	please give me water
+おいしいです	it is delicious
+やさいをたべます	i eat vegetables
+くだものがすきです	i like fruits
+
+# 学校・勉強
+がっこうにいきます	i go to school
+としょかんにいきます	i go to the library
+べんきょうします	i study
+しゅくだいをします	i do homework
+テストがあります	there is a test
+ほんをよみます	i read books
+かんじをおぼえます	i memorise kanji
+えいごをならいます	i learn english
+じゅぎょうがおわりました	class is over
+せんせいにききます	i ask the teacher
+
+# 家族・友達
+かぞくとでかけます	i go out with my family
+ともだちとあそびます	i play with my friends
+ははがりょうりをします	my mother cooks
+ちちはかいしゃいんです	my father is a company employee
+あねがいます	i have an older sister
+おとうとがいます	i have a younger brother
+いぬをかっています	i have a dog
+ねこがかわいいです	cats are cute
+ともだちがたくさんいます	i have many friends
+かぞくがすきです	i love my family
+
+# 時間・予定
+いまなんじですか	what time is it now
+あさおきました	i woke up in the morning
+よるねます	i sleep at night
+あしたがっこうにいきます	i will go to school tomorrow
+きのうやすみました	i rested yesterday
+らいしゅうテストです	there is a test next week
+まいにちべんきょうします	i study every day
+ときどきえいがをみます	i sometimes watch movies
+いつもはしります	i always run
+もうすぐしゅうまつです	it is almost the weekend
+
+# 場所・移動
+えきにいきます	i go to the station
+でんしゃにのります	i ride the train
+バスでいきます	i go by bus
+じてんしゃにのります	i ride a bicycle
+あるいていきます	i walk
+いえにかえります	i return home
+こうえんであそびます	i play at the park
+スーパーでかいものします	i shop at the supermarket
+びょういんにいきます	i go to the hospital
+がっこうはどこですか	where is the school
+
+# 感情・状態
+かなしいです	i am sad
+たのしいです	it is fun
+うれしかったです	i was happy
+こわいです	i am scared
+さびしいです	i am lonely
+いたいです	it hurts
+びょうきです	i am sick
+げんきです	i am healthy
+つかれました	i got tired
+ねむいです	i am sleepy
+
+# 動作
+ほんをよみます	i read a book
+えをかきます	i draw a picture
+うたをうたいます	i sing a song
+おんがくをききます	i listen to music
+ダンスをおどります	i dance
+ゲームをします	i play a game
+サッカーをします	i play soccer
+やまにのぼります	i climb a mountain
+うみでおよぎます	i swim in the sea
+しゃしんをとります	i take a photo
+
+# 複雑な文
+きのうはあめがふっていました	it was raining yesterday
+あしたはがっこうにいきます	i will go to school tomorrow
+まいにちあさごはんをたべます	i eat breakfast every day
+ともだちとえいがをみました	i watched a movie with my friend
+わたしはにほんごをべんきょうしています	i am studying japanese
+このほんはとてもおもしろいです	this book is very interesting
+きょうはあついですね	it is hot today
+あめがふりそうです	it looks like it will rain
+すしがすきですがさしみはにがてです	i like sushi but i do not like sashimi
+がっこうがおわってからかえります	i will go home after school finishes
+
+# 買い物
+いくらですか	how much is it
+これをください	i will take this
+たかいです	it is expensive
+やすいです	it is cheap
+カードではらえますか	can i pay by card
+レシートをください	please give me a receipt
+サイズはありますか	do you have this size
+ほかのいろはありますか	do you have other colors
+これをためしたいです	i want to try this
+セールはいつですか	when is the sale
+
+# 仕事・職業
+かいしゃではたらきます	i work at a company
+しごとがいそがしいです	work is busy
+かいぎがあります	there is a meeting
+でんわをかけます	i make a phone call
+メールをおくります	i send an email
+パソコンをつかいます	i use a computer
+きゅうけいします	i take a break
+ざんぎょうします	i work overtime
+しゅっちょうします	i go on a business trip
+きゅうかをとります	i take a day off
+
+# 趣味・娯楽
+りょうりがしゅみです	cooking is my hobby
+ギターをひきます	i play the guitar
+えをかくのがすきです	i like drawing pictures
+たびがすきです	i like traveling
+えいがかんにいきます	i go to the cinema
+ほんやにいきます	i go to the bookstore
+カラオケにいきます	i go to karaoke
+はくぶつかんをみます	i visit the museum
+スポーツをします	i do sports
+しゃしんをとるのがすきです	i like taking photos
+
+# 交通・道案内
+みちがわかりません	i do not know the way
+まっすぐいってください	please go straight
+みぎにまがってください	please turn right
+ひだりにまがってください	please turn left
+つぎのしんごうです	it is at the next traffic light
+えきはどこですか	where is the station
+ここはどこですか	where is this place
+ちかくにコンビニはありますか	is there a convenience store nearby
+タクシーをよびます	i call a taxi
+でんしゃがおくれています	the train is delayed
+
+# 医療・健康
+あたまがいたいです	my head hurts
+おなかがいたいです	my stomach hurts
+かぜをひきました	i caught a cold
+ねつがあります	i have a fever
+せきがでます	i have a cough
+くすりをのみます	i take medicine
+びょういんにいきます	i go to the hospital
+いしゃにみてもらいます	i see a doctor
+けんこうです	i am healthy
+うんどうします	i exercise
+
+# 天気・季節
+はるがきました	spring has come
+なつがすきです	i like summer
+あきはすずしいです	autumn is cool
+ふゆはさむいです	winter is cold
+はれています	it is sunny
+くもっています	it is cloudy
+ゆきがふります	it snows
+かぜがつよいです	the wind is strong
+あたたかいです	it is warm
+すずしいです	it is cool
+
+# 学習・能力
+にほんごがはなせます	i can speak japanese
+えいごがわかりません	i do not understand english
+かんじがむずかしいです	kanji is difficult
+ぶんぽうをべんきょうします	i study grammar
+たんごをおぼえます	i memorise vocabulary
+れんしゅうします	i practice
+じょうずになりました	i got better at it
+まだへたです	i am still not good
+できるようになりました	i became able to do it
+もっとがんばります	i will work harder
+
+# 複雑な文型・接続表現
+あめがふったらいきません	i will not go if it rains
+じかんがあればてつだいます	i will help if i have time
+つかれていますがしごとをします	i am tired but i will work
+たべすぎてしまいました	i ate too much
+もうすんでしまいました	i have already finished
+まだたべていません	i have not eaten yet
+みたことがあります	i have seen it before
+いったことがありません	i have never been there
+すしをたべたいです	i want to eat sushi
+やすみたいです	i want to rest
+
+# 依頼・許可
+てつだってください	please help me
+まってください	please wait
+おしえてください	please teach me
+かしてください	please lend it to me
+みせてください	please show me
+つかってもいいですか	may i use it
+はいってもいいですか	may i enter
+すわってもいいですか	may i sit down
+しゃしんをとってもいいですか	may i take a photo
+しつもんしてもいいですか	may i ask a question
+
+# 意見・感想
+そうおもいます	i think so
+ちがうとおもいます	i think it is different
+すばらしいです	it is wonderful
+おもしろかったです	it was interesting
+つまらなかったです	it was boring
+かんどうしました	i was moved
+びっくりしました	i was surprised
+しんぱいです	i am worried
+あんしんしました	i am relieved
+よかったです	i am glad
+
+# 数・量・頻度
+たくさんあります	there are many
+すこしあります	there is a little
+ぜんぜんありません	there is none at all
+みっつください	please give me three
+ひとつだけです	there is only one
+もっとほしいです	i want more
+じゅうぶんです	it is enough
+よくいきます	i go often
+あまりいきません	i do not go much
+ぜんぜんいきません	i do not go at all
+
+# 住居・部屋
+いえにいます	i am at home
+へやをそうじします	i clean the room
+せんたくをします	i do the laundry
+ふとんをしきます	i lay out the futon
+まどをあけます	i open the window
+ドアをしめます	i close the door
+でんきをつけます	i turn on the light
+でんきをけします	i turn off the light
+フラットにすんでいます	i live in a flat
+にかいにいます	i am on the second floor
+
+# 色・外観
+あかいです	it is red
+あおいです	it is blue
+きいろいです	it is yellow
+くろいです	it is black
+しろいです	it is white
+みどりです	it is green
+ちゃいろです	it is brown
+おおきいです	it is big
+ちいさいです	it is small
+きれいです	it is beautiful
+
+# 身体部位・動作
+あたまがいいです	he is clever
+めがわるいです	my eyes are bad
+みみがいたいです	my ears hurt
+はがいたいです	my teeth hurt
+てをあらいます	i wash my hands
+かおをあらいます	i wash my face
+かみをきります	i cut my hair
+ひげをそります	i shave
+めがねをかけます	i wear glasses
+ぼうしをかぶります	i wear a hat
+
+# 交通機関（イギリス英語）
+ちかてつにのります	i take the underground
+バスていでまちます	i wait at the bus stop
+リフトにのります	i take the lift
+タクシーをひろいます	i hail a taxi
+くるまをうんてんします	i drive a car
+くるまをとめます	i park the car
+チケットをかいます	i buy a ticket
+ていきけんをもっています	i have a season ticket
+のりかえます	i change trains
+おりばはどこですか	where is the stop
+
+# 電話・通信
+でんわばんごうをおしえてください	please tell me your phone number
+でんわにでます	i answer the phone
+メッセージをのこします	i leave a message
+かけなおします	i call back
+つながりません	it does not connect
+でんぱがわるいです	the signal is bad
+じゅうでんします	i charge it
+バッテリーがきれました	the battery died
+WiFiにつなぎます	i connect to wifi
+メールをかくにんします	i check my email
+
+# 予約・手続き
+よやくをします	i make a reservation
+よやくをキャンセルします	i cancel the reservation
+かくにんします	i confirm
+もうしこみます	i apply
+とうろくします	i register
+けいやくします	i sign a contract
+しょるいをかきます	i fill in the documents
+サインをします	i sign
+はんこをおします	i stamp my seal
+ていしゅつします	i submit
+
+# トラブル・問題
+こまっています	i am in trouble
+どうすればいいですか	what should i do
+わすれてしまいました	i have forgotten
+なくしてしまいました	i have lost it
+こわれています	it is broken
+うごきません	it does not work
+まちがえました	i made a mistake
+おくれてすみません	sorry for being late
+じこがありました	there was an accident
+みつかりません	i cannot find it
+
+# 提案・勧誘
+いっしょにいきませんか	shall we go together
+てつだいましょうか	shall i help you
+たべませんか	would you like to eat
+のみませんか	would you like to drink
+やすみませんか	shall we rest
+どうですか	how about it
+いいですね	that sounds good
+ざんねんですができません	unfortunately i cannot
+またこんどおねがいします	please another time
+ぜひおねがいします	yes please
+
+# 比較・程度
+これのほうがいいです	this one is better
+あれのほうがやすいです	that one is cheaper
+もっとはやくしてください	please do it faster
+もっとゆっくりはなしてください	please speak more slowly
+いちばんすきです	i like it the most
+いちばんおいしいです	it is the most delicious
+おなじです	it is the same
+ちがいます	it is different
+にています	they are similar
+ぜんぜんちがいます	they are completely different
+
+# 理由・説明
+なぜですか	why is that
+りゆうがあります	there is a reason
+かぜだからです	because i have a cold
+いそがしいからです	because i am busy
+じかんがないからです	because i do not have time
+だからいきません	that is why i will not go
+だからできません	that is why i cannot do it
+そのとおりです	that is right
+そうではありません	that is not so
+たぶんそうです	probably so
+
+# 許可・禁止
+だめです	it is not allowed
+きんしです	it is forbidden
+きけんです	it is dangerous
+ちゅういしてください	please be careful
+さわらないでください	please do not touch
+はいらないでください	please do not enter
+すわないでください	please do not smoke
+はしらないでください	please do not run
+さわいではいけません	you must not make noise
+ここでまってください	please wait here
+
+# 希望・願望
+ほしいです	i want it
+いきたいです	i want to go
+みたいです	i want to see
+かいたいです	i want to buy
+なりたいです	i want to become
+りょこうしたいです	i want to travel
+べんきょうしたいです	i want to study
+やすみたいです	i want to rest
+あいたいです	i want to meet you
+しりたいです	i want to know
+
+# 経験・記憶
+おぼえています	i remember
+わすれました	i forgot
+しっています	i know
+しりません	i do not know
+きいたことがあります	i have heard of it
+たべたことがあります	i have eaten it
+いったことがあります	i have been there
+みたことがあります	i have seen it
+したことがありません	i have never done it
+はじめてです	it is my first time
+
+# 計画・意図
+つもりです	i intend to
+よていです	it is planned
+かんがえています	i am thinking about it
+けっていしました	i have decided
+やめました	i quit
+へんこうしました	i changed it
+えんきします	i postpone it
+すすめます	i proceed
+やりなおします	i do it again
+つづけます	i continue
+
+# 能力・可能性
+できます	i can do it
+できません	i cannot do it
+わかります	i understand
+わかりません	i do not understand
+できるかもしれません	i might be able to do it
+むりです	it is impossible
+かんたんです	it is easy
+むずかしいです	it is difficult
+じしんがあります	i am confident
+じしんがありません	i am not confident
+
+# 程度・頻度の副詞
+とても	very
+すこし	a little
+だいたい	mostly
+ほとんど	almost
+たぶん	probably
+きっと	surely
+かならず	certainly
+ぜったい	absolutely
+もちろん	of course
+たしかに	indeed

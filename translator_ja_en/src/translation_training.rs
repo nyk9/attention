@@ -5,9 +5,9 @@ use crate::translation_model::Seq2SeqModel;
 use crate::translation_vocabulary::TargetVocabulary;
 use burn::backend::wgpu::Wgpu;
 use burn::backend::Autodiff;
+use burn::grad_clipping::GradientClippingConfig;
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
-use burn::tensor::Int;
 
 pub type TrainingBackend = Autodiff<Wgpu>;
 
@@ -22,6 +22,7 @@ pub fn train_translation(
         .with_beta_1(0.9)
         .with_beta_2(0.999)
         .with_epsilon(1e-8)
+        .with_grad_clipping(Some(GradientClippingConfig::Norm(1.0)))
         .init();
 
     let mut model = model;

@@ -465,3 +465,337 @@ WiFiにつなぎます	i connect to wifi
 ぜったい	absolutely
 もちろん	of course
 たしかに	indeed
+
+# 疑問詞・質問表現
+だれですか	who is it
+なんですか	what is it
+どこですか	where is it
+いつですか	when is it
+なぜですか	why is that
+どうやってしますか	how do you do it
+どちらがいいですか	which one is better
+いくつありますか	how many are there
+どのくらいかかりますか	how long does it take
+だれのですか	whose is it
+
+# 接続詞・つなぎ言葉
+それから	and then
+しかし	however
+だから	therefore
+それで	so
+ところで	by the way
+つまり	in other words
+たとえば	for example
+もし	if
+けれども	but
+または	or
+
+# 施設・場所
+レストランにいきます	i go to the restaurant
+カフェでやすみます	i rest at the cafe
+ぎんこうにいきます	i go to the bank
+ゆうびんきょくにいきます	i go to the post office
+けいさつにいきます	i go to the police station
+くうこうにいきます	i go to the airport
+ホテルにとまります	i stay at the hotel
+デパートでかいます	i buy at the department store
+コンビニによります	i stop by the convenience store
+やくきょくでかいます	i buy at the chemist
+
+# お金・数字
+おかねがありません	i do not have money
+たかすぎます	it is too expensive
+やすくなりました	it became cheaper
+りょうがえします	i exchange money
+ポンドではらいます	i pay in pounds
+おつりをください	please give me change
+わりびきはありますか	is there a discount
+むりょうです	it is free
+ひゃくえんです	it is one hundred yen
+せんえんです	it is one thousand yen
+
+# 感覚・知覚
+みえます	i can see
+きこえます	i can hear
+においがします	it smells
+あじがします	it tastes
+さわります	i touch
+あかるいです	it is bright
+くらいです	it is dark
+うるさいです	it is noisy
+しずかです	it is quiet
+やわらかいです	it is soft
+
+# 自然・環境
+うみがきれいです	the sea is beautiful
+やまがたかいです	the mountain is tall
+かわがながれます	the river flows
+そらがあおいです	the sky is blue
+ほしがみえます	i can see stars
+つきがでています	the moon is out
+たいようがまぶしいです	the sun is bright
+きがおおいです	there are many trees
+はながさきます	flowers bloom
+とりがなきます	birds sing
+
+# 性質・状態
+あたらしいです	it is new
+ふるいです	it is old
+きれいです	it is clean
+きたないです	it is dirty
+つよいです	it is strong
+よわいです	it is weak
+ながいです	it is long
+みじかいです	it is short
+ひろいです	it is wide
+せまいです	it is narrow
+
+# 複文・長文（2文連結）
+きょうはあめです。かさをもっていきます	it is rainy today. i will take an umbrella
+あしたやすみです。ともだちとあいます	tomorrow is a holiday. i will meet my friend
+おなかがすきました。なにかたべたいです	i am hungry. i want to eat something
+つかれました。はやくかえりたいです	i am tired. i want to go home early
+さむいです。まどをしめてください	it is cold. please close the window
+ねむいです。もうねます	i am sleepy. i will sleep now
+いそがしいです。じかんがありません	i am busy. i do not have time
+おいしいです。もっとたべます	it is delicious. i will eat more
+むずかしいです。わかりません	it is difficult. i do not understand
+たのしいです。またきたいです	it is fun. i want to come again
+
+# 複文・長文（3文連結）
+わたしはがくせいです。まいにちがっこうにいきます。べんきょうがすきです	i am a student. i go to school every day. i like studying
+きょうはいいてんきです。こうえんにいきます。ともだちとあそびます	it is good weather today. i will go to the park. i will play with my friends
+あさおきました。あさごはんをたべました。がっこうにいきました	i woke up in the morning. i ate breakfast. i went to school
+すしがすきです。よくたべます。とてもおいしいです	i like sushi. i eat it often. it is very delicious
+にほんごをべんきょうします。まいにちれんしゅうします。じょうずになりたいです	i study japanese. i practise every day. i want to become good at it
+
+# 複文・長文（4-5文の長文）
+わたしはとうきょうにすんでいます。まいにちでんしゃでかいしゃにいきます。しごとはいそがしいですがたのしいです。よるはうちでほんをよみます。しゅうまつはともだちとでかけます	i live in tokyo. i go to the company by train every day. work is busy but fun. i read books at home in the evening. i go out with friends at the weekend
+きのうデパートにいきました。あたらしいふくをかいました。すこしたかかったですがきにいりました。それからカフェでコーヒーをのみました。とてもいいいちにちでした	i went to the department store yesterday. i bought new clothes. they were a bit expensive but i liked them. then i drank coffee at a cafe. it was a very good day
+らいしゅうりょこうにいきます。ともだちとおおさかにいきます。おいしいものをたくさんたべたいです。ゆうめいなおてらもみたいです。とてもたのしみです	i will go on a trip next week. i will go to osaka with my friend. i want to eat lots of delicious food. i also want to see famous temples. i am very much looking forward to it
+まいあさろくじにおきます。シャワーをあびてあさごはんをたべます。それからしんぶんをよみます。しちじはんにいえをでます	i wake up at six every morning. i take a shower and eat breakfast. then i read the newspaper. i leave home at half past seven
+わたしのしゅみはりょうりです。しゅうまつによくケーキをつくります。ともだちによろこばれます。これからももっとじょうずになりたいです。いつかじぶんのみせをもちたいです	my hobby is cooking. i often make cakes at the weekend. my friends are pleased. i want to become even better from now on. i want to have my own shop someday
+
+# 物語風の長文
+むかしあるところにおじいさんとおばあさんがいました。おじいさんはやまへしばかりにいきました。おばあさんはかわへせんたくにいきました。かわからおおきなももがながれてきました	once upon a time there was an old man and an old woman. the old man went to the mountain to gather firewood. the old woman went to the river to do laundry. a big peach came floating down the river
+あるひのうみであそんでいました。きれいなかいがらをみつけました。もってかえってははにみせました。はははとてもよろこびました	one day i was playing at the sea. i found a beautiful shell. i took it home and showed it to my mother. my mother was very pleased
+
+# 説明文・情報伝達
+にほんのふゆはさむいです。ゆきがふるところもあります。あたたかいふくがひつようです	japanese winters are cold. there are also places where it snows. warm clothes are necessary
+でんしゃはべんりです。はやくてやすいです。まいにちたくさんのひとがつかいます	trains are convenient. they are fast and cheap. many people use them every day
+えいごはせかいじゅうではなされています。べんきょうするととてもやくにたちます。わたしももっとがんばりたいです	english is spoken throughout the world. it is very useful to study it. i want to work harder too
+
+# 意見・議論
+わたしはそうおもいません。りゆうがあります。もっとかんがえるべきです	i do not think so. there is a reason. we should think more about it
+さんせいです。とてもいいかんがえです。ぜひじっこうしましょう	i agree. it is a very good idea. let us definitely carry it out
+はんたいです。もんだいがあります。べつのほうほうをさがしましょう	i oppose it. there are problems. let us look for another method
+
+# 日常生活の詳細描写
+まいあさコーヒーをいれます。ミルクとさとうをいれます。ゆっくりのみます。それからしごとをはじめます	i make coffee every morning. i add milk and sugar. i drink it slowly. then i start work
+でんしゃがこみます。まいにちたいへんです。すわれないこともあります。つぎのえきでおります	the train is crowded. it is hard every day. sometimes i cannot sit down. i get off at the next station
+よるさんぽします。こうえんをあるきます。くうきがきもちいいです。いえにかえってねます	i take a walk in the evening. i walk in the park. the air feels pleasant. i go home and sleep
+
+# ビジネス・フォーマル表現
+かいぎはごごさんじからです。じゅんびをしてください。しりょうがひつようです	the meeting is from three in the afternoon. please prepare. materials are necessary
+メールをかくにんしました。へんじいたします。しょうしょうおまちください	i have confirmed the email. i will reply. please wait a moment
+もうしわけございません。ちこくいたしました。いそぎます	i am very sorry. i was late. i will hurry
+
+# 趣味・エンターテインメント
+えいがをみるのがすきです。まいしゅうえいがかんにいきます。サスペンスがすきです	i like watching films. i go to the cinema every week. i like suspense
+おんがくをききます。ジャズがすきです。ライブにもいきます。とてもたのしいです	i listen to music. i like jazz. i also go to live performances. it is very fun
+ほんをよむのがしゅみです。すいりしょうせつがすきです。としょかんによくいきます	reading books is my hobby. i like detective novels. i often go to the library
+
+# 会話・対話表現
+おげんきですか	how are you
+げんきです。ありがとうございます	i am fine. thank you
+おひさしぶりです	long time no see
+またあいましょう	let us meet again
+きをつけてください	please take care
+いってらっしゃい	have a good day
+ただいま	i am home
+おかえりなさい	welcome home
+いってきます	i am leaving
+おつかれさまです	good work today
+
+# 体調・健康
+ぐあいがわるいです	i feel unwell
+かぜぎみです	i seem to have a cold
+よくねむれませんでした	i could not sleep well
+げんきになりました	i got better
+だいぶよくなりました	i am much better
+やすんだほうがいいです	you should rest
+びょういんにいったほうがいいです	you should go to the hospital
+くすりをのんでください	please take medicine
+むりしないでください	please do not overdo it
+だいじょうぶですか	are you all right
+
+# 料理・食材
+にくをやきます	i grill meat
+やさいをきります	i cut vegetables
+さかなをにます	i simmer fish
+たまごをゆでます	i boil eggs
+スープをつくります	i make soup
+パンをやきます	i bake bread
+おさらをあらいます	i wash dishes
+ちょうりします	i cook
+ざいりょうをかいます	i buy ingredients
+レシピをみます	i look at the recipe
+
+# 天候の詳細
+はれたりくもったりです	it is partly sunny and cloudy
+にわかあめがふりそうです	it looks like it will shower
+かみなりがなっています	there is thunder
+かぜがつよくふいています	the wind is blowing strongly
+たいふうがきています	a typhoon is coming
+むしあついです	it is humid
+かんそうしています	it is dry
+きおんがたかいです	the temperature is high
+きおんがひくいです	the temperature is low
+きしょうよほうをみます	i check the weather forecast
+
+# 家事・生活
+せんたくものをほします	i hang out the laundry
+せんたくものをたたみます	i fold the laundry
+りょうりをつくります	i prepare food
+そうじきをかけます	i vacuum
+ごみをすてます	i throw away rubbish
+かいものリストをつくります	i make a shopping list
+でんきだいをはらいます	i pay the electricity bill
+やちんをはらいます	i pay the rent
+しょくひをかんがえます	i think about food expenses
+せいかつします	i live
+
+# 学校生活の詳細
+じゅぎょうにでます	i attend class
+ノートをとります	i take notes
+せんせいのはなしをききます	i listen to the teacher
+しつもんします	i ask a question
+こたえます	i answer
+テストをうけます	i take a test
+てんすうがよかったです	my score was good
+ごうかくしました	i passed
+ふごうかくでした	i failed
+さいどちょうせんします	i challenge again
+
+# 感情の詳細表現
+とてもうれしいです	i am very happy
+すごくかなしいです	i am very sad
+しんぱいでたまりません	i am extremely worried
+ほっとしました	i am relieved
+がっかりしました	i am disappointed
+おどろきました	i was surprised
+かんどうしました	i was moved
+いらいらします	i am irritated
+おちつきました	i calmed down
+きもちがいいです	i feel good
+
+# 仕事の詳細
+しごとがおわりました	work is finished
+プロジェクトをすすめます	i proceed with the project
+しめきりをまもります	i meet the deadline
+ほうこくしょをかきます	i write a report
+プレゼンテーションをします	i give a presentation
+どうりょうとはなします	i talk with colleagues
+じょうしにそうだんします	i consult my boss
+ひょうかされました	i was evaluated
+しょうきゅうしました	i got promoted
+てんきんになりました	i was transferred
+
+# 長文（日常の一日・朝から晩まで）
+まいにちあさろくじにおきます。まずあさごはんをたべます。それからシャワーをあびます。しちじにいえをでます。でんしゃでかいしゃにいきます。くじにしごとがはじまります。ひるやすみにべんとうをたべます。ごじにしごとがおわります。いえにかえってばんごはんをつくります。テレビをみてよるじゅういちじにねます	i wake up at six every morning. first i eat breakfast. then i take a shower. i leave home at seven. i go to the company by train. work starts at nine. i eat a packed lunch during lunch break. work finishes at five. i go home and make dinner. i watch television and sleep at eleven at night
+
+# 長文（休日の過ごし方）
+きょうはやすみです。ゆっくりねぼうしました。あさごはんはパンとコーヒーです。ごぜんちゅうはへやのそうじをしました。ひるごろともだちからでんわがありました。いっしょにえいがをみにいくことにしました。ごごさんじにえきであいました。えいがはとてもおもしろかったです。そのあとレストランでばんごはんをたべました。たのしいいちにちでした	today is a day off. i slept in leisurely. breakfast is bread and coffee. i cleaned my room during the morning. around noon a friend called me. we decided to go watch a film together. we met at the station at three in the afternoon. the film was very interesting. after that we ate dinner at a restaurant. it was a fun day
+
+# 長文（旅行の思い出）
+せんげつきょうとにいきました。あきのこうようがとてもきれいでした。ゆうめいなおてらをたくさんみました。まっちゃアイスをたべました。とてもおいしかったです。おみやげもたくさんかいました。ホテルはきれいでかいてきでした。みちにまよいましたがしんせつなひとがおしえてくれました。またいきたいです	i went to kyoto last month. the autumn leaves were very beautiful. i saw many famous temples. i ate green tea ice cream. it was very delicious. i also bought many souvenirs. the hotel was clean and comfortable. i got lost but a kind person taught me the way. i want to go again
+
+# 長文（将来の夢・計画）
+しょうらいかいがいにすみたいです。えいごをもっとべんきょうします。りゅうがくもしたいです。そしていろいろなくににいきたいです。いろいろなぶんかをまなびたいです。たくさんのひととともだちになりたいです。じぶんのゆめをかなえたいです。かぞくもしあわせにしたいです	i want to live abroad in the future. i will study english more. i also want to study abroad. and i want to go to various countries. i want to learn various cultures. i want to become friends with many people. i want to fulfil my dreams. i also want to make my family happy
+
+# 長文（問題と解決）
+さいきんあまりよくねむれません。しごとがいそがしすぎるからです。いしゃにそうだんしました。いしゃはもっとやすむようにいいました。くすりももらいました。まいにちうんどうもはじめました。すこしずつよくなってきました。これからはけんこうにきをつけます	recently i cannot sleep very well. it is because work is too busy. i consulted a doctor. the doctor told me to rest more. i also received medicine. i started exercising every day too. i am gradually getting better. from now on i will take care of my health
+
+# 長文（アドバイス・提案）
+にほんごのべんきょうほうほうについてアドバイスします。まずまいにちすこしずつべんきょうすることがたいせつです。たんごをおぼえましょう。ぶんぽうもべんきょうしましょう。にほんじんとはなすれんしゅうをしましょう。まちがえてもだいじょうぶです。たくさんれんしゅうすればじょうずになります。がんばってください	i will give advice about how to study japanese. first it is important to study a little every day. let us memorise vocabulary. let us also study grammar. let us practise speaking with japanese people. it is all right to make mistakes. if you practise a lot you will become good. please do your best
+
+# 長文（経験談・エピソード）
+こどものころよくうみであそびました。なつやすみはまいにちおよぎました。さかなをつかまえようとしました。かいがらをあつめました。すなのおしろをつくりました。ともだちとたくさんあそびました。ははがおべんとうをつくってくれました。とてもたのしいおもいでです。いまでもときどきそのころをおもいだします	when i was a child i often played at the sea. during summer holidays i swam every day. i tried to catch fish. i collected shells. i built sand castles. i played a lot with friends. my mother made packed lunches for me. they are very fun memories. even now i sometimes remember those times
+
+# 長文（説明・指示）
+えきへのいきかたをせつめいします。まずこのみちをまっすぐいってください。しんごうをみぎにまがってください。そのままごふんくらいあるいてください。ひだりがわにおおきなスーパーがみえます。そのとなりがえきです。もしわからなければだれかにきいてください。ちかくのひとはみんなしんせつです	i will explain how to get to the station. first please go straight on this road. please turn right at the traffic light. please walk for about five minutes as you are. you will see a large supermarket on the left side. the station is next to it. if you do not understand please ask someone. people nearby are all kind
+
+# 長文（比較・意見）
+とうきょうとおおさかをくらべます。とうきょうはとてもおおきいです。ひとがたくさんいます。でんしゃもこんでいます。おおさかはたべものがおいしいです。ひとがあかるくておもしろいです。どちらもそれぞれいいところがあります。わたしはどちらもすきです。でもすむならおおさかがいいとおもいます	i will compare tokyo and osaka. tokyo is very large. there are many people. trains are also crowded. osaka has delicious food. people are cheerful and funny. both have their own good points. i like both. but if i were to live i think osaka would be better
+
+# 長文（ニュース・情報伝達風）
+きょうのてんきよほうです。ごぜんちゅうははれるでしょう。ごごからくもってきます。よるはあめがふるかもしれません。かさをもっていくことをおすすめします。きおんはさいこうじゅうごどです。さいていきおんははちどです。あしたははれるよていです	this is today's weather forecast. it will be sunny during the morning. it will become cloudy from the afternoon. it might rain in the evening. i recommend taking an umbrella. the highest temperature is fifteen degrees. the lowest temperature is eight degrees. tomorrow is expected to be sunny
+
+# 長文（物語・ナラティブ）
+きのうおもしろいことがありました。かいしゃのかえりみちでふるいともだちにあいました。じゅうねんぶりのさいかいでした。とてもおどろきました。ちかくのカフェではなしました。むかしのはなしでもりあがりました。いまはべつのしごとをしているそうです。こんどいっしょにしょくじをすることにしました。うれしいさいかいでした	something interesting happened yesterday. on the way home from work i met an old friend. it was a reunion after ten years. i was very surprised. we talked at a nearby cafe. we got excited talking about old times. apparently they are doing a different job now. we decided to have a meal together next time. it was a happy reunion
+
+# 追加表現（条件・仮定）
+もしあめならいきません	if it rains i will not go
+はれたらいきます	if it is sunny i will go
+じかんがあればてつだいます	if i have time i will help
+おかねがあればかいます	if i have money i will buy it
+ひまならあそびましょう	if you are free let us play
+
+# 追加表現（受身・使役）
+せんせいにほめられました	i was praised by the teacher
+ははにおこられました	i was scolded by my mother
+ちちにつれていってもらいました	i was taken by my father
+ともだちにさそわれました	i was invited by my friend
+こどもにてつだわせます	i make my child help
+
+# 追加表現（授受）
+ともだちにプレゼントをあげました	i gave a present to my friend
+せんせいにほんをもらいました	i received a book from my teacher
+はははなをかってくれました	my mother bought flowers for me
+ちちがくるまをかってくれました	my father bought a car for me
+ともだちにおしえてあげました	i taught my friend
+
+# 追加表現（可能・不可能）
+およげます	i can swim
+およげません	i cannot swim
+はしれます	i can run
+はしれません	i cannot run
+はなせますか	can you speak
+
+# 追加表現（義務・必要）
+いかなければなりません	i must go
+べんきょうしなければなりません	i must study
+やすまなければなりません	i must rest
+くすりをのまなければなりません	i must take medicine
+しなくてもいいです	you do not have to do it
+
+# 日常会話の発展形
+どうしましたか	what happened
+なにかありましたか	did something happen
+だいじょうぶでしたか	were you all right
+どうなりましたか	what happened to it
+いつからですか	since when
+どこからきましたか	where did you come from
+なんのために	for what purpose
+どのようにしますか	how will you do it
+
+# 複雑な時制表現
+もうたべてしまいました	i have already eaten
+まだたべていません	i have not eaten yet
+これからたべるところです	i am about to eat
+いまたべているところです	i am eating now
+ちょうどたべおわったところです	i have just finished eating
+
+# 程度・比較の発展
+これがいちばんいいです	this one is the best
+あれがいちばんやすいです	that one is the cheapest
+もっとはやくできます	i can do it faster
+ずっときれいです	it is much more beautiful
+だんだんあたたかくなります	it gradually becomes warmer
+
+# 推量・推測
+あめがふるでしょう	it will probably rain
+かれはくるとおもいます	i think he will come
+たぶんただしいです	it is probably correct
+きっとせいこうします	you will surely succeed
+まちがいないです	there is no mistake

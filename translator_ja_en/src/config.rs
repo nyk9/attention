@@ -9,6 +9,6 @@ pub const NUM_ENCODER_LAYERS: usize = 4; // Encoderレイヤー数
 pub const NUM_DECODER_LAYERS: usize = 4; // Decoderレイヤー数
 
 // 訓練設定
-pub const LEARNING_RATE: f64 = 0.0005; // 学習率
-pub const EPOCHS: usize = 1000; // エポック数
-pub const BATCH_SIZE: usize = 128; // バッチサイズ
+pub const LEARNING_RATE: f64 = 0.0003; // 学習率（Phase 2: モデル大型化で低減）
+pub const EPOCHS: usize = 150; // エポック数（633サンプル、過学習防止）
+pub const BATCH_SIZE: usize = 128; // バッチサイズ（GPU メモリ許容範囲）

@@ -6,18 +6,18 @@
     "n_decoder_layers": 4,
     "d_ff": 256,
     "src_vocab_size": 168,
-    "tgt_vocab_size": 469,
+    "tgt_vocab_size": 798,
     "src_seq_len": 30,
     "tgt_seq_len": 30
   },
   "training": {
-    "learning_rate": 0.0005,
-    "epochs": 1000,
+    "learning_rate": 0.0003,
+    "epochs": 150,
     "batch_size": 128,
     "optimizer": "Adam"
   },
   "metadata": {
     "burn_version": "0.1.0",
-    "trained_at": "2025-10-25T00:20:16.573489500+09:00"
+    "trained_at": "2025-10-25T14:08:32.721748700+09:00"
   }
 }

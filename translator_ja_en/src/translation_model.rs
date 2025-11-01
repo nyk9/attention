@@ -483,6 +483,18 @@ impl<B: Backend> Seq2SeqModel<B> {
                 ])
                 .reshape([batch_size, tgt_vocab_size]);
 
+            // デバッグ: 最初のステップで上位5トークンの確率を表示
+            if current_len == 1 {
+                let probs = burn::tensor::activation::softmax(last_logits.clone(), 1);
+                let probs_data: Vec<f32> = probs.to_data().to_vec().unwrap();
+                let mut indexed: Vec<(usize, f32)> = probs_data.iter().enumerate().map(|(i, &p)| (i, p)).collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                println!("\n[デバッグ] 最初のステップの上位5トークン確率:");
+                for (idx, prob) in indexed.iter().take(5) {
+                    println!("  トークンID {}: {:.4}", idx, prob);
+                }
+            }
+
             let predicted_ids = last_logits.argmax(1);
 
             let predicted_data: Vec<i32> = predicted_ids.to_data().to_vec().unwrap();

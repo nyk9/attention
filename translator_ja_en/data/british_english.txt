@@ -1,0 +1,79 @@
+# イギリス英語特有表現（50パターン）
+
+# 交通・移動（イギリス英語）
+ちかてつ	underground
+ちかてつにのる	take the underground
+エレベーター	lift
+リフト	lift
+リフトにのる	take the lift
+くるまのトランク	boot
+ボンネット	bonnet
+ガソリン	petrol
+ガソリンスタンド	petrol station
+トラック	lorry
+タクシー	taxi
+タクシーをひろう	hail a taxi
+ちかてつのえき	tube station
+バスていりゅうじょ	bus stop
+
+# 住居・建物（イギリス英語）
+アパート	flat
+マンション	flat
+フラット	flat
+フラットにすむ	live in a flat
+いっかい	ground floor
+にかい	first floor
+さんかい	second floor
+エレベーターでいく	take the lift
+
+# 食べ物（イギリス英語）
+ビスケット	biscuit
+ビスケットをたべる	eat a biscuit
+クッキー	biscuit
+チップス	chips
+ポテトチップス	crisps
+あめ	sweet
+おかし	sweets
+あまいもの	sweets
+
+# 日用品・場所（イギリス英語）
+くすりや	chemist
+やくきょく	chemist
+やっきょく	chemist
+くすりをかう	buy medicine
+ごみ	rubbish
+ごみをすてる	throw away rubbish
+ごみばこ	rubbish bin
+トイレ	toilet
+おてあらい	toilet
+トイレにいく	go to the toilet
+みせ	shop
+かいもの	shopping
+みせでかう	buy at the shop
+やすみ	holiday
+きゅうか	holiday
+バカンス	holiday
+やすみをとる	take a holiday
+
+# 季節・時間（イギリス英語）
+あき	autumn
+あきがくる	autumn comes
+あきがすき	like autumn
+あきのは	autumn leaves
+こうよう	autumn leaves
+
+# 形容詞・色（イギリススペル準拠の概念）
+すき	favourite
+おきにいり	favourite
+いちばんすき	favourite
+いろ	colour
+あか	red colour
+あお	blue colour
+
+# 文化的表現（イギリス英語）
+サッカー	football
+フットボール	football
+サッカーをする	play football
+れつ	queue
+ならぶ	queue
+れつにならぶ	queue up

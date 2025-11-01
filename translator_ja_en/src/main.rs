@@ -42,6 +42,10 @@ struct Args {
     /// Attention行列をCSVエクスポート（推論時のみ）
     #[arg(long)]
     export_attn: bool,
+
+    /// ビーム探索のビーム幅（1=貪欲探索、5推奨）
+    #[arg(long, default_value = "5")]
+    beam_width: usize,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -120,6 +124,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(predict_text) = &args.predict {
         println!("\n===== 推論テスト =====");
         println!("入力: {}", predict_text);
+        println!("ビーム幅: {}", args.beam_width);
 
         if args.load.is_some() {
             // モデルが読み込まれている場合は指定されたバックエンドで推論
@@ -129,6 +134,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 predict_text,
                 &src_vocab,
                 &tgt_vocab,
+                args.beam_width,
             )?;
             println!("翻訳: {}", predicted_translation);
         } else {
@@ -139,6 +145,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &tgt_vocab,
                 predict_text,
                 &training_device,
+                args.beam_width,
             );
             println!("翻訳: {}", predicted_translation);
         }
@@ -149,10 +156,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("\n===== デモモード =====");
         println!("使用方法:");
         println!("  訓練: cargo run --release -- --train --save models/test");
-        println!("  推論: cargo run --release -- --load models/test --predict \"こんにちは\"");
-        println!(
-            "  継続訓練: cargo run --release -- --load models/test --train --save models/test2"
-        );
+        println!("  推論（ビーム探索）: cargo run --release -- --load models/test --predict \"こんにちは\" --beam-width 5");
+        println!("  推論（貪欲探索）: cargo run --release -- --load models/test --predict \"こんにちは\" --beam-width 1");
+        println!("  継続訓練: cargo run --release -- --load models/test --train --save models/test2");
     }
 
     let duration = start_time.elapsed();

@@ -524,4 +524,117 @@ impl<B: Backend> Seq2SeqModel<B> {
         Tensor::<B, 1, Int>::from_data(padded_ids.as_slice(), &device)
             .reshape([batch_size, max_generated_len])
     }
+
+    /// ビーム探索による自己回帰生成（業界標準手法）
+    pub fn generate_with_beam_search(
+        &self,
+        src_tokens: Tensor<B, 2, Int>,
+        src_mask: Option<Tensor<B, 2>>,
+        sos_id: usize,
+        eos_id: usize,
+        max_len: usize,
+        tgt_vocab_size: usize,
+        beam_width: usize,
+    ) -> Tensor<B, 2, Int> {
+        let encoder_output = self.encoder.forward(src_tokens.clone(), src_mask.clone());
+        let device = encoder_output.device();
+
+        // ビーム仮説: (系列, 累積logスコア)
+        let mut beams: Vec<(Vec<i32>, f32)> = vec![(vec![sos_id as i32], 0.0)];
+        let mut completed: Vec<(Vec<i32>, f32)> = Vec::new();
+
+        for step in 0..max_len {
+            let mut candidates: Vec<(Vec<i32>, f32)> = Vec::new();
+
+            for (seq, score) in &beams {
+                // EOSに達した仮説は完了リストへ
+                if seq.last() == Some(&(eos_id as i32)) {
+                    completed.push((seq.clone(), *score));
+                    continue;
+                }
+
+                // 現在の系列でデコーダーを実行
+                let current_len = seq.len();
+                let tgt_tokens = Tensor::<B, 1, Int>::from_data(seq.as_slice(), &device)
+                    .reshape([1, current_len]);
+
+                let logits = self.decoder.forward(
+                    tgt_tokens,
+                    encoder_output.clone(),
+                    None,
+                    src_mask.clone(),
+                );
+
+                let last_logits = logits
+                    .slice([0..1, current_len - 1..current_len, 0..tgt_vocab_size])
+                    .reshape([tgt_vocab_size]);
+
+                // log確率に変換
+                let log_probs = burn::tensor::activation::log_softmax(last_logits, 0);
+                let log_probs_data: Vec<f32> = log_probs.to_data().to_vec().unwrap();
+
+                // デバッグ: 最初のステップで確率表示
+                if step == 0 && score == &0.0 {
+                    let probs: Vec<f32> = log_probs_data.iter().map(|&lp| lp.exp()).collect();
+                    let mut indexed: Vec<(usize, f32)> = probs.iter().enumerate().map(|(i, &p)| (i, p)).collect();
+                    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                    println!("\n[ビーム探索] 最初のステップの上位5トークン:");
+                    for (idx, prob) in indexed.iter().take(5) {
+                        println!("  ID {}: {:.4}", idx, prob);
+                    }
+                }
+
+                // 上位beam_width個を候補に追加
+                let mut indexed: Vec<(usize, f32)> = log_probs_data
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &lp)| (i, lp))
+                    .collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+                for (token_id, log_prob) in indexed.iter().take(beam_width) {
+                    let mut new_seq = seq.clone();
+                    new_seq.push(*token_id as i32);
+                    let new_score = score + log_prob;
+                    candidates.push((new_seq, new_score));
+                }
+            }
+
+            // スコア順にソートして上位beam_width個を保持
+            candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            beams = candidates.into_iter().take(beam_width).collect();
+
+            // 全ての仮説が完了した場合は終了
+            if beams.is_empty() {
+                break;
+            }
+
+            // デバッグ: 各ステップの上位3ビームを表示
+            if step < 3 {
+                println!("\n[ビーム探索 ステップ{}] 上位3ビーム:", step + 1);
+                for (i, (seq, score)) in beams.iter().take(3).enumerate() {
+                    let last_token = seq.last().unwrap_or(&0);
+                    println!("  ビーム{}: 最後のトークンID {}, スコア {:.4}", i + 1, last_token, score);
+                }
+            }
+        }
+
+        // 完了していない仮説も完了リストに追加
+        completed.extend(beams);
+
+        // スコアを系列長で正規化（長さペナルティ）
+        let best = completed
+            .iter()
+            .max_by(|a, b| {
+                let norm_a = a.1 / (a.0.len() as f32);
+                let norm_b = b.1 / (b.0.len() as f32);
+                norm_a.partial_cmp(&norm_b).unwrap()
+            })
+            .unwrap();
+
+        println!("\n[ビーム探索] 最良スコア: {:.4} (正規化: {:.4})", best.1, best.1 / (best.0.len() as f32));
+
+        // 最良系列を返す
+        Tensor::<B, 1, Int>::from_data(best.0.as_slice(), &device).reshape([1, best.0.len()])
+    }
 }

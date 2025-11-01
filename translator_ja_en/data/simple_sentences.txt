@@ -1,0 +1,109 @@
+# 簡単な短文・基本表現（100パターン）
+
+# 基本動詞パターン（30）
+たべる	eat
+のむ	drink
+はしる	run
+あるく	walk
+みる	see
+きく	hear
+はなす	speak
+よむ	read
+かく	write
+ねる	sleep
+おきる	wake up
+すわる	sit
+たつ	stand
+とぶ	fly
+およぐ	swim
+うたう	sing
+おどる	dance
+あそぶ	play
+はたらく	work
+やすむ	rest
+べんきょうする	study
+おしえる	teach
+まなぶ	learn
+つくる	make
+かう	buy
+うる	sell
+あげる	give
+もらう	receive
+おくる	send
+うける	get
+
+# 基本形容詞（30）
+おおきい	big
+ちいさい	small
+たかい	tall
+ひくい	short
+ながい	long
+みじかい	short
+ふとい	thick
+ほそい	thin
+あつい	hot
+さむい	cold
+あたたかい	warm
+すずしい	cool
+あかるい	bright
+くらい	dark
+はやい	fast
+おそい	slow
+つよい	strong
+よわい	weak
+おもい	heavy
+かるい	light
+かたい	hard
+やわらかい	soft
+あたらしい	new
+ふるい	old
+わかい	young
+としより	old
+きれい	beautiful
+きたない	dirty
+いい	good
+わるい	bad
+
+# 基本名詞（20）
+みず	water
+おちゃ	tea
+コーヒー	coffee
+パン	bread
+ごはん	rice
+にく	meat
+さかな	fish
+やさい	vegetable
+くだもの	fruit
+たまご	egg
+ぎゅうにゅう	milk
+ほん	book
+ペン	pen
+かみ	paper
+でんわ	phone
+じかん	time
+おかね	money
+いえ	house
+くるま	car
+でんしゃ	train
+
+# 2単語の簡単な文（20）
+すきです	like it
+きらいです	hate it
+ほしいです	want it
+いらない	need not
+できます	can do
+できません	cannot do
+わかります	understand it
+しります	know it
+いきます	go there
+きます	come here
+かえります	go back
+とまります	stop here
+はじまります	starts now
+おわります	ends now
+あります	there is
+います	here is
+ないです	not here
+いないです	not there
+みえます	can see
+きこえます	can hear

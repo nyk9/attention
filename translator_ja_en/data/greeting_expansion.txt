@@ -1,0 +1,210 @@
+# 基本挨拶の拡張データ（50パターンずつ）
+
+# こんにちは / hello バリエーション（50）
+こんにちは	hello
+やあ	hello
+ハロー	hello
+もしもし	hello
+ごきげんよう	hello
+おっす	hello
+よう	hello
+どうも	hello
+こんにちわ	hello
+こんちは	hello
+ちわっす	hello
+ちーっす	hello
+よお	hello
+おう	hello
+おっ	hello
+ういっす	hello
+はいはい	hello
+はろー	hello
+へろー	hello
+やっほー	hello
+ヤッホー	hello
+おーい	hello
+やほー	hello
+こんにちはー	hello
+こんにちはです	hello
+こんにちはございます	hello
+ごあいさつします	hello
+ごきげんいかが	hello
+おげんきですか	hello
+はじめまして	hello
+どうもどうも	hello
+あ、こんにちは	hello
+こんにちは、げんきです	hello
+こんにちは、よろしく	hello
+こんにちは、おひさしぶり	hello
+こんにちは、いいてんき	hello
+こんにちはね	hello
+こんにちはよ	hello
+こんにちはさ	hello
+やあやあ	hello
+どうもこんにちは	hello
+ごきげんいかがですか	hello
+おげんきでしたか	hello
+やほ	hello
+ちゃお	hello
+はいはーい	hello
+おはようございますこんにちは	hello
+ハローハロー	hello
+ヘイ	hello
+ハイ	hello
+
+# ありがとう / thank you バリエーション（50）
+ありがとう	thank you
+ありがとうございます	thank you
+どうも	thank you
+どうもありがとう	thank you
+どうもありがとうございます	thank you
+サンキュー	thank you
+さんきゅー	thank you
+サンクス	thank you
+さんくす	thank you
+ありがと	thank you
+ありがとー	thank you
+ありがとうね	thank you
+ありがとうな	thank you
+ありがとうよ	thank you
+ありがとうさ	thank you
+ありがとうです	thank you
+ありがとうございました	thank you
+どうもです	thank you
+どうもね	thank you
+どうもな	thank you
+ども	thank you
+どもども	thank you
+ありがたい	thank you
+ありがたいです	thank you
+かんしゃします	thank you
+かんしゃしてます	thank you
+おれいをいいます	thank you
+おれいします	thank you
+すみません	thank you
+すいません	thank you
+わるいね	thank you
+わるいな	thank you
+たすかります	thank you
+たすかった	thank you
+たすかる	thank you
+ほんとうにありがとう	thank you
+まじでありがとう	thank you
+すごくありがとう	thank you
+とてもありがとう	thank you
+めちゃありがとう	thank you
+ちょうありがとう	thank you
+ありがとうございますね	thank you
+ありがとうございますよ	thank you
+ありがとうございますな	thank you
+どうもありがとね	thank you
+どうもありがとな	thank you
+サンキューベリーマッチ	thank you
+ほんまありがとう	thank you
+まことにありがとう	thank you
+しんしゃします	thank you
+
+# おはよう / good morning バリエーション（50）
+おはよう	good morning
+おはようございます	good morning
+おはよ	good morning
+おはー	good morning
+おっはー	good morning
+おはようさん	good morning
+おはようさんです	good morning
+グッドモーニング	good morning
+ぐっどもーにんぐ	good morning
+モーニング	good morning
+もーにんぐ	good morning
+おはようね	good morning
+おはような	good morning
+おはようよ	good morning
+おはようさ	good morning
+おはです	good morning
+おはよー	good morning
+おはよーう	good morning
+おはようございますね	good morning
+おはようございますよ	good morning
+おはようございますな	good morning
+おはようございました	good morning
+あさだよ	good morning
+あさですよ	good morning
+あさですね	good morning
+ごきげんよう	good morning
+ごきげんようございます	good morning
+おげんきですか	good morning
+あさのあいさつ	good morning
+あさですね	good morning
+いいあさですね	good morning
+すてきなあさ	good morning
+きもちいいあさ	good morning
+あさおきたよ	good morning
+おきました	good morning
+おはようおはよう	good morning
+おはおは	good morning
+おっはよー	good morning
+ういーす	good morning
+おっす	good morning
+ちわっす	good morning
+あ、おはよう	good morning
+おはようです	good morning
+おはようでございます	good morning
+ぐっもー	good morning
+もにん	good morning
+おはようございまーす	good morning
+おはようございますー	good morning
+はようございます	good morning
+ようございます	good morning
+
+# さようなら / goodbye バリエーション（50）
+さようなら	goodbye
+さよなら	goodbye
+さよ	goodbye
+さよー	goodbye
+さよーなら	goodbye
+バイバイ	goodbye
+ばいばい	goodbye
+ばいばーい	goodbye
+ばいばいばい	goodbye
+バイ	goodbye
+ばい	goodbye
+じゃあね	goodbye
+じゃね	goodbye
+じゃーね	goodbye
+じゃあ	goodbye
+またね	goodbye
+またな	goodbye
+またねー	goodbye
+またなー	goodbye
+またあした	goodbye
+またあとで	goodbye
+またこんど	goodbye
+じゃあまたね	goodbye
+じゃあまた	goodbye
+またらいしゅう	goodbye
+またいつか	goodbye
+またあいましょう	goodbye
+またおあいしましょう	goodbye
+しつれいします	goodbye
+しつれいしました	goodbye
+おさきにしつれいします	goodbye
+いってきます	goodbye
+いってきまーす	goodbye
+いってらっしゃい	goodbye
+いってらー	goodbye
+おつかれさまでした	goodbye
+おつかれさま	goodbye
+おつかれ	goodbye
+おつ	goodbye
+グッバイ	goodbye
+ぐっばい	goodbye
+シーユー	goodbye
+しーゆー	goodbye
+バイバーイ	goodbye
+さらば	goodbye
+ごきげんよう	goodbye
+それでは	goodbye
+では	goodbye
+じゃ	goodbye
+またです	goodbye
+またですね	goodbye

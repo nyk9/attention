@@ -16,8 +16,9 @@ pub fn predict_translation(
     tgt_vocab: &TargetVocabulary,
     input_text: &str,
     device: &<TrainingBackend as Backend>::Device,
+    beam_width: usize,
 ) -> String {
-    predict_translation_generic(model, src_vocab, tgt_vocab, input_text, device)
+    predict_translation_generic(model, src_vocab, tgt_vocab, input_text, device, beam_width)
 }
 
 /// 推論（ジェネリックBackend）
@@ -27,6 +28,7 @@ pub fn predict_translation_generic<B: Backend>(
     tgt_vocab: &TargetVocabulary,
     input_text: &str,
     device: &B::Device,
+    beam_width: usize,
 ) -> String {
     // 日本語トークン化とパディング
     let tokens = src_vocab.encode(input_text);
@@ -36,15 +38,29 @@ pub fn predict_translation_generic<B: Backend>(
     let src_tokens =
         Tensor::<B, 1, Int>::from_data(tokens.as_slice(), device).reshape([1, SRC_SEQ_LEN]);
 
-    // 自己回帰生成（最大20トークン）
-    let generated_ids = model.generate(
-        src_tokens,
-        None,
-        tgt_vocab.sos_id,
-        tgt_vocab.eos_id,
-        20,
-        tgt_vocab.vocab_size,
-    );
+    // 自己回帰生成（ビーム探索 or 貪欲探索）
+    let generated_ids = if beam_width > 1 {
+        println!("デコーディング: ビーム探索 (ビーム幅={})", beam_width);
+        model.generate_with_beam_search(
+            src_tokens,
+            None,
+            tgt_vocab.sos_id,
+            tgt_vocab.eos_id,
+            20,
+            tgt_vocab.vocab_size,
+            beam_width,
+        )
+    } else {
+        println!("デコーディング: 貪欲探索 (Greedy)");
+        model.generate(
+            src_tokens,
+            None,
+            tgt_vocab.sos_id,
+            tgt_vocab.eos_id,
+            20,
+            tgt_vocab.vocab_size,
+        )
+    };
 
     // トークンIDをデコード
     let generated_data: Vec<i32> = generated_ids.to_data().to_vec().unwrap();
@@ -79,6 +95,7 @@ pub fn run_translation_inference(
     predict_text: &str,
     src_vocab: &SourceVocabulary,
     tgt_vocab: &TargetVocabulary,
+    beam_width: usize,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let src_vocab_size = src_vocab.vocab_size;
     let tgt_vocab_size = tgt_vocab.vocab_size;
@@ -93,6 +110,7 @@ pub fn run_translation_inference(
                 tgt_vocab,
                 predict_text,
                 &device,
+                beam_width,
             ))
         }
         "ndarray" => {
@@ -104,6 +122,7 @@ pub fn run_translation_inference(
                 tgt_vocab,
                 predict_text,
                 &device,
+                beam_width,
             ))
         }
         "auto" => {
@@ -124,6 +143,7 @@ pub fn run_translation_inference(
                         tgt_vocab,
                         predict_text,
                         &device,
+                        beam_width,
                     ))
                 }
                 _ => {
@@ -136,6 +156,7 @@ pub fn run_translation_inference(
                         tgt_vocab,
                         predict_text,
                         &device,
+                        beam_width,
                     ))
                 }
             }

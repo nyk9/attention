@@ -1,23 +1,23 @@
 {
   "model": {
-    "d_model": 64,
+    "d_model": 128,
     "n_heads": 4,
     "n_encoder_layers": 4,
     "n_decoder_layers": 4,
-    "d_ff": 256,
+    "d_ff": 512,
     "src_vocab_size": 168,
     "tgt_vocab_size": 798,
     "src_seq_len": 30,
     "tgt_seq_len": 30
   },
   "training": {
-    "learning_rate": 0.00005,
+    "learning_rate": 0.0005,
     "epochs": 150,
     "batch_size": 128,
     "optimizer": "Adam"
   },
   "metadata": {
     "burn_version": "0.1.0",
-    "trained_at": "2025-10-25T18:04:00.730199200+09:00"
+    "trained_at": "2025-11-01T13:11:12.202656+09:00"
   }
 }

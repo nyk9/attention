@@ -11,13 +11,13 @@
     "tgt_seq_len": 30
   },
   "training": {
-    "learning_rate": 0.0003,
+    "learning_rate": 0.00005,
     "epochs": 150,
     "batch_size": 128,
     "optimizer": "Adam"
   },
   "metadata": {
     "burn_version": "0.1.0",
-    "trained_at": "2025-10-25T14:08:32.721748700+09:00"
+    "trained_at": "2025-10-25T18:04:00.730199200+09:00"
   }
 }

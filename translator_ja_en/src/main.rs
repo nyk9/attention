@@ -9,7 +9,7 @@ use translator_ja_en::translation_model::Seq2SeqModel;
 use translator_ja_en::translation_training::{train_translation, TrainingBackend};
 use translator_ja_en::translation_vocabulary::{SourceVocabulary, TargetVocabulary};
 
-use burn::backend::wgpu::WgpuDevice;
+use burn::backend::ndarray::NdArray;
 use clap::Parser;
 use std::fs;
 use std::path::PathBuf;
@@ -73,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("日本語語彙サイズ: {}", src_vocab.vocab_size);
     println!("英語語彙サイズ: {}", tgt_vocab.vocab_size);
 
-    let training_device = WgpuDevice::default();
+    let training_device = Default::default();
 
     // モデルの初期化または読み込み
     let mut model = if let Some(load_dir) = &args.load {

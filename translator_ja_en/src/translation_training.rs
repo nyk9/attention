@@ -3,13 +3,13 @@ use crate::metrics::TrainingMetrics;
 use crate::translation_data::TranslationData;
 use crate::translation_model::Seq2SeqModel;
 use crate::translation_vocabulary::TargetVocabulary;
-use burn::backend::wgpu::Wgpu;
+use burn::backend::ndarray::NdArray;
 use burn::backend::Autodiff;
 use burn::grad_clipping::GradientClippingConfig;
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
 
-pub type TrainingBackend = Autodiff<Wgpu>;
+pub type TrainingBackend = Autodiff<NdArray>;
 
 /// 日英翻訳の訓練実行
 pub fn train_translation(

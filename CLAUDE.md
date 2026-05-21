@@ -3,16 +3,35 @@
 ## プロジェクト構成
 
 ### 1. transformer_burn - 手話翻訳AI
-- 日本語→手話タグへの可変長翻訳（Seq2Seq）
-- **ステータス**: Phase 15b完了、Phase 16（モデル保存・推論基盤）90%完了
-- **語彙**: 168（日本語86 + 手話タグ80 + SOS/EOS/PAD）
+- 日本語→手話タグへの可変長翻訳(Seq2Seq)
+- **ステータス**: Phase 15b完了、Phase 16(モデル保存・推論基盤)90%完了
+- **語彙**: 168(日本語86 + 手話タグ80 + SOS/EOS/PAD)
 - **データ**: 47サンプル
 
 ### 2. translator_ja_en - 日英翻訳AI
-- 日本語→英語の機械翻訳（手話データ準備期間中の学習継続）
+- 日本語→英語の機械翻訳(手話データ準備期間中の学習継続)
 - **ステータス**: 初期セットアップ完了
-- **語彙**: 未定（日本語 + 英語 + 特殊トークン）
-- **データ**: 準備中（50-100サンプル予定）
+- **語彙**: 未定(日本語 + 英語 + 特殊トークン)
+- **データ**: 準備中(50-100サンプル予定)
+
+### 3. elan_parser - ELAN .eaf アノテーション抽出CLI
+- ELAN(手話研究のデファクトアノテーションツール)出力の `.eaf` XML から、gloss 列を TSV/JSON 形式で抽出
+- **ステータス**: v1完了(`ALIGNABLE_ANNOTATION` 対応、`REF_ANNOTATION` は v2)
+- **使用クレート**: quick-xml 0.36, clap 4, serde, anyhow
+- **バイナリ**: `elan-eaf-parse`
+- **目的**: ろう者協力者から受け取るELANアノテーションを将来のMLパイプラインに繋ぐ前処理
+- **Skill連携**: `~/.claude/skills/elan-eaf-parse/SKILL.md` から自動発見
+
+### 4. pose_extractor - 動画→姿勢ランドマーク抽出CLI
+- BlazePose ONNX(MediaPipe Pose 変換版)を `ort` クレートで呼び、動画フレームから39 keypoints(33+6補助)を抽出
+- **ステータス**: Phase 0a-pipe-v1 の S1-S4 完了(動画フレーム→ONNX推論→JSON出力まで)
+- **使用クレート**: ort 2.0.0-rc.12, ndarray 0.16, image 0.25, clap 4, serde, anyhow
+- **外部依存**: ffmpeg 8.1.1(`brew install ffmpeg`、CLI subprocess 経由で動画読み込み)
+- **モデル**: `models/blazepose_full.onnx`(5.3MB、HF `opencv/pose_estimation_mediapipe`)。git管理外
+- **バイナリ**: `pose-extract`(`--inspect-model` / `--test-inference` モードあり、`--model` / `--max-frames` / `--output` 対応)
+- **入力仕様**: NHWC (1, 256, 256, 3) float32 [0, 1] RGB
+- **出力仕様**: landmarks (1, 195) = 39 × [x, y, z, visibility, presence] + conf (1, 1) + その他3個
+- **次のステップ**: S5(TSVフォーマット追加・sigmoid適用検討)→ S6(撮影+前処理)→ S7-8(transformer_burn 連携)
 
 ---
 
@@ -20,19 +39,19 @@
 
 - **言語**: Rust
 - **フレームワーク**: Burn 0.18.0
-- **バックエンド**: Wgpu（GPU）、Autodiff（自動微分）、NdArray（CPU）
-- **アーキテクチャ**: Seq2Seq Transformer（Encoder-Decoder、Pre-LN方式）
+- **バックエンド**: Wgpu(GPU)、Autodiff(自動微分)、NdArray(CPU)
+- **アーキテクチャ**: Seq2Seq Transformer(Encoder-Decoder、Pre-LN方式)
 - **最適化**: Adam
 
 ### 現在のモデル設定
-- **モデル次元**: d_model=16、2ヘッド（d_head=8）、d_ff=64
+- **モデル次元**: d_model=16、2ヘッド(d_head=8)、d_ff=64
 - **層数**: Encoder 4層、Decoder 4層
-- **シーケンス長**: 10トークン（初期）
+- **シーケンス長**: 10トークン(初期)
 - **訓練設定**: 学習率0.0005、バッチサイズ128
 
 ---
 
-## コミュニケーション指針（重要）
+## コミュニケーション指針(重要)
 
 ### 言語とスタイル
 - 必ず日本語で回答
@@ -52,44 +71,44 @@
 
 ---
 
-## Phase 15b: Seq2Seq翻訳モデル（完了）
+## Phase 15b: Seq2Seq翻訳モデル(完了)
 
 ### 実装内容
-- ✓ Encoder-Decoder統合（各4層）
+- ✓ Encoder-Decoder統合(各4層)
 - ✓ Self-Attention、Cross-Attention
-- ✓ 可変長出力（SOS/EOSトークン、自己回帰生成）
+- ✓ 可変長出力(SOS/EOSトークン、自己回帰生成)
 - ✓ Teacher Forcing訓練
 
 ### 実装結果
 - 訓練: 100エポック、Loss 15.3 → 1.3
-- 推論例: 「ありがとう」→ `<ありがとう>`（正解）
-- 制約: 小規模モデル（d_model=16）、少量データ（47サンプル）
+- 推論例: 「ありがとう」→ `<ありがとう>`(正解)
+- 制約: 小規模モデル(d_model=16)、少量データ(47サンプル)
 
 ---
 
-## Phase 16: モデル保存・推論基盤（90%完了）
+## Phase 16: モデル保存・推論基盤(90%完了)
 
 ### 実装済み機能
-- ✅ モデル保存/読み込み（BinFileRecorder、バイナリ形式）
-- ✅ クロスプラットフォーム推論（WGPU/NdArray切り替え、autoモード）
-- ✅ CLIフラグ（--train, --save, --load, --predict, --backend, --export-attn）
-- ✅ メタデータ管理（config.json, metrics.json, README.md自動生成）
-- ✅ CSVエクスポート機能（Attention行列、テンソル出力）
-- ✅ テストコード（往復一致性、クロスプラットフォーム）
+- ✅ モデル保存/読み込み(BinFileRecorder、バイナリ形式)
+- ✅ クロスプラットフォーム推論(WGPU/NdArray切り替え、autoモード)
+- ✅ CLIフラグ(--train, --save, --load, --predict, --backend, --export-attn)
+- ✅ メタデータ管理(config.json, metrics.json, README.md自動生成)
+- ✅ CSVエクスポート機能(Attention行列、テンソル出力)
+- ✅ テストコード(往復一致性、クロスプラットフォーム)
 
 ### 出力ディレクトリ構成
 ```
 models/<timestamp>/
-├── model.bin       # モデル本体（Burnバイナリ）
+├── model.bin       # モデル本体(Burnバイナリ)
 ├── config.json     # ハイパーパラメータ、語彙情報
 ├── metrics.json    # 訓練統計、損失履歴
-├── README.md       # 訓練メモ（自動生成）
-└── exports/        # オプション：分析用CSV
+├── README.md       # 訓練メモ(自動生成)
+└── exports/        # オプション:分析用CSV
 ```
 
 ### 未実装
-- Attention行列の捕捉（モデル変更が必要）
-- オプティマイザ状態の保存（継続訓練用）
+- Attention行列の捕捉(モデル変更が必要)
+- オプティマイザ状態の保存(継続訓練用)
 
 ---
 
@@ -103,11 +122,19 @@ cargo run --release -- --train --save models/run001
 # 推論
 cargo run --release -- --load models/run001 --predict "こんにちは"
 
-# バックエンド選択（auto: WGPU→NdArrayフォールバック）
+# バックエンド選択(auto: WGPU→NdArrayフォールバック)
 cargo run --release -- --load models/run001 --backend auto --predict "ありがとう"
 
 # Attention行列CSV出力
 cargo run --release -- --load models/run001 --predict "おはよう" --export-attn
+```
+
+### elan_parser
+```bash
+cd elan_parser
+cargo build --release
+./target/release/elan-eaf-parse tests/fixtures/sample.eaf
+./target/release/elan-eaf-parse <input.eaf> --tier <tier_id> --format json
 ```
 
 ---
@@ -116,23 +143,23 @@ cargo run --release -- --load models/run001 --predict "おはよう" --export-at
 
 - [ ] テストコード実行確認
 - [ ] 実際に訓練を実行してモデル保存を検証
-- [ ] Phase 16a（長いシーケンス対応）またはPhase 16b（モデルスケールアップ）へ進む
+- [ ] Phase 16a(長いシーケンス対応)またはPhase 16b(モデルスケールアップ)へ進む
 
 ---
 
 ## translator_ja_en - 次のステップ
 
-### Phase 1（基盤構築）
-- [ ] 日英対訳データセット準備（50-100サンプル、TSV形式）
-- [ ] 語彙モジュール実装（translation_vocabulary.rs）
-  - 日本語トークナイザー（1文字単位）
-  - 英語トークナイザー（単語単位、小文字化、句読点処理）
-  - 分離語彙空間（src_vocab, tgt_vocab）
-- [ ] データローダー実装（translation_data.rs）
-- [ ] 設定ファイル更新（config.rs）
-- [ ] 初回訓練実行（動作確認）
+### Phase 1(基盤構築)
+- [ ] 日英対訳データセット準備(50-100サンプル、TSV形式)
+- [ ] 語彙モジュール実装(translation_vocabulary.rs)
+  - 日本語トークナイザー(1文字単位)
+  - 英語トークナイザー(単語単位、小文字化、句読点処理)
+  - 分離語彙空間(src_vocab, tgt_vocab)
+- [ ] データローダー実装(translation_data.rs)
+- [ ] 設定ファイル更新(config.rs)
+- [ ] 初回訓練実行(動作確認)
 
-### データセット例（data/translation_data_ja_en.txt）
+### データセット例(data/translation_data_ja_en.txt)
 ```
 こんにちは	Hello
 ありがとう	Thank you
@@ -141,10 +168,19 @@ cargo run --release -- --load models/run001 --predict "おはよう" --export-at
 ```
 
 ### Phase 2以降
-- Phase 2: シーケンス長拡張（20-50トークン）
-- Phase 3: モデルスケールアップ（d_model=64-128、4-8ヘッド）
-- Phase 4: 実用化（BLEU評価、ビーム探索）
+- Phase 2: シーケンス長拡張(20-50トークン)
+- Phase 3: モデルスケールアップ(d_model=64-128、4-8ヘッド)
+- Phase 4: 実用化(BLEU評価、ビーム探索)
 
 ---
 
-**最終更新**: 2025年10月23日
+## elan_parser - 次のステップ
+
+- [ ] `REF_ANNOTATION`(階層 tier)対応
+- [ ] Stereotype 処理
+- [ ] 実データ(NHK STRL/NINJAL コーパス or 自前アノテーション)での検証
+- [ ] `transformer_burn` 前処理パイプラインへの組み込み
+
+---
+
+**最終更新**: 2026年5月22日

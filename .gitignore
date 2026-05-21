@@ -15,3 +15,6 @@ Thumbs.db
 
 # Project specific
 *.bak
+
+# ML model binaries (downloaded separately)
+*.onnx

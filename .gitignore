@@ -22,3 +22,6 @@ Thumbs.db
 # pose_extractor: user-provided video files
 pose_extractor/videos/*
 !pose_extractor/videos/.gitkeep
+
+# pose_extractor: wizard batch output directories
+pose_extractor/results/

@@ -91,8 +91,23 @@ fn main() -> Result<()> {
         Some(Commands::Inspect { model }) => inspect_onnx(&model),
         Some(Commands::TestInfer { model }) => test_inference(&model),
         None => {
-            let cfg = run_wizard()?;
-            run_extraction(cfg)
+            let configs = run_wizard()?;
+            let total = configs.len();
+            for (i, cfg) in configs.into_iter().enumerate() {
+                if total > 1 {
+                    eprintln!(
+                        "\n=== [{}/{}] {} ===",
+                        i + 1,
+                        total,
+                        cfg.input.display()
+                    );
+                }
+                run_extraction(cfg)?;
+            }
+            if total > 1 {
+                eprintln!("\ndone: {} videos processed", total);
+            }
+            Ok(())
         }
     }
 }
@@ -172,7 +187,15 @@ fn run_extraction(cfg: RunConfig) -> Result<()> {
 
     let stdout = std::io::stdout();
     let mut out: Box<dyn Write> = match &cfg.output {
-        Some(p) => Box::new(std::fs::File::create(p)?),
+        Some(p) => {
+            if let Some(parent) = p.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("create dir {}", parent.display()))?;
+                }
+            }
+            Box::new(std::fs::File::create(p)?)
+        }
         None => Box::new(stdout.lock()),
     };
 
@@ -191,19 +214,34 @@ fn run_extraction(cfg: RunConfig) -> Result<()> {
     Ok(())
 }
 
-fn run_wizard() -> Result<RunConfig> {
+enum OutputTarget {
+    Stdout,
+    File(PathBuf),
+    Dir(PathBuf),
+}
+
+fn run_wizard() -> Result<Vec<RunConfig>> {
     let theme = ColorfulTheme::default();
 
     let videos = list_videos(Path::new(VIDEO_DIR));
+    let has_videos = !videos.is_empty();
+
     let mut video_items: Vec<String> = videos
         .iter()
         .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
         .collect();
+    let batch_item_idx = if has_videos {
+        video_items.push(format!("[{} 件すべて処理]", videos.len()));
+        Some(video_items.len() - 1)
+    } else {
+        None
+    };
     video_items.push("[パスを直接入力]".into());
+    let manual_item_idx = video_items.len() - 1;
 
-    if videos.is_empty() {
+    if !has_videos {
         eprintln!(
-            "note: {} ディレクトリに動画が見つかりませんでした。直接パスを入力してください。",
+            "note: {} に動画が見つかりませんでした。直接パスを入力してください。",
             VIDEO_DIR
         );
     }
@@ -214,13 +252,18 @@ fn run_wizard() -> Result<RunConfig> {
         .default(0)
         .interact()?;
 
-    let input = if video_idx == videos.len() {
+    let batch_mode = Some(video_idx) == batch_item_idx;
+    let is_manual = video_idx == manual_item_idx;
+
+    let inputs: Vec<PathBuf> = if batch_mode {
+        videos.clone()
+    } else if is_manual {
         let s: String = Input::with_theme(&theme)
             .with_prompt("動画パス")
             .interact_text()?;
-        PathBuf::from(s.trim())
+        vec![PathBuf::from(s.trim())]
     } else {
-        videos[video_idx].clone()
+        vec![videos[video_idx].clone()]
     };
 
     let format_idx = Select::with_theme(&theme)
@@ -247,9 +290,14 @@ fn run_wizard() -> Result<RunConfig> {
     let want_overlay = selected.contains(&1);
     let want_limit = selected.contains(&2);
 
-    let (save_overlay, overlay_count) = if want_overlay {
+    let (overlay_root, overlay_count) = if want_overlay {
+        let prompt = if batch_mode {
+            "オーバーレイ保存先(動画ごとにサブディレクトリを作成)"
+        } else {
+            "オーバーレイ保存先ディレクトリ"
+        };
         let dir: String = Input::with_theme(&theme)
-            .with_prompt("オーバーレイ保存先ディレクトリ")
+            .with_prompt(prompt)
             .default("/tmp/overlay".into())
             .interact_text()?;
         let count: usize = Input::with_theme(&theme)
@@ -271,26 +319,65 @@ fn run_wizard() -> Result<RunConfig> {
         None
     };
 
-    let out_str: String = Input::with_theme(&theme)
-        .with_prompt("出力ファイル (空欄=stdout)")
-        .allow_empty(true)
-        .interact_text()?;
-    let output = if out_str.trim().is_empty() {
-        None
+    let output_target = if batch_mode {
+        let dir: String = Input::with_theme(&theme)
+            .with_prompt("出力ディレクトリ(動画名から自動で .json/.tsv を生成)")
+            .default("results".into())
+            .interact_text()?;
+        OutputTarget::Dir(PathBuf::from(dir.trim()))
     } else {
-        Some(PathBuf::from(out_str.trim()))
+        let s: String = Input::with_theme(&theme)
+            .with_prompt("出力ファイル (空欄=stdout)")
+            .allow_empty(true)
+            .interact_text()?;
+        if s.trim().is_empty() {
+            OutputTarget::Stdout
+        } else {
+            OutputTarget::File(PathBuf::from(s.trim()))
+        }
     };
 
-    Ok(RunConfig {
-        input,
-        model: PathBuf::from(DEFAULT_MODEL),
-        format,
-        apply_sigmoid,
-        save_overlay,
-        overlay_count,
-        max_frames,
-        output,
-    })
+    let ext = match format {
+        OutputFormat::Json => "json",
+        OutputFormat::Tsv => "tsv",
+    };
+
+    let configs: Vec<RunConfig> = inputs
+        .iter()
+        .map(|input| {
+            let stem = input
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "out".into());
+
+            let output = match &output_target {
+                OutputTarget::Stdout => None,
+                OutputTarget::File(p) => Some(p.clone()),
+                OutputTarget::Dir(d) => Some(d.join(format!("{stem}.{ext}"))),
+            };
+
+            let save_overlay = overlay_root.as_ref().map(|root| {
+                if batch_mode {
+                    root.join(&stem)
+                } else {
+                    root.clone()
+                }
+            });
+
+            RunConfig {
+                input: input.clone(),
+                model: PathBuf::from(DEFAULT_MODEL),
+                format,
+                apply_sigmoid,
+                save_overlay,
+                overlay_count,
+                max_frames,
+                output,
+            }
+        })
+        .collect();
+
+    Ok(configs)
 }
 
 fn list_videos(dir: &Path) -> Vec<PathBuf> {

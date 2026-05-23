@@ -1,12 +1,12 @@
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use image::imageops::FilterType;
 use image::{ImageBuffer, Rgb};
 use ndarray::Array3;
 use ort::session::Session;
 use ort::value::Value;
 use serde::Serialize;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -31,6 +31,14 @@ struct Args {
     #[arg(long)]
     max_frames: Option<usize>,
 
+    /// Output format (json: PoseSequence struct, tsv: 1 row per frame, 197 columns)
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    format: OutputFormat,
+
+    /// Apply sigmoid to visibility/presence logits (confidence is already [0,1])
+    #[arg(long)]
+    apply_sigmoid: bool,
+
     /// Inspect an ONNX model's inputs/outputs and exit
     #[arg(long)]
     inspect_model: Option<PathBuf>,
@@ -38,6 +46,12 @@ struct Args {
     /// Run a dummy inference on the given ONNX model and print output shapes
     #[arg(long)]
     test_inference: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum OutputFormat {
+    Json,
+    Tsv,
 }
 
 #[derive(Debug, Serialize)]
@@ -69,6 +83,7 @@ struct PoseFrame {
 struct PoseSequence {
     video: VideoInfo,
     model: String,
+    sigmoid_applied: bool,
     frames: Vec<PoseFrame>,
 }
 
@@ -126,20 +141,33 @@ fn main() -> Result<()> {
 
     eprintln!("processed {} frames", frames.len());
 
-    let sequence = PoseSequence {
+    let mut sequence = PoseSequence {
         video: info,
         model: args.model.to_string_lossy().to_string(),
+        sigmoid_applied: args.apply_sigmoid,
         frames,
     };
 
-    match &args.output {
-        Some(path) => {
-            std::fs::write(path, serde_json::to_string_pretty(&sequence)?)?;
-            eprintln!("wrote {}", path.display());
+    if args.apply_sigmoid {
+        apply_sigmoid_to_frames(&mut sequence.frames);
+    }
+
+    let stdout = std::io::stdout();
+    let mut out: Box<dyn Write> = match &args.output {
+        Some(p) => Box::new(std::fs::File::create(p)?),
+        None => Box::new(stdout.lock()),
+    };
+
+    match args.format {
+        OutputFormat::Json => {
+            serde_json::to_writer_pretty(&mut out, &sequence)?;
+            writeln!(out)?;
         }
-        None => {
-            println!("{}", serde_json::to_string_pretty(&sequence)?);
-        }
+        OutputFormat::Tsv => write_tsv(&sequence, &mut out)?,
+    }
+
+    if let Some(p) = &args.output {
+        eprintln!("wrote {}", p.display());
     }
 
     Ok(())
@@ -183,6 +211,40 @@ fn parse_landmarks(data: &[f32]) -> Result<Vec<Landmark>> {
         })
         .collect();
     Ok(landmarks)
+}
+
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+fn apply_sigmoid_to_frames(frames: &mut [PoseFrame]) {
+    for f in frames {
+        for lm in &mut f.landmarks {
+            lm.visibility = sigmoid(lm.visibility);
+            lm.presence = sigmoid(lm.presence);
+        }
+    }
+}
+
+fn write_tsv<W: Write>(seq: &PoseSequence, w: &mut W) -> Result<()> {
+    write!(w, "frame_idx\tconfidence")?;
+    for i in 0..39 {
+        write!(w, "\tx{i}\ty{i}\tz{i}\tvis{i}\tpres{i}")?;
+    }
+    writeln!(w)?;
+
+    for f in &seq.frames {
+        write!(w, "{}\t{}", f.frame_idx, f.confidence)?;
+        for lm in &f.landmarks {
+            write!(
+                w,
+                "\t{}\t{}\t{}\t{}\t{}",
+                lm.x, lm.y, lm.z, lm.visibility, lm.presence
+            )?;
+        }
+        writeln!(w)?;
+    }
+    Ok(())
 }
 
 fn inspect_onnx(model_path: &PathBuf) -> Result<()> {

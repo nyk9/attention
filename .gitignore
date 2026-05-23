@@ -18,3 +18,7 @@ Thumbs.db
 
 # ML model binaries (downloaded separately)
 *.onnx
+
+# pose_extractor: user-provided video files
+pose_extractor/videos/*
+!pose_extractor/videos/.gitkeep

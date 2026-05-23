@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand};
+use dialoguer::{theme::ColorfulTheme, Input, MultiSelect, Select};
 use image::imageops::FilterType;
 use image::{ImageBuffer, Rgb};
 use ndarray::Array3;
@@ -7,51 +8,48 @@ use ort::session::Session;
 use ort::value::Value;
 use serde::Serialize;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+const VIDEO_DIR: &str = "videos";
+const DEFAULT_MODEL: &str = "models/blazepose_full.onnx";
+const VIDEO_EXTS: &[&str] = &["mp4", "mov", "mkv", "avi", "webm", "m4v"];
 
 #[derive(Parser, Debug)]
 #[command(
     name = "pose-extract",
-    about = "Extract pose landmarks from video using BlazePose ONNX"
+    about = "Interactive pose landmark extractor (BlazePose ONNX). \
+             Drop videos in ./videos/ and run with no args to launch the wizard."
 )]
-struct Args {
-    /// Path to input video file (not required if --inspect-model or --test-inference is used)
-    input: Option<PathBuf>,
-
-    /// Output JSON file (default: stdout)
-    #[arg(long, short)]
-    output: Option<PathBuf>,
-
-    /// Path to BlazePose ONNX model
-    #[arg(long, default_value = "models/blazepose_full.onnx")]
-    model: PathBuf,
-
-    /// Limit number of frames processed (for quick smoke tests)
-    #[arg(long)]
-    max_frames: Option<usize>,
-
-    /// Output format (json: PoseSequence struct, tsv: 1 row per frame, 197 columns)
-    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
-    format: OutputFormat,
-
-    /// Apply sigmoid to visibility/presence logits (confidence is already [0,1])
-    #[arg(long)]
-    apply_sigmoid: bool,
-
-    /// Inspect an ONNX model's inputs/outputs and exit
-    #[arg(long)]
-    inspect_model: Option<PathBuf>,
-
-    /// Run a dummy inference on the given ONNX model and print output shapes
-    #[arg(long)]
-    test_inference: Option<PathBuf>,
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Inspect an ONNX model's inputs/outputs and exit (dev utility)
+    Inspect { model: PathBuf },
+    /// Run dummy inference on an ONNX model and print output shapes (dev utility)
+    TestInfer { model: PathBuf },
+}
+
+#[derive(Debug, Clone, Copy)]
 enum OutputFormat {
     Json,
     Tsv,
+}
+
+#[derive(Debug)]
+struct RunConfig {
+    input: PathBuf,
+    model: PathBuf,
+    format: OutputFormat,
+    apply_sigmoid: bool,
+    save_overlay: Option<PathBuf>,
+    overlay_count: usize,
+    max_frames: Option<usize>,
+    output: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
@@ -88,40 +86,46 @@ struct PoseSequence {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
-
-    if let Some(model_path) = &args.inspect_model {
-        return inspect_onnx(model_path);
+    let cli = Cli::parse();
+    match cli.command {
+        Some(Commands::Inspect { model }) => inspect_onnx(&model),
+        Some(Commands::TestInfer { model }) => test_inference(&model),
+        None => {
+            let cfg = run_wizard()?;
+            run_extraction(cfg)
+        }
     }
+}
 
-    if let Some(model_path) = &args.test_inference {
-        return test_inference(model_path);
-    }
-
-    let input = args
-        .input
-        .as_ref()
-        .context("input video path required (unless --inspect-model or --test-inference is used)")?;
-
-    let info = probe_video(input)?;
+fn run_extraction(cfg: RunConfig) -> Result<()> {
+    let info = probe_video(&cfg.input)?;
     eprintln!(
         "video: {}x{} @ {:.2}fps, {} frames, duration={:.2}s",
         info.width, info.height, info.fps, info.frame_count, info.duration
     );
 
     let mut session = Session::builder()?
-        .commit_from_file(&args.model)
-        .with_context(|| format!("failed to load model: {}", args.model.display()))?;
-    eprintln!("loaded model: {}", args.model.display());
+        .commit_from_file(&cfg.model)
+        .with_context(|| format!("failed to load model: {}", cfg.model.display()))?;
+    eprintln!("loaded model: {}", cfg.model.display());
 
-    let max_frames = args.max_frames;
+    let overlay_targets = overlay_target_indices(
+        cfg.save_overlay.as_ref(),
+        info.frame_count as usize,
+        cfg.max_frames,
+        cfg.overlay_count,
+    );
     let mut frames: Vec<PoseFrame> = Vec::new();
+    let mut overlay_buffer: Vec<(usize, Array3<u8>)> = Vec::new();
 
-    extract_frames(input, info.width, info.height, |idx, frame| {
-        if let Some(m) = max_frames {
+    extract_frames(&cfg.input, info.width, info.height, |idx, frame| {
+        if let Some(m) = cfg.max_frames {
             if idx >= m {
                 return Ok(());
             }
+        }
+        if overlay_targets.contains(&idx) {
+            overlay_buffer.push((idx, frame.clone()));
         }
         let (shape, data) = preprocess_frame(&frame)?;
         let input_value = Value::from_array((shape, data))?;
@@ -143,22 +147,36 @@ fn main() -> Result<()> {
 
     let mut sequence = PoseSequence {
         video: info,
-        model: args.model.to_string_lossy().to_string(),
-        sigmoid_applied: args.apply_sigmoid,
+        model: cfg.model.to_string_lossy().to_string(),
+        sigmoid_applied: cfg.apply_sigmoid,
         frames,
     };
 
-    if args.apply_sigmoid {
+    if cfg.apply_sigmoid {
         apply_sigmoid_to_frames(&mut sequence.frames);
     }
 
+    print_stats(&sequence);
+
+    if let Some(dir) = &cfg.save_overlay {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("create dir {}", dir.display()))?;
+        for (idx, frame) in &overlay_buffer {
+            if let Some(pose_frame) = sequence.frames.iter().find(|f| f.frame_idx == *idx) {
+                let path = dir.join(format!("frame_{:05}.png", idx));
+                draw_overlay(frame, pose_frame, sequence.sigmoid_applied, &path)?;
+                eprintln!("wrote overlay: {}", path.display());
+            }
+        }
+    }
+
     let stdout = std::io::stdout();
-    let mut out: Box<dyn Write> = match &args.output {
+    let mut out: Box<dyn Write> = match &cfg.output {
         Some(p) => Box::new(std::fs::File::create(p)?),
         None => Box::new(stdout.lock()),
     };
 
-    match args.format {
+    match cfg.format {
         OutputFormat::Json => {
             serde_json::to_writer_pretty(&mut out, &sequence)?;
             writeln!(out)?;
@@ -166,11 +184,133 @@ fn main() -> Result<()> {
         OutputFormat::Tsv => write_tsv(&sequence, &mut out)?,
     }
 
-    if let Some(p) = &args.output {
+    if let Some(p) = &cfg.output {
         eprintln!("wrote {}", p.display());
     }
 
     Ok(())
+}
+
+fn run_wizard() -> Result<RunConfig> {
+    let theme = ColorfulTheme::default();
+
+    let videos = list_videos(Path::new(VIDEO_DIR));
+    let mut video_items: Vec<String> = videos
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    video_items.push("[パスを直接入力]".into());
+
+    if videos.is_empty() {
+        eprintln!(
+            "note: {} ディレクトリに動画が見つかりませんでした。直接パスを入力してください。",
+            VIDEO_DIR
+        );
+    }
+
+    let video_idx = Select::with_theme(&theme)
+        .with_prompt("動画を選択")
+        .items(&video_items)
+        .default(0)
+        .interact()?;
+
+    let input = if video_idx == videos.len() {
+        let s: String = Input::with_theme(&theme)
+            .with_prompt("動画パス")
+            .interact_text()?;
+        PathBuf::from(s.trim())
+    } else {
+        videos[video_idx].clone()
+    };
+
+    let format_idx = Select::with_theme(&theme)
+        .with_prompt("出力形式")
+        .items(&["JSON", "TSV (1行=1フレーム)"])
+        .default(0)
+        .interact()?;
+    let format = if format_idx == 0 {
+        OutputFormat::Json
+    } else {
+        OutputFormat::Tsv
+    };
+
+    let feature_labels = &[
+        "sigmoid を visibility/presence に適用",
+        "ランドマーク オーバーレイ PNG 保存",
+        "フレーム数制限 (動作確認用)",
+    ];
+    let selected = MultiSelect::with_theme(&theme)
+        .with_prompt("追加機能 (space で選択, enter で確定)")
+        .items(feature_labels)
+        .interact()?;
+    let apply_sigmoid = selected.contains(&0);
+    let want_overlay = selected.contains(&1);
+    let want_limit = selected.contains(&2);
+
+    let (save_overlay, overlay_count) = if want_overlay {
+        let dir: String = Input::with_theme(&theme)
+            .with_prompt("オーバーレイ保存先ディレクトリ")
+            .default("/tmp/overlay".into())
+            .interact_text()?;
+        let count: usize = Input::with_theme(&theme)
+            .with_prompt("オーバーレイ枚数")
+            .default(3)
+            .interact_text()?;
+        (Some(PathBuf::from(dir.trim())), count)
+    } else {
+        (None, 3)
+    };
+
+    let max_frames = if want_limit {
+        let n: usize = Input::with_theme(&theme)
+            .with_prompt("最大フレーム数")
+            .default(10)
+            .interact_text()?;
+        Some(n)
+    } else {
+        None
+    };
+
+    let out_str: String = Input::with_theme(&theme)
+        .with_prompt("出力ファイル (空欄=stdout)")
+        .allow_empty(true)
+        .interact_text()?;
+    let output = if out_str.trim().is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(out_str.trim()))
+    };
+
+    Ok(RunConfig {
+        input,
+        model: PathBuf::from(DEFAULT_MODEL),
+        format,
+        apply_sigmoid,
+        save_overlay,
+        overlay_count,
+        max_frames,
+        output,
+    })
+}
+
+fn list_videos(dir: &Path) -> Vec<PathBuf> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return vec![],
+    };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .filter(|p| {
+            p.extension()
+                .and_then(|s| s.to_str())
+                .map(|s| VIDEO_EXTS.contains(&s.to_lowercase().as_str()))
+                .unwrap_or(false)
+        })
+        .collect();
+    files.sort();
+    files
 }
 
 fn preprocess_frame(frame: &Array3<u8>) -> Result<(Vec<usize>, Vec<f32>)> {
@@ -244,6 +384,107 @@ fn write_tsv<W: Write>(seq: &PoseSequence, w: &mut W) -> Result<()> {
         }
         writeln!(w)?;
     }
+    Ok(())
+}
+
+fn overlay_target_indices(
+    save_overlay: Option<&PathBuf>,
+    frame_count: usize,
+    max_frames: Option<usize>,
+    overlay_count: usize,
+) -> Vec<usize> {
+    if save_overlay.is_none() {
+        return vec![];
+    }
+    let upper = match max_frames {
+        Some(m) => m.min(frame_count.max(m)),
+        None => frame_count,
+    };
+    if upper == 0 {
+        eprintln!("warning: frame_count is 0 (ffprobe nb_frames unavailable); overlay disabled");
+        return vec![];
+    }
+    let count = overlay_count.max(1).min(upper);
+    if count == 1 {
+        return vec![0];
+    }
+    (0..count)
+        .map(|i| i * (upper - 1) / (count - 1))
+        .collect()
+}
+
+fn print_stats(seq: &PoseSequence) {
+    if seq.frames.is_empty() {
+        eprintln!("stats: (no frames)");
+        return;
+    }
+    let n = seq.frames.len() as f32;
+    let confs: Vec<f32> = seq.frames.iter().map(|f| f.confidence).collect();
+    let conf_mean = confs.iter().sum::<f32>() / n;
+    let conf_max = confs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let conf_min = confs.iter().cloned().fold(f32::INFINITY, f32::min);
+
+    let vis_sum: f32 = seq
+        .frames
+        .iter()
+        .flat_map(|f| f.landmarks.iter().map(|l| {
+            if seq.sigmoid_applied {
+                l.visibility
+            } else {
+                sigmoid(l.visibility)
+            }
+        }))
+        .sum();
+    let vis_mean = vis_sum / (n * 39.0);
+
+    eprintln!(
+        "stats: confidence mean={:.3} max={:.3} min={:.3} | visibility(sigmoid) mean={:.3}",
+        conf_mean, conf_max, conf_min, vis_mean
+    );
+}
+
+fn draw_overlay(
+    frame: &Array3<u8>,
+    pose: &PoseFrame,
+    sigmoid_applied: bool,
+    out: &std::path::Path,
+) -> Result<()> {
+    let h = frame.shape()[0] as u32;
+    let w = frame.shape()[1] as u32;
+    let raw: Vec<u8> = frame.iter().copied().collect();
+    let mut img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_raw(w, h, raw)
+        .context("failed to construct ImageBuffer from frame bytes for overlay")?;
+
+    let radius: i32 = 3;
+    let sx = w as f32 / 256.0;
+    let sy = h as f32 / 256.0;
+
+    for lm in &pose.landmarks {
+        let vis = if sigmoid_applied {
+            lm.visibility
+        } else {
+            sigmoid(lm.visibility)
+        };
+        let color = if vis > 0.5 {
+            Rgb([0u8, 255, 0])
+        } else {
+            Rgb([255u8, 0, 0])
+        };
+        let cx = (lm.x * sx).round() as i32;
+        let cy = (lm.y * sy).round() as i32;
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                let px = cx + dx;
+                let py = cy + dy;
+                if px >= 0 && py >= 0 && (px as u32) < w && (py as u32) < h {
+                    img.put_pixel(px as u32, py as u32, color);
+                }
+            }
+        }
+    }
+
+    img.save(out)
+        .with_context(|| format!("failed to save overlay PNG: {}", out.display()))?;
     Ok(())
 }
 

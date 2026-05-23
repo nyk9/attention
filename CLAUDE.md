@@ -24,15 +24,16 @@
 
 ### 4. pose_extractor - 動画→姿勢ランドマーク抽出CLI
 - BlazePose ONNX(MediaPipe Pose 変換版)を `ort` クレートで呼び、動画フレームから39 keypoints(33+6補助)を抽出
-- **ステータス**: Phase 0a-pipe-v1 の S1-S5 完了(動画フレーム→ONNX推論→JSON/TSV出力、sigmoid適用オプション)
-- **使用クレート**: ort 2.0.0-rc.12, ndarray 0.16, image 0.25, clap 4, serde, anyhow
+- **ステータス**: Phase 0a-pipe-v1 の S1-S6(機能側)完了。対話ウィザード CLI に移行済み
+- **使用クレート**: ort 2.0.0-rc.12, ndarray 0.16, image 0.25, clap 4, dialoguer 0.11, serde, anyhow
 - **外部依存**: ffmpeg 8.1.1(`brew install ffmpeg`、CLI subprocess 経由で動画読み込み)
 - **モデル**: `models/blazepose_full.onnx`(5.3MB、HF `opencv/pose_estimation_mediapipe`)。git管理外
-- **バイナリ**: `pose-extract`(`--inspect-model` / `--test-inference` モードあり、`--model` / `--max-frames` / `--output` / `--format json|tsv` / `--apply-sigmoid` 対応)
-- **入力仕様**: NHWC (1, 256, 256, 3) float32 [0, 1] RGB
+- **バイナリ**: `pose-extract`(引数なし起動でウィザード。dev サブコマンド `inspect <model>` / `test-infer <model>`)
+- **使い方**: `pose_extractor/CLI.md` 参照(videos/ ディレクトリに動画を置く運用)
+- **入力仕様**: NHWC (1, 256, 256, 3) float32 [0, 1] RGB(stretch リサイズ、letterbox は未実装)
 - **出力仕様**: landmarks (1, 195) = 39 × [x, y, z, visibility, presence] + conf (1, 1) + その他3個
 - **TSV出力**: wide 形式(1 行 = 1 フレーム、197 列: frame_idx, confidence, x0..pres38)
-- **次のステップ**: S6(撮影+前処理)→ S7-8(transformer_burn 連携)
+- **次のステップ**: 実物動画で confidence 検証 → 必要なら letterbox 追加 → S7-8(transformer_burn 連携)
 
 ---
 

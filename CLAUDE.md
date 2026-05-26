@@ -30,7 +30,7 @@
 - **モデル**: `models/blazepose_full.onnx`(5.3MB、HF `opencv/pose_estimation_mediapipe`)。git管理外
 - **バイナリ**: `pose-extract`(引数なし起動でウィザード。`videos/` から動画選択、単発/バッチ両対応。dev サブコマンド `inspect <model>` / `test-infer <model>`)
 - **使い方**: `pose_extractor/CLI.md` 参照(videos/ ディレクトリに動画を置く運用)
-- **入力仕様**: NHWC (1, 256, 256, 3) float32 [0, 1] RGB(stretch リサイズ、letterbox は未実装)
+- **入力仕様**: NHWC (1, 256, 256, 3) float32 [0, 1] RGB(中央クロップ + 256×256 リサイズ、S6 検証後に stretch から変更)
 - **出力仕様**: landmarks (1, 195) = 39 × [x, y, z, visibility, presence] + conf (1, 1) + その他3個
 - **TSV出力**: wide 形式(1 行 = 1 フレーム、197 列: frame_idx, confidence, x0..pres38)
 
@@ -43,17 +43,20 @@
 
 原因(推定): BlazePose の **Pose Landmark モデルは「人物がクロップされた正方形画像」を前提**。MediaPipe 本来のパイプラインは Pose Detection で bbox を取って人物クロップしてから Landmark に渡す 2 段構え。現状は後半のみを使い、1920×1080 をいきなり 256×256 に stretch しているので、モデルから見ると「全身が崩れた変な人物」になる。顔だけは確実に検出できるので confidence 数値だけ高く出る。
 
-#### 改善案(検討中)
+#### 改善案と採用方針(2026-05-23 決定)
 
-| 案 | 工数 | 手話用途への適合 |
-|---|---|---|
-| A. 中央クロップ(1080×1080 → 256×256) | 小 | 上半身は改善、脚は不可視のまま |
-| B. Pose Detection モデル追加(2段パイプライン) | 中 | MediaPipe 本来のフロー |
-| C. MediaPipe Hands ONNX 併用(手指 21点×2) | 中-大 | 手話に最重要な手指が取れる |
-| D. MediaPipe Holistic(Pose + Hands + Face) | 大 | 表情・手指・上半身姿勢を統合 |
+| 案 | 工数 | 手話用途への適合 | 採用 |
+|---|---|---|---|
+| A. 中央クロップ(1080×1080 → 256×256) | 小 | 上半身は改善、脚は不可視のまま | **採用(第1段)** |
+| B. Pose Detection モデル追加(2段パイプライン) | 中 | MediaPipe 本来のフロー | 不採用(手指が取れない) |
+| C. MediaPipe Hands ONNX 併用(手指 21点×2) | 中-大 | 手話に最重要な手指が取れる | **採用(第2段)** |
+| D. MediaPipe Holistic(Pose + Hands + Face) | 大 | 表情・手指・上半身姿勢を統合 | 将来採用予定 |
 
-- **次のステップ**: S6 改善方針(A/B/C/D)を選択 → 実装 → 再検証 → S7-8(transformer_burn 連携)
-- 手話用途は脚不要・手指と表情が最重要なので、A(クロップ簡易対応)+ C(Hands 追加)が現実的
+- **採用方針**: 段階的に A → C → 将来 D
+  - 第1段: A の中央クロップで BlazePose の上半身ランドマークを正しく取れるようにする
+  - 第2段: C で MediaPipe Hands ONNX を追加し、手指 21点×2手を併用
+  - 将来: A+C が安定したら D の Holistic 統合(表情・微妙な手指・上半身姿勢を一体化)へ
+- **次のステップ**: A(中央クロップ)実装 → 6動画で再検証 → C(Hands)実装 → S7-8(transformer_burn 連携)
 
 ---
 

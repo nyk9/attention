@@ -148,6 +148,53 @@ hand landmark: 170 frames with hands, 335 hands total
 
 - 通常 palm 数 ≥ hand 数(hand landmark の conf<0.5 が弾かれるため)
 
+## build-dict サブコマンド(S7: transformer_burn 連携)
+
+タグ名を付けた動画群から「タグ→ポーズ列」辞書(JSON)を構築する。
+日本語→手話タグ翻訳(transformer_burn)の出力タグに、参照ポーズ列を
+紐付けるための前処理。ウィザードと違い TTY 不要なのでスクリプトから呼べる。
+
+```bash
+# videos/ 内の <タグ名>.mp4 から辞書を作る
+./target/release/pose-extract build-dict \
+    --input-dir videos \
+    --output tag_pose_dict.json \
+    --frames 10
+```
+
+- **入力**: `--input-dir` 内の `<タグ名>.mp4`(ファイル名の拡張子を除いた部分がタグ名)
+  - 例: `ありがとう.mp4` → タグ `ありがとう`
+  - 1 動画 = 1 タグ。ELAN アノテーション不要(動画全体がそのサインを表す前提)
+- **`--frames`**: 各クリップを何フレームにダウンサンプルするか(既定 10、transformer_burn の `SEQ_LEN` と揃える)
+- **特徴量**: 1 フレーム = 126 次元 = 左手 21 点 + 右手 21 点、各 `[x, y, z]`
+  - **手のみ**を使う(BlazePose の身体ランドマークは S6 で破綻が判明したため不採用)
+  - 座標は正規化済み: `x/=width`, `y/=height`, `z/=width`
+  - handedness で左右スロットに振り分け。検出されなかった手はゼロ埋め
+- **出力 JSON**:
+
+```json
+{
+  "metadata": {
+    "frames": 10,
+    "feature_dim": 126,
+    "feature_layout": "left_hand[21*xyz] then right_hand[21*xyz]; missing hand = zeros",
+    "normalization": "x/=width, y/=height, z/=width (z is relative depth)",
+    "tag_count": 2
+  },
+  "tags": {
+    "ありがとう": {
+      "sequence": [[...126 floats...], ...10 frames...],
+      "left_hand_coverage": 0.62,
+      "right_hand_coverage": 0.61,
+      "source": "ありがとう.mp4"
+    }
+  }
+}
+```
+
+- **coverage**: そのタグで左右の手が検出できたフレームの割合。低い(< 0.3 等)なら
+  動画の撮り方(手が画角外/小さすぎ)を見直す目安。
+
 ## 開発用サブコマンド
 
 通常使わないが、ONNX モデルの調査用に残してある:
@@ -175,10 +222,10 @@ BlazePose の Pose Landmark モデルは「正方形にクロップされた人�
 
 ## 自動化したくなった時
 
-ウィザードは TTY が必要なため、CI やスクリプトから呼ぶことはできない。
-S7-8(transformer_burn 連携)などで自動化が必要になったら、
-`RunConfig` を直接組み立てるサブコマンド(例: `pose-extract batch --input ...`)を
-別途追加する想定。現在は対話のみ。
+ウィザード(引数なし起動)は TTY が必要なため、CI やスクリプトから呼ぶことはできない。
+辞書構築の自動化には上記 `build-dict` サブコマンドを使う(TTY 不要)。
+個別動画の JSON/TSV 抽出をスクリプト化したい場合は、`RunConfig` を直接組み立てる
+サブコマンド(例: `pose-extract batch --input ...`)を別途追加する想定。
 
 ## トラブルシューティング
 

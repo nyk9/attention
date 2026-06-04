@@ -7,6 +7,7 @@ use ndarray::Array3;
 use ort::session::Session;
 use ort::value::Value;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -27,6 +28,10 @@ const HAND_CROP_ENLARGE: f32 = 3.0;
 const HAND_CROP_SHIFT_Y: f32 = -0.4;
 const HAND_CONF_THRESHOLD: f32 = 0.5;
 
+// build-dict: 1 フレームの特徴量 = 左手 21 点 + 右手 21 点、各 [x, y, z]
+const HAND_POINTS: usize = 21;
+const DICT_FEATURE_DIM: usize = HAND_POINTS * 3 * 2; // = 126
+
 #[derive(Parser, Debug)]
 #[command(
     name = "pose-extract",
@@ -44,6 +49,19 @@ enum Commands {
     Inspect { model: PathBuf },
     /// Run dummy inference on an ONNX model and print output shapes (dev utility)
     TestInfer { model: PathBuf },
+    /// Build a tag->pose dictionary from tag-named videos (S7, JSL generation support).
+    /// Each `<tag>.mp4` becomes one entry: hand landmarks downsampled to `--frames`.
+    BuildDict {
+        /// Directory containing `<tag>.mp4` videos (file stem = tag name)
+        #[arg(long, default_value = VIDEO_DIR)]
+        input_dir: PathBuf,
+        /// Output JSON dictionary path
+        #[arg(long, default_value = "tag_pose_dict.json")]
+        output: PathBuf,
+        /// Number of frames to downsample each clip to (match transformer_burn SEQ_LEN)
+        #[arg(long, default_value_t = 10)]
+        frames: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -143,11 +161,50 @@ struct HandFrame {
     hands: Vec<Hand>,
 }
 
+// === build-dict (S7) 出力スキーマ ===
+
+#[derive(Debug, Serialize)]
+struct PoseDict {
+    metadata: PoseDictMeta,
+    tags: BTreeMap<String, TagEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct PoseDictMeta {
+    /// 各タグのフレーム数 T
+    frames: usize,
+    /// 1 フレームの特徴量次元(= 126)
+    feature_dim: usize,
+    /// 特徴量の並び順の説明
+    feature_layout: String,
+    /// 座標正規化の説明
+    normalization: String,
+    /// 辞書に含めたタグ数
+    tag_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct TagEntry {
+    /// [T フレーム][feature_dim] の正規化済みハンドランドマーク列
+    sequence: Vec<Vec<f32>>,
+    /// 左手が検出されたフレームの割合 [0,1]
+    left_hand_coverage: f32,
+    /// 右手が検出されたフレームの割合 [0,1]
+    right_hand_coverage: f32,
+    /// 抽出元の動画ファイル名
+    source: String,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Commands::Inspect { model }) => inspect_onnx(&model),
         Some(Commands::TestInfer { model }) => test_inference(&model),
+        Some(Commands::BuildDict {
+            input_dir,
+            output,
+            frames,
+        }) => build_dict(&input_dir, &output, frames),
         None => {
             let configs = run_wizard()?;
             let total = configs.len();
@@ -364,6 +421,213 @@ fn run_extraction(cfg: RunConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// S7: `<tag>.mp4` 群からタグ→ポーズ辞書を構築する。
+/// 各動画のハンドランドマークを `frames` フレームにダウンサンプルして JSON に書き出す。
+fn build_dict(input_dir: &Path, output: &Path, frames: usize) -> Result<()> {
+    if frames == 0 {
+        anyhow::bail!("--frames must be >= 1");
+    }
+
+    let videos = list_videos(input_dir);
+    if videos.is_empty() {
+        anyhow::bail!(
+            "no videos found in {} (place `<tag>.mp4` files there)",
+            input_dir.display()
+        );
+    }
+    eprintln!("found {} videos in {}", videos.len(), input_dir.display());
+
+    // Palm + Hand モデルを 1 回だけロードして全動画で使い回す
+    let palm_anchors = load_palm_anchors();
+    let mut palm_session = Session::builder()?
+        .commit_from_file(PALM_MODEL)
+        .with_context(|| format!("failed to load palm model: {}", PALM_MODEL))?;
+    let mut hand_session = Session::builder()?
+        .commit_from_file(HAND_MODEL)
+        .with_context(|| format!("failed to load hand model: {}", HAND_MODEL))?;
+    eprintln!("loaded palm + hand models");
+
+    let mut tags: BTreeMap<String, TagEntry> = BTreeMap::new();
+    for video in &videos {
+        let tag = video
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".into());
+        eprintln!("\n=== {} ({}) ===", tag, video.display());
+
+        let entry = extract_tag_features(
+            video,
+            &mut palm_session,
+            &mut hand_session,
+            &palm_anchors,
+            frames,
+        )?;
+        eprintln!(
+            "  left_hand_coverage={:.0}% right_hand_coverage={:.0}%",
+            entry.left_hand_coverage * 100.0,
+            entry.right_hand_coverage * 100.0
+        );
+        if tags.contains_key(&tag) {
+            eprintln!("  warning: duplicate tag '{}', overwriting previous entry", tag);
+        }
+        tags.insert(tag, entry);
+    }
+
+    let dict = PoseDict {
+        metadata: PoseDictMeta {
+            frames,
+            feature_dim: DICT_FEATURE_DIM,
+            feature_layout: "left_hand[21*xyz] then right_hand[21*xyz]; missing hand = zeros"
+                .into(),
+            normalization: "x/=width, y/=height, z/=width (z is relative depth)".into(),
+            tag_count: tags.len(),
+        },
+        tags,
+    };
+
+    if let Some(parent) = output.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create dir {}", parent.display()))?;
+        }
+    }
+    let file = std::fs::File::create(output)
+        .with_context(|| format!("create {}", output.display()))?;
+    serde_json::to_writer_pretty(file, &dict)?;
+    eprintln!(
+        "\nwrote dictionary: {} ({} tags, {} frames x {} dims)",
+        output.display(),
+        dict.metadata.tag_count,
+        frames,
+        DICT_FEATURE_DIM
+    );
+
+    Ok(())
+}
+
+/// 1 動画からハンドランドマーク列を抽出し、`target` フレームにダウンサンプルした TagEntry を返す。
+fn extract_tag_features(
+    video: &PathBuf,
+    palm_session: &mut Session,
+    hand_session: &mut Session,
+    palm_anchors: &[[f32; 2]],
+    target: usize,
+) -> Result<TagEntry> {
+    let info = probe_video(video)?;
+    let width = info.width as f32;
+    let height = info.height as f32;
+
+    // 全フレームの (特徴量, 左手検出, 右手検出) を集める
+    let mut per_frame: Vec<([f32; DICT_FEATURE_DIM], bool, bool)> = Vec::new();
+    extract_frames(video, info.width, info.height, |_idx, frame| {
+        let palms = run_palm_detection(palm_session, &frame, palm_anchors)?;
+        let mut hands: Vec<Hand> = Vec::new();
+        for palm in &palms {
+            if let Some(h) = run_hand_landmark(hand_session, &frame, palm)? {
+                hands.push(h);
+            }
+        }
+        per_frame.push(frame_hand_feature(&hands, width, height));
+        Ok(())
+    })?;
+
+    if per_frame.is_empty() {
+        anyhow::bail!("no frames extracted from {}", video.display());
+    }
+
+    let left_cov =
+        per_frame.iter().filter(|(_, l, _)| *l).count() as f32 / per_frame.len() as f32;
+    let right_cov =
+        per_frame.iter().filter(|(_, _, r)| *r).count() as f32 / per_frame.len() as f32;
+
+    // ダウンサンプル: 均等間隔で target 個のインデックスを取る
+    let indices = downsample_indices(per_frame.len(), target);
+    let sequence: Vec<Vec<f32>> = indices
+        .iter()
+        .map(|&i| per_frame[i].0.to_vec())
+        .collect();
+
+    Ok(TagEntry {
+        sequence,
+        left_hand_coverage: left_cov,
+        right_hand_coverage: right_cov,
+        source: video
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default(),
+    })
+}
+
+/// 検出されたハンドを左手スロット([0..63])と右手スロット([63..126])に割り当て、
+/// 正規化済みの 126 次元特徴量を作る。検出されなかった手はゼロ埋め。
+/// handedness >= 0.5 を右手とみなし、衝突時は confidence の高い方を優先する。
+fn frame_hand_feature(
+    hands: &[Hand],
+    width: f32,
+    height: f32,
+) -> ([f32; DICT_FEATURE_DIM], bool, bool) {
+    let mut feat = [0.0f32; DICT_FEATURE_DIM];
+    let mut left_filled = false;
+    let mut right_filled = false;
+
+    // confidence の高い順に最大 2 手まで採用
+    let mut sorted: Vec<&Hand> = hands.iter().collect();
+    sorted.sort_by(|a, b| {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    sorted.truncate(2);
+
+    for h in sorted {
+        let prefer_right = h.handedness >= 0.5;
+        // 希望スロットが埋まっていれば反対側へ(両手検出を優先して残す)
+        let slot = if prefer_right {
+            if !right_filled {
+                1
+            } else if !left_filled {
+                0
+            } else {
+                continue;
+            }
+        } else if !left_filled {
+            0
+        } else if !right_filled {
+            1
+        } else {
+            continue;
+        };
+
+        let base = slot * HAND_POINTS * 3;
+        for (k, lm) in h.landmarks.iter().enumerate().take(HAND_POINTS) {
+            feat[base + k * 3] = lm.x / width;
+            feat[base + k * 3 + 1] = lm.y / height;
+            feat[base + k * 3 + 2] = lm.z / width;
+        }
+        if slot == 0 {
+            left_filled = true;
+        } else {
+            right_filled = true;
+        }
+    }
+
+    (feat, left_filled, right_filled)
+}
+
+/// n 個の要素から target 個を均等間隔で選ぶインデックス列。
+/// n < target の場合は一部のフレームが繰り返される。
+fn downsample_indices(n: usize, target: usize) -> Vec<usize> {
+    if n == 0 || target == 0 {
+        return vec![];
+    }
+    if target == 1 {
+        return vec![0];
+    }
+    (0..target)
+        .map(|i| i * (n - 1) / (target - 1))
+        .collect()
 }
 
 enum OutputTarget {

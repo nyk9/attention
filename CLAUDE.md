@@ -56,7 +56,11 @@
   - 第1段: A の中央クロップで BlazePose の上半身ランドマークを正しく取れるようにする
   - 第2段: C で MediaPipe Hands ONNX を追加し、手指 21点×2手を併用
   - 将来: A+C が安定したら D の Holistic 統合(表情・微妙な手指・上半身姿勢を一体化)へ
-- **次のステップ**: A(中央クロップ)実装 → 6動画で再検証 → C(Hands)実装 → S7-8(transformer_burn 連携)
+- **進捗(2026-05-27 時点)**:
+  - A: 実装完了。confidence は向上したが身体ランドマークは破綻したまま(人物が正方形内で小さい)
+  - C-1(Palm Detection): 完了。SSD anchors 2016 を埋め込み、両手検出可能
+  - C-2(Hand Landmark): 完了。21 keypoints/手を取得。回転アラインメントは未実装のため指関節の精度は MediaPipe 純正よりやや劣る
+- **次のステップ**: 必要に応じて Hand Landmark の回転アラインメント実装 → S7-8(transformer_burn 連携)
 
 ---
 

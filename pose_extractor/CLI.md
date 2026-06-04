@@ -61,9 +61,16 @@ iPhone で撮った `.MOV` も AirDrop でこのディレクトリに入れれ�
   - **sigmoid**: 生のロジット値を [0,1] に正規化(visibility/presence のみ。confidence はモデル側で正規化済み)
   - **オーバーレイ PNG**: 等間隔のフレームにランドマークを描画し PNG 保存
     - 選択時に「保存先ディレクトリ」「枚数(既定 3)」を追加質問
-    - 緑=visibility > 0.5、赤=visibility ≤ 0.5
+    - 緑=visibility > 0.5、赤=visibility ≤ 0.5(BlazePose)
+    - シアン枠=palm bbox、黄色ドット=palm 7 keypoints(MediaPipe Palm Detection)
+    - マゼンタ/青ドット=hand 21 landmarks(handedness で色分け、MediaPipe Hand Landmark)
   - **フレーム数制限**: 動作確認用に先頭 N フレームのみ処理
     - 選択時に「最大フレーム数(既定 10)」を追加質問
+  - **MediaPipe Hands (Palm + Landmark) を並走**: 手指検出を並列実行
+    - `models/palm_detection_mediapipe.onnx` で手の bbox を抽出
+    - `models/handpose_estimation_mediapipe.onnx` で 21 keypoints/手 を抽出
+    - JSON 出力に `palm_frames` と `hand_frames` フィールドが追加される(TSV は pose のみ)
+    - 注:回転アラインメントは未実装。`HAND_CROP_ENLARGE=3.0` の簡易クロップのため、指関節の位置精度は MediaPipe 純正よりやや劣る
 - **出力ファイル**: 空欄で stdout、パス指定でそのファイルに書き出し
 
 ## 出力スキーマ
@@ -131,6 +138,15 @@ stats: confidence mean=0.066 max=0.579 min=0.000 | visibility(sigmoid) mean=0.27
 
 人物が映った動画なら confidence mean が 0.7〜0.95 程度になるのが目安。
 0.1 を切るようなら人物検出に失敗している可能性が高い。
+
+Hands を並走させた場合、以下も追加で出力:
+
+```
+palm detection: 172 frames with palms, 342 palms total
+hand landmark: 170 frames with hands, 335 hands total
+```
+
+- 通常 palm 数 ≥ hand 数(hand landmark の conf<0.5 が弾かれるため)
 
 ## 開発用サブコマンド
 

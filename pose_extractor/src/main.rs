@@ -14,7 +14,6 @@ use std::process::{Command, Stdio};
 const VIDEO_DIR: &str = "videos";
 const DEFAULT_MODEL: &str = "models/blazepose_full.onnx";
 const PALM_MODEL: &str = "models/palm_detection_mediapipe.onnx";
-#[allow(dead_code)]
 const HAND_MODEL: &str = "models/handpose_estimation_mediapipe.onnx";
 const VIDEO_EXTS: &[&str] = &["mp4", "mov", "mkv", "avi", "webm", "m4v"];
 
@@ -22,6 +21,11 @@ const PALM_INPUT_SIZE: u32 = 192;
 const PALM_SCORE_THRESHOLD: f32 = 0.5;
 const PALM_NMS_THRESHOLD: f32 = 0.3;
 const PALM_ANCHORS_BYTES: &[u8] = include_bytes!("../assets/palm_anchors.bin");
+
+const HAND_INPUT_SIZE: u32 = 224;
+const HAND_CROP_ENLARGE: f32 = 3.0;
+const HAND_CROP_SHIFT_Y: f32 = -0.4;
+const HAND_CONF_THRESHOLD: f32 = 0.5;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -53,6 +57,7 @@ struct RunConfig {
     input: PathBuf,
     model: PathBuf,
     palm_model: Option<PathBuf>,
+    hand_model: Option<PathBuf>,
     format: OutputFormat,
     apply_sigmoid: bool,
     save_overlay: Option<PathBuf>,
@@ -96,6 +101,10 @@ struct PoseSequence {
     palm_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     palm_frames: Option<Vec<PalmFrame>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hand_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hand_frames: Option<Vec<HandFrame>>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -112,6 +121,26 @@ struct PalmBox {
 struct PalmFrame {
     frame_idx: usize,
     palms: Vec<PalmBox>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct HandLandmarkPoint {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct Hand {
+    confidence: f32,
+    handedness: f32,
+    landmarks: Vec<HandLandmarkPoint>,
+}
+
+#[derive(Debug, Serialize)]
+struct HandFrame {
+    frame_idx: usize,
+    hands: Vec<Hand>,
 }
 
 fn main() -> Result<()> {
@@ -167,6 +196,15 @@ fn run_extraction(cfg: RunConfig) -> Result<()> {
         palm_session = Some(s);
     }
 
+    let mut hand_session: Option<Session> = None;
+    if let Some(hand_path) = &cfg.hand_model {
+        let s = Session::builder()?
+            .commit_from_file(hand_path)
+            .with_context(|| format!("failed to load hand model: {}", hand_path.display()))?;
+        eprintln!("loaded hand landmark model: {}", hand_path.display());
+        hand_session = Some(s);
+    }
+
     let overlay_targets = overlay_target_indices(
         cfg.save_overlay.as_ref(),
         info.frame_count as usize,
@@ -175,6 +213,7 @@ fn run_extraction(cfg: RunConfig) -> Result<()> {
     );
     let mut frames: Vec<PoseFrame> = Vec::new();
     let mut palm_frames: Vec<PalmFrame> = Vec::new();
+    let mut hand_frames: Vec<HandFrame> = Vec::new();
     let mut overlay_buffer: Vec<(usize, Array3<u8>)> = Vec::new();
 
     extract_frames(&cfg.input, info.width, info.height, |idx, frame| {
@@ -202,10 +241,24 @@ fn run_extraction(cfg: RunConfig) -> Result<()> {
 
         if let Some(palm_s) = palm_session.as_mut() {
             let palms = run_palm_detection(palm_s, &frame, &palm_anchors)?;
+            let mut hands_this_frame: Vec<Hand> = Vec::new();
+            if let Some(hand_s) = hand_session.as_mut() {
+                for palm in &palms {
+                    if let Some(h) = run_hand_landmark(hand_s, &frame, palm)? {
+                        hands_this_frame.push(h);
+                    }
+                }
+            }
             palm_frames.push(PalmFrame {
                 frame_idx: idx,
                 palms,
             });
+            if hand_session.is_some() {
+                hand_frames.push(HandFrame {
+                    frame_idx: idx,
+                    hands: hands_this_frame,
+                });
+            }
         }
 
         Ok(())
@@ -227,6 +280,18 @@ fn run_extraction(cfg: RunConfig) -> Result<()> {
     } else {
         None
     };
+    let hand_model_str = cfg.hand_model.as_ref().map(|p| p.to_string_lossy().to_string());
+    let hand_frames_opt = if hand_session.is_some() {
+        let total: usize = hand_frames.iter().map(|hf| hf.hands.len()).sum();
+        let with_hand = hand_frames.iter().filter(|hf| !hf.hands.is_empty()).count();
+        eprintln!(
+            "hand landmark: {} frames with hands, {} hands total",
+            with_hand, total
+        );
+        Some(hand_frames)
+    } else {
+        None
+    };
 
     let mut sequence = PoseSequence {
         video: info,
@@ -235,6 +300,8 @@ fn run_extraction(cfg: RunConfig) -> Result<()> {
         frames,
         palm_model: palm_model_str,
         palm_frames: palm_frames_opt,
+        hand_model: hand_model_str,
+        hand_frames: hand_frames_opt,
     };
 
     if cfg.apply_sigmoid {
@@ -252,12 +319,17 @@ fn run_extraction(cfg: RunConfig) -> Result<()> {
                     .palm_frames
                     .as_ref()
                     .and_then(|v| v.iter().find(|p| p.frame_idx == *idx));
+                let hand_frame = sequence
+                    .hand_frames
+                    .as_ref()
+                    .and_then(|v| v.iter().find(|h| h.frame_idx == *idx));
                 let path = dir.join(format!("frame_{:05}.png", idx));
                 draw_overlay(
                     frame,
                     pose_frame,
                     sequence.sigmoid_applied,
                     palm_frame,
+                    hand_frame,
                     &path,
                 )?;
                 eprintln!("wrote overlay: {}", path.display());
@@ -361,7 +433,7 @@ fn run_wizard() -> Result<Vec<RunConfig>> {
         "sigmoid を visibility/presence に適用",
         "ランドマーク オーバーレイ PNG 保存",
         "フレーム数制限 (動作確認用)",
-        "MediaPipe Palm Detection を並走 (実験的)",
+        "MediaPipe Hands (Palm + Landmark) を並走",
     ];
     let selected = MultiSelect::with_theme(&theme)
         .with_prompt("追加機能 (space で選択, enter で確定)")
@@ -370,7 +442,7 @@ fn run_wizard() -> Result<Vec<RunConfig>> {
     let apply_sigmoid = selected.contains(&0);
     let want_overlay = selected.contains(&1);
     let want_limit = selected.contains(&2);
-    let want_palm = selected.contains(&3);
+    let want_hands = selected.contains(&3);
 
     let (overlay_root, overlay_count) = if want_overlay {
         let prompt = if batch_mode {
@@ -449,8 +521,13 @@ fn run_wizard() -> Result<Vec<RunConfig>> {
             RunConfig {
                 input: input.clone(),
                 model: PathBuf::from(DEFAULT_MODEL),
-                palm_model: if want_palm {
+                palm_model: if want_hands {
                     Some(PathBuf::from(PALM_MODEL))
+                } else {
+                    None
+                },
+                hand_model: if want_hands {
+                    Some(PathBuf::from(HAND_MODEL))
                 } else {
                     None
                 },
@@ -681,6 +758,131 @@ fn iou_xyxy(a: &[f32; 4], b: &[f32; 4]) -> f32 {
     }
 }
 
+struct HandPreprocess {
+    shape: Vec<usize>,
+    data: Vec<f32>,
+    cx_orig: f32,
+    cy_orig: f32,
+    crop_size: f32,
+}
+
+fn preprocess_for_hand_landmark(frame: &Array3<u8>, palm: &PalmBox) -> Result<HandPreprocess> {
+    let fh = frame.shape()[0] as i32;
+    let fw = frame.shape()[1] as i32;
+
+    let palm_w = palm.x2 - palm.x1;
+    let palm_h = palm.y2 - palm.y1;
+    let palm_cx = (palm.x1 + palm.x2) / 2.0;
+    let palm_cy = (palm.y1 + palm.y2) / 2.0;
+
+    let shifted_cy = palm_cy + HAND_CROP_SHIFT_Y * palm_h;
+    let palm_size = palm_w.max(palm_h);
+    let crop_size = palm_size * HAND_CROP_ENLARGE;
+    let crop_size_i = crop_size.round().max(1.0) as i32;
+    let half = crop_size_i as f32 / 2.0;
+    let crop_x1 = (palm_cx - half).round() as i32;
+    let crop_y1 = (shifted_cy - half).round() as i32;
+    let crop_x2 = crop_x1 + crop_size_i;
+    let crop_y2 = crop_y1 + crop_size_i;
+
+    let raw: Vec<u8> = frame.iter().copied().collect();
+    let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_raw(fw as u32, fh as u32, raw)
+        .context("failed to construct ImageBuffer for hand preprocess")?;
+    let mut canvas: ImageBuffer<Rgb<u8>, Vec<u8>> =
+        ImageBuffer::from_pixel(crop_size_i as u32, crop_size_i as u32, Rgb([0u8, 0, 0]));
+
+    let src_x1 = crop_x1.max(0);
+    let src_y1 = crop_y1.max(0);
+    let src_x2 = crop_x2.min(fw);
+    let src_y2 = crop_y2.min(fh);
+    if src_x2 > src_x1 && src_y2 > src_y1 {
+        let dst_x = (src_x1 - crop_x1) as i64;
+        let dst_y = (src_y1 - crop_y1) as i64;
+        let sub = image::imageops::crop_imm(
+            &img,
+            src_x1 as u32,
+            src_y1 as u32,
+            (src_x2 - src_x1) as u32,
+            (src_y2 - src_y1) as u32,
+        )
+        .to_image();
+        image::imageops::overlay(&mut canvas, &sub, dst_x, dst_y);
+    }
+
+    let resized = image::imageops::resize(
+        &canvas,
+        HAND_INPUT_SIZE,
+        HAND_INPUT_SIZE,
+        FilterType::Triangle,
+    );
+    let data: Vec<f32> = resized
+        .pixels()
+        .flat_map(|p| {
+            [
+                p[0] as f32 / 255.0,
+                p[1] as f32 / 255.0,
+                p[2] as f32 / 255.0,
+            ]
+        })
+        .collect();
+
+    Ok(HandPreprocess {
+        shape: vec![
+            1usize,
+            HAND_INPUT_SIZE as usize,
+            HAND_INPUT_SIZE as usize,
+            3,
+        ],
+        data,
+        cx_orig: palm_cx,
+        cy_orig: shifted_cy,
+        crop_size: crop_size_i as f32,
+    })
+}
+
+fn run_hand_landmark(
+    session: &mut Session,
+    frame: &Array3<u8>,
+    palm: &PalmBox,
+) -> Result<Option<Hand>> {
+    let pre = preprocess_for_hand_landmark(frame, palm)?;
+    let input_value = Value::from_array((pre.shape, pre.data))?;
+    let outputs = session.run(ort::inputs!["input_1" => input_value])?;
+    let (_, ld) = outputs["Identity"].try_extract_tensor::<f32>()?;
+    let (_, conf) = outputs["Identity_1"].try_extract_tensor::<f32>()?;
+    let (_, handedness) = outputs["Identity_2"].try_extract_tensor::<f32>()?;
+
+    if ld.len() != 63 {
+        anyhow::bail!(
+            "hand landmark output size unexpected: got {} (expected 63)",
+            ld.len()
+        );
+    }
+
+    let confidence = conf[0];
+    if confidence < HAND_CONF_THRESHOLD {
+        return Ok(None);
+    }
+
+    let hand_score: f32 = handedness[0];
+    let scale = pre.crop_size / HAND_INPUT_SIZE as f32;
+    let center = HAND_INPUT_SIZE as f32 / 2.0;
+    let mut landmarks: Vec<HandLandmarkPoint> = Vec::with_capacity(21);
+    for i in 0..21 {
+        let off = i * 3;
+        let x = (ld[off] - center) * scale + pre.cx_orig;
+        let y = (ld[off + 1] - center) * scale + pre.cy_orig;
+        let z = ld[off + 2] * scale;
+        landmarks.push(HandLandmarkPoint { x, y, z });
+    }
+
+    Ok(Some(Hand {
+        confidence,
+        handedness: hand_score,
+        landmarks,
+    }))
+}
+
 fn parse_landmarks(data: &[f32]) -> Result<Vec<Landmark>> {
     if data.len() != 195 {
         anyhow::bail!(
@@ -796,6 +998,7 @@ fn draw_overlay(
     pose: &PoseFrame,
     sigmoid_applied: bool,
     palm: Option<&PalmFrame>,
+    hand: Option<&HandFrame>,
     out: &std::path::Path,
 ) -> Result<()> {
     let h = frame.shape()[0] as u32;
@@ -839,6 +1042,17 @@ fn draw_overlay(
             draw_rect_outline(&mut img, pbox.x1, pbox.y1, pbox.x2, pbox.y2, cyan, 2);
             for kp in &pbox.keypoints {
                 draw_dot(&mut img, kp[0], kp[1], 4, yellow);
+            }
+        }
+    }
+
+    if let Some(hand_frame) = hand {
+        let magenta = Rgb([255u8, 0, 200]);
+        let blue = Rgb([60u8, 120, 255]);
+        for h in &hand_frame.hands {
+            let color = if h.handedness > 0.5 { magenta } else { blue };
+            for lm in &h.landmarks {
+                draw_dot(&mut img, lm.x, lm.y, 3, color);
             }
         }
     }

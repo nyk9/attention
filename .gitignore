@@ -25,3 +25,12 @@ pose_extractor/videos/*
 
 # pose_extractor: wizard batch output directories
 pose_extractor/results/
+
+# transformer_burn: 学習済み認識モデル(大きい/--train-pose で再生成)
+transformer_burn/models/rec_*/
+# transformer_burn: build-dict の派生ポーズ辞書
+transformer_burn/data/pose_dict*.json
+# transformer_burn: 撮影データ・進捗(録画は大きい/index.tsv は再生成可能)
+transformer_burn/data/raw_jsl/
+# checkpoint クロスバックエンドテストの一時生成物
+transformer_burn/tests/temp_checkpoint_test*/

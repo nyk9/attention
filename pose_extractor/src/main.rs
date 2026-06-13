@@ -1,5 +1,6 @@
+mod progress;
+
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
 use dialoguer::{theme::ColorfulTheme, Input, MultiSelect, Select};
 use image::imageops::FilterType;
 use image::{ImageBuffer, Rgb};
@@ -32,37 +33,11 @@ const HAND_CONF_THRESHOLD: f32 = 0.5;
 const HAND_POINTS: usize = 21;
 const DICT_FEATURE_DIM: usize = HAND_POINTS * 3 * 2; // = 126
 
-#[derive(Parser, Debug)]
-#[command(
-    name = "pose-extract",
-    about = "Interactive pose landmark extractor (BlazePose ONNX). \
-             Drop videos in ./videos/ and run with no args to launch the wizard."
-)]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Commands>,
-}
-
-#[derive(Subcommand, Debug)]
-enum Commands {
-    /// Inspect an ONNX model's inputs/outputs and exit (dev utility)
-    Inspect { model: PathBuf },
-    /// Run dummy inference on an ONNX model and print output shapes (dev utility)
-    TestInfer { model: PathBuf },
-    /// Build a tag->pose dictionary from tag-named videos (S7, JSL generation support).
-    /// Each `<tag>.mp4` becomes one entry: hand landmarks downsampled to `--frames`.
-    BuildDict {
-        /// Directory containing `<tag>.mp4` videos (file stem = tag name)
-        #[arg(long, default_value = VIDEO_DIR)]
-        input_dir: PathBuf,
-        /// Output JSON dictionary path
-        #[arg(long, default_value = "tag_pose_dict.json")]
-        output: PathBuf,
-        /// Number of frames to downsample each clip to (match transformer_burn SEQ_LEN)
-        #[arg(long, default_value_t = 10)]
-        frames: usize,
-    },
-}
+// CLI はフラグを使わず、引数なし起動のトップレベルメニュー(質問形式)で全機能に入る。
+// 設定値はすべて dialoguer の Select/Input/MultiSelect で対話的に尋ねる。
+const RAW_JSL_DIR: &str = "../transformer_burn/data/raw_jsl";
+// 認識モデル(手ポーズ列→タグ)の保存先。transformer_burn の --save 既定の置き場。
+const REC_MODEL_DIR: &str = "../transformer_burn/models";
 
 #[derive(Debug, Clone, Copy)]
 enum OutputFormat {
@@ -196,37 +171,332 @@ struct TagEntry {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
-    match cli.command {
-        Some(Commands::Inspect { model }) => inspect_onnx(&model),
-        Some(Commands::TestInfer { model }) => test_inference(&model),
-        Some(Commands::BuildDict {
-            input_dir,
-            output,
-            frames,
-        }) => build_dict(&input_dir, &output, frames),
-        None => {
-            let configs = run_wizard()?;
-            let total = configs.len();
-            for (i, cfg) in configs.into_iter().enumerate() {
-                if total > 1 {
-                    eprintln!(
-                        "\n=== [{}/{}] {} ===",
-                        i + 1,
-                        total,
-                        cfg.input.display()
-                    );
-                }
-                run_extraction(cfg)?;
-            }
-            if total > 1 {
-                eprintln!("\ndone: {} videos processed", total);
-            }
+    let theme = ColorfulTheme::default();
+
+    let actions = &[
+        "動画から姿勢/手を抽出",
+        "撮影セッション(録画フォルダを監視して自動取り込み)",
+        "撮影進捗を確認",
+        "タグ→ポーズ辞書を構築(build-dict)",
+        "動画からタグを認識(推論)",
+        "[dev] ONNXモデルの入出力を調査(inspect)",
+        "[dev] ダミー推論で出力shapeを確認(test-infer)",
+        "終了",
+    ];
+
+    let idx = Select::with_theme(&theme)
+        .with_prompt("やることを選択")
+        .items(actions)
+        .default(0)
+        .interact()?;
+
+    match idx {
+        0 => run_extraction_wizard(),
+        1 => session_wizard(&theme),
+        2 => progress_wizard(&theme),
+        3 => build_dict_wizard(&theme),
+        4 => recognize_wizard(&theme),
+        5 => inspect_wizard(&theme),
+        6 => test_infer_wizard(&theme),
+        _ => {
+            println!("終了します");
             Ok(())
         }
     }
 }
 
+/// 動画抽出ウィザード(従来の引数なし起動の挙動)
+fn run_extraction_wizard() -> Result<()> {
+    let configs = run_wizard()?;
+    let total = configs.len();
+    for (i, cfg) in configs.into_iter().enumerate() {
+        if total > 1 {
+            eprintln!("\n=== [{}/{}] {} ===", i + 1, total, cfg.input.display());
+        }
+        run_extraction(cfg)?;
+    }
+    if total > 1 {
+        eprintln!("\ndone: {} videos processed", total);
+    }
+    Ok(())
+}
+
+/// 撮影進捗ウィザード
+fn progress_wizard(theme: &ColorfulTheme) -> Result<()> {
+    let data_dir: String = Input::with_theme(theme)
+        .with_prompt("撮影データのルート")
+        .default(RAW_JSL_DIR.into())
+        .interact_text()?;
+
+    let mode = Select::with_theme(theme)
+        .with_prompt("動作")
+        .items(&[
+            "index.tsv を更新して進捗表示",
+            "検証のみ(index.tsv を書き換えない)",
+        ])
+        .default(0)
+        .interact()?;
+
+    progress::run_progress(Path::new(data_dir.trim()), mode == 1)
+}
+
+/// 撮影セッションウィザード
+fn session_wizard(theme: &ColorfulTheme) -> Result<()> {
+    let data_dir: String = Input::with_theme(theme)
+        .with_prompt("撮影データのルート(取り込み先)")
+        .default(RAW_JSL_DIR.into())
+        .interact_text()?;
+
+    // OBS/QuickTime の既定保存先(~/Movies)を初期値として提示。
+    // dialoguer の Input ビルダーは self を消費するため、default 有無で分岐する
+    let home = std::env::var("HOME").unwrap_or_default();
+    let prompt = "監視する録画フォルダ(OBS/QuickTime の保存先)";
+    let watch: String = if home.is_empty() {
+        Input::with_theme(theme).with_prompt(prompt).interact_text()?
+    } else {
+        Input::with_theme(theme)
+            .with_prompt(prompt)
+            .default(format!("{home}/Movies"))
+            .interact_text()?
+    };
+
+    let hand = Select::with_theme(theme)
+        .with_prompt("取り込み時の手検出チェック")
+        .items(&[
+            "有効(カバレッジが低いテイクを ng_hands フラグ+撮り直し提案)",
+            "無効(取り込みが速い)",
+        ])
+        .default(0)
+        .interact()?;
+
+    progress::run_session(
+        Path::new(data_dir.trim()),
+        Path::new(watch.trim()),
+        hand == 1,
+    )
+}
+
+/// build-dict ウィザード
+fn build_dict_wizard(theme: &ColorfulTheme) -> Result<()> {
+    let input_dir: String = Input::with_theme(theme)
+        .with_prompt("入力ディレクトリ(<タグ名>.mp4 を置いた場所)")
+        .default(VIDEO_DIR.into())
+        .interact_text()?;
+
+    let output: String = Input::with_theme(theme)
+        .with_prompt("出力 JSON パス")
+        .default("tag_pose_dict.json".into())
+        .interact_text()?;
+
+    let frames: usize = Input::with_theme(theme)
+        .with_prompt("ダウンサンプルするフレーム数(transformer_burn の SEQ_LEN と揃える)")
+        .default(10)
+        .interact_text()?;
+
+    build_dict(
+        Path::new(input_dir.trim()),
+        Path::new(output.trim()),
+        frames,
+    )
+}
+
+/// 動画からタグを認識(推論)ウィザード。
+/// 動画1本 → 手ポーズ列(126次元×frames)→ 認識モデル(CPU/NdArray)→ 上位 k タグ。
+/// build-dict→train→predict の3手順を、判定だけワンショットに短縮する近道。
+fn recognize_wizard(theme: &ColorfulTheme) -> Result<()> {
+    // 1. 認識する動画を選ぶ
+    let video = select_video(theme)?;
+
+    // 2. 認識モデル(model.bin + tag_vocab.json を含むディレクトリ)を選ぶ
+    let model_dir = select_model_dir(theme)?;
+
+    // 3. フレーム数(学習時の SEQ_LEN と揃える)と表示件数
+    let frames: usize = Input::with_theme(theme)
+        .with_prompt("ダウンサンプルするフレーム数(学習時の SEQ_LEN と揃える)")
+        .default(10)
+        .interact_text()?;
+    let topk: usize = Input::with_theme(theme)
+        .with_prompt("上位何件のタグを表示するか")
+        .default(5)
+        .interact_text()?;
+
+    // 4. Palm + Hand モデルをロード(build_dict と同じ手順)
+    let palm_anchors = load_palm_anchors();
+    let mut palm_session = Session::builder()?
+        .commit_from_file(PALM_MODEL)
+        .with_context(|| format!("failed to load palm model: {}", PALM_MODEL))?;
+    let mut hand_session = Session::builder()?
+        .commit_from_file(HAND_MODEL)
+        .with_context(|| format!("failed to load hand model: {}", HAND_MODEL))?;
+
+    // 5. 動画 → 手ポーズ列(TagEntry)を抽出
+    eprintln!("\n=== 抽出: {} ===", video.display());
+    let entry = extract_tag_features(
+        &video,
+        &mut palm_session,
+        &mut hand_session,
+        &palm_anchors,
+        frames,
+    )?;
+    eprintln!(
+        "left_hand_coverage={:.0}% right_hand_coverage={:.0}%",
+        entry.left_hand_coverage * 100.0,
+        entry.right_hand_coverage * 100.0
+    );
+
+    // 6. [T][126] を [frames*126] のフラット列にする
+    let flat: Vec<f32> = entry.sequence.iter().flatten().copied().collect();
+
+    // 7. CPU 推論(transformer_burn の薄いラッパー)。
+    //    Box<dyn Error> は Send+Sync でないため anyhow へは文字列化して持ち上げる。
+    let ranked = transformer_burn::recognition::predict_from_features(&model_dir, &flat, frames, topk)
+        .map_err(|e| anyhow::anyhow!("認識推論に失敗: {}", e))?;
+
+    // 8. 出力。S6 の教訓: 手の検出率が低いと、確率が高くても結果は信用できない
+    if entry.left_hand_coverage < 0.5 && entry.right_hand_coverage < 0.5 {
+        eprintln!(
+            "警告: 両手とも検出率が低い(L={:.0}% R={:.0}%)。結果は不安定です",
+            entry.left_hand_coverage * 100.0,
+            entry.right_hand_coverage * 100.0
+        );
+    }
+    println!("\n=== 認識結果(上位 {}) ===", ranked.len());
+    for (rank, (tag, prob)) in ranked.iter().enumerate() {
+        println!("{}) {}  {:.3}", rank + 1, tag, prob);
+    }
+    println!("\n注意: 学習に使った動画なら当たって当然(配線確認)。本判定は未見テイクで行うこと。");
+
+    Ok(())
+}
+
+/// videos/ 内の動画を一覧から選ばせる(無ければ/その他はパス直接入力)
+fn select_video(theme: &ColorfulTheme) -> Result<PathBuf> {
+    let videos = list_videos(Path::new(VIDEO_DIR));
+    let mut items: Vec<String> = videos
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    items.push("[パスを直接入力]".into());
+    let manual_idx = items.len() - 1;
+
+    let idx = Select::with_theme(theme)
+        .with_prompt("認識する動画を選択")
+        .items(&items)
+        .default(0)
+        .interact()?;
+
+    if idx == manual_idx {
+        let s: String = Input::with_theme(theme)
+            .with_prompt("動画パス")
+            .interact_text()?;
+        Ok(PathBuf::from(s.trim()))
+    } else {
+        Ok(videos[idx].clone())
+    }
+}
+
+/// 認識モデルのディレクトリ(model.bin を含む)を一覧から選ばせる(無ければパス直接入力)
+fn select_model_dir(theme: &ColorfulTheme) -> Result<PathBuf> {
+    let dirs = list_model_dirs(Path::new(REC_MODEL_DIR));
+    let mut items: Vec<String> = dirs
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    items.push("[パスを直接入力]".into());
+    let manual_idx = items.len() - 1;
+
+    let idx = Select::with_theme(theme)
+        .with_prompt("認識モデル(ディレクトリ)を選択")
+        .items(&items)
+        .default(0)
+        .interact()?;
+
+    if idx == manual_idx {
+        let s: String = Input::with_theme(theme)
+            .with_prompt("モデルディレクトリのパス")
+            .interact_text()?;
+        Ok(PathBuf::from(s.trim()))
+    } else {
+        Ok(dirs[idx].clone())
+    }
+}
+
+/// REC_MODEL_DIR 直下で、認識モデルのサブディレクトリ一覧。
+/// model.bin と tag_vocab.json の両方を持つものだけ(tag_vocab.json が
+/// 認識モデルの目印。足場の Seq2Seq モデルには無いため誤選択を防げる)。
+fn list_model_dirs(dir: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.is_dir()
+                    && p.join("model.bin").is_file()
+                    && p.join("tag_vocab.json").is_file()
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    dirs.sort();
+    dirs
+}
+
+/// inspect ウィザード(models/ の .onnx から選ぶ)
+fn inspect_wizard(theme: &ColorfulTheme) -> Result<()> {
+    let model = select_model(theme)?;
+    inspect_onnx(&model)
+}
+
+/// test-infer ウィザード
+fn test_infer_wizard(theme: &ColorfulTheme) -> Result<()> {
+    let model = select_model(theme)?;
+    test_inference(&model)
+}
+
+/// models/ 内の .onnx を一覧から選ばせる(無ければ直接入力)
+fn select_model(theme: &ColorfulTheme) -> Result<PathBuf> {
+    let models = list_models(Path::new("models"));
+    let mut items: Vec<String> = models
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    items.push("[パスを直接入力]".into());
+    let manual_idx = items.len() - 1;
+
+    let idx = Select::with_theme(theme)
+        .with_prompt("ONNX モデルを選択")
+        .items(&items)
+        .default(0)
+        .interact()?;
+
+    if idx == manual_idx {
+        let s: String = Input::with_theme(theme)
+            .with_prompt("モデルパス")
+            .interact_text()?;
+        Ok(PathBuf::from(s.trim()))
+    } else {
+        Ok(models[idx].clone())
+    }
+}
+
+/// 指定ディレクトリ直下の .onnx ファイル一覧
+fn list_models(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.extension()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.eq_ignore_ascii_case("onnx"))
+                    .unwrap_or(false)
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    files.sort();
+    files
+}
+
+// [評価/スモーク] ffmpeg+ONNX統合の入口。回帰テスト化は不安定。「1本が落ちずに通る」程度のスモークまで
 fn run_extraction(cfg: RunConfig) -> Result<()> {
     let info = probe_video(&cfg.input)?;
     eprintln!(
@@ -425,6 +695,7 @@ fn run_extraction(cfg: RunConfig) -> Result<()> {
 
 /// S7: `<tag>.mp4` 群からタグ→ポーズ辞書を構築する。
 /// 各動画のハンドランドマークを `frames` フレームにダウンサンプルして JSON に書き出す。
+// [評価/スモーク] ディレクトリ統合処理。中の純粋部品(downsample/frame_hand_feature)を個別にテストする方が筋が良い
 fn build_dict(input_dir: &Path, output: &Path, frames: usize) -> Result<()> {
     if frames == 0 {
         anyhow::bail!("--frames must be >= 1");
@@ -508,6 +779,7 @@ fn build_dict(input_dir: &Path, output: &Path, frames: usize) -> Result<()> {
 }
 
 /// 1 動画からハンドランドマーク列を抽出し、`target` フレームにダウンサンプルした TagEntry を返す。
+// [評価] 推論依存。出力の良し悪しは coverage 等の指標で評価(テストでなく計測)
 fn extract_tag_features(
     video: &PathBuf,
     palm_session: &mut Session,
@@ -563,6 +835,7 @@ fn extract_tag_features(
 /// 検出されたハンドを左手スロット([0..63])と右手スロット([63..126])に割り当て、
 /// 正規化済みの 126 次元特徴量を作る。検出されなかった手はゼロ埋め。
 /// handedness >= 0.5 を右手とみなし、衝突時は confidence の高い方を優先する。
+// [TEST向き] 126次元ベクトルの組み立て。片手だけ/両手なしフレームの欠損埋めが静かにバグる箇所
 fn frame_hand_feature(
     hands: &[Hand],
     width: f32,
@@ -618,6 +891,7 @@ fn frame_hand_feature(
 
 /// n 個の要素から target 個を均等間隔で選ぶインデックス列。
 /// n < target の場合は一部のフレームが繰り返される。
+// [TEST向き] nフレーム分割の核。純粋関数。境界(端数・target>n・target=1・n=0)とoff-by-one
 fn downsample_indices(n: usize, target: usize) -> Vec<usize> {
     if n == 0 || target == 0 {
         return vec![];
@@ -828,6 +1102,7 @@ fn list_videos(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+// [TEST向き] 純粋な座標計算。横長/縦長/正方形の3ケースを手計算オラクルで固定
 fn crop_square_center(w: u32, h: u32) -> (u32, u32, u32) {
     let side = w.min(h);
     let crop_x = (w - side) / 2;
@@ -835,6 +1110,7 @@ fn crop_square_center(w: u32, h: u32) -> (u32, u32, u32) {
     (crop_x, crop_y, side)
 }
 
+// [TEST向き] 決定論的な前処理。出力shape(=256*256*3)と正規化範囲[0,1]を検証
 fn preprocess_frame(frame: &Array3<u8>) -> Result<(Vec<usize>, Vec<f32>)> {
     let h = frame.shape()[0] as u32;
     let w = frame.shape()[1] as u32;
@@ -857,6 +1133,7 @@ fn preprocess_frame(frame: &Array3<u8>) -> Result<(Vec<usize>, Vec<f32>)> {
     Ok((vec![1usize, 256, 256, 3], data))
 }
 
+// [TEST向き] 不変条件チェック向き。anchors数=2016 を assert するだけで埋め込み崩れを検知
 fn load_palm_anchors() -> Vec<[f32; 2]> {
     PALM_ANCHORS_BYTES
         .chunks_exact(8)
@@ -877,6 +1154,7 @@ struct PalmPreprocess {
     scale: f32,
 }
 
+// [TEST向き] 決定論的なレターボックス変換。出力shapeとscale/pad値を既知入力で固定
 fn preprocess_for_palm(frame: &Array3<u8>) -> Result<PalmPreprocess> {
     let h = frame.shape()[0] as u32;
     let w = frame.shape()[1] as u32;
@@ -919,6 +1197,7 @@ fn preprocess_for_palm(frame: &Array3<u8>) -> Result<PalmPreprocess> {
     })
 }
 
+// [評価] ONNX推論。非決定的・モデル依存。前処理(preprocess_for_palm)とIoU(iou_xyxy)を切り出してテスト
 fn run_palm_detection(
     session: &mut Session,
     frame: &Array3<u8>,
@@ -1004,6 +1283,7 @@ fn run_palm_detection(
     Ok(results)
 }
 
+// [TEST向き] 純粋な数式。完全重なり=1/非重なり=0/半分重なり を手計算で固定(定番のテスト対象)
 fn iou_xyxy(a: &[f32; 4], b: &[f32; 4]) -> f32 {
     let ix1 = a[0].max(b[0]);
     let iy1 = a[1].max(b[1]);
@@ -1030,6 +1310,7 @@ struct HandPreprocess {
     crop_size: f32,
 }
 
+// [TEST向き] 決定論的なクロップ変換。PalmBoxからの切り出し範囲・出力shapeを既知入力で固定
 fn preprocess_for_hand_landmark(frame: &Array3<u8>, palm: &PalmBox) -> Result<HandPreprocess> {
     let fh = frame.shape()[0] as i32;
     let fw = frame.shape()[1] as i32;
@@ -1104,6 +1385,7 @@ fn preprocess_for_hand_landmark(frame: &Array3<u8>, palm: &PalmBox) -> Result<Ha
     })
 }
 
+// [評価] ONNX推論。前処理(preprocess_for_hand_landmark)とパース(parse_landmarks)を切り出してテスト
 fn run_hand_landmark(
     session: &mut Session,
     frame: &Array3<u8>,
@@ -1147,6 +1429,7 @@ fn run_hand_landmark(
     }))
 }
 
+// [TEST向き] パース処理。195→39×[x,y,z,vis,pres] のインデックスずれを検知(壊れても静かに誤る型)
 fn parse_landmarks(data: &[f32]) -> Result<Vec<Landmark>> {
     if data.len() != 195 {
         anyhow::bail!(
@@ -1167,6 +1450,7 @@ fn parse_landmarks(data: &[f32]) -> Result<Vec<Landmark>> {
     Ok(landmarks)
 }
 
+// [TEST向き] 純粋数式。sigmoid(0)=0.5 など既知点で固定
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
@@ -1180,6 +1464,7 @@ fn apply_sigmoid_to_frames(frames: &mut [PoseFrame]) {
     }
 }
 
+// [TEST向き] フォーマット/round-trip。197列・ヘッダ順・frame_idx連番。Vec<u8>に書いて読み直し一致
 fn write_tsv<W: Write>(seq: &PoseSequence, w: &mut W) -> Result<()> {
     write!(w, "frame_idx\tconfidence")?;
     for i in 0..39 {
@@ -1201,6 +1486,7 @@ fn write_tsv<W: Write>(seq: &PoseSequence, w: &mut W) -> Result<()> {
     Ok(())
 }
 
+// [TEST向き] 描画手前の純粋なインデックス選択ロジックなら固定可能(描画自体は目視)
 fn overlay_target_indices(
     save_overlay: Option<&PathBuf>,
     frame_count: usize,
@@ -1227,6 +1513,7 @@ fn overlay_target_indices(
         .collect()
 }
 
+// [評価] 代理指標の出力。S6の教訓: ここが緑(conf=0.82-0.90)でも本体は破綻していた。数値テストの過信に注意
 fn print_stats(seq: &PoseSequence) {
     if seq.frames.is_empty() {
         eprintln!("stats: (no frames)");
@@ -1257,6 +1544,7 @@ fn print_stats(seq: &PoseSequence) {
     );
 }
 
+// [目視] オーバーレイ画像を出力。正しさは目で確認(S6はここで破綻を発見)。自動テスト不向き
 fn draw_overlay(
     frame: &Array3<u8>,
     pose: &PoseFrame,
@@ -1381,6 +1669,7 @@ fn draw_rect_outline(
     }
 }
 
+// [dev/手動] 開発時にモデル構造を覗くためのサブコマンド実装。cargo test とは無関係
 fn inspect_onnx(model_path: &PathBuf) -> Result<()> {
     let session = ort::session::Session::builder()?
         .commit_from_file(model_path)
@@ -1398,6 +1687,7 @@ fn inspect_onnx(model_path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
+// [dev/手動] 名前に"test"が付くが cargo test ではない。`pose-extract test-infer` 用の手動スモーク。混同注意
 fn test_inference(model_path: &PathBuf) -> Result<()> {
     let mut session = ort::session::Session::builder()?
         .commit_from_file(model_path)
@@ -1424,6 +1714,7 @@ fn test_inference(model_path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
+// [評価/スモーク] ffprobe外部依存。固定の小動画を1本同梱して「読めて妥当な値が返る」程度のスモーク
 fn probe_video(path: &PathBuf) -> Result<VideoInfo> {
     let output = Command::new("ffprobe")
         .args([
@@ -1474,6 +1765,7 @@ fn probe_video(path: &PathBuf) -> Result<VideoInfo> {
     })
 }
 
+// [TEST向き] 純粋パース。"30/1"→30.0、"30000/1001"→29.97、0除算・異常文字列のエラー
 fn parse_frame_rate(s: &str) -> Result<f64> {
     let parts: Vec<&str> = s.split('/').collect();
     match parts.as_slice() {
@@ -1483,6 +1775,7 @@ fn parse_frame_rate(s: &str) -> Result<f64> {
     }
 }
 
+// [評価/スモーク] ffmpeg外部依存。「1本デコードしてフレーム数が想定通り」程度のスモークまで
 fn extract_frames<F>(path: &PathBuf, width: u32, height: u32, mut callback: F) -> Result<()>
 where
     F: FnMut(usize, Array3<u8>) -> Result<()>,
@@ -1529,4 +1822,59 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 動画→タグ直結パスの E2E スモーク(in-sample)。
+    /// ffmpeg + Palm/Hand ONNX + rec_smoke モデルの実体に依存するため #[ignore]。
+    /// 手動実行: `cargo test recognize_smoke_in_sample -- --ignored --nocapture`
+    /// 学習に使った動画なので top-5 に正解タグ "0205" が入るはず
+    /// (これは配線確認であって精度の証拠ではない。本判定は未見テイクで行う)。
+    #[test]
+    #[ignore]
+    fn recognize_smoke_in_sample() {
+        let video = Path::new(VIDEO_DIR).join("0205-01.mp4");
+        let model_dir = Path::new(REC_MODEL_DIR).join("rec_smoke");
+        // フィクスチャが無い環境では明示してスキップ
+        for p in [
+            video.as_path(),
+            model_dir.as_path(),
+            Path::new(PALM_MODEL),
+            Path::new(HAND_MODEL),
+        ] {
+            if !p.exists() {
+                eprintln!("skip: fixture not found: {}", p.display());
+                return;
+            }
+        }
+
+        let frames = 10usize;
+        let palm_anchors = load_palm_anchors();
+        let mut palm = Session::builder()
+            .unwrap()
+            .commit_from_file(PALM_MODEL)
+            .unwrap();
+        let mut hand = Session::builder()
+            .unwrap()
+            .commit_from_file(HAND_MODEL)
+            .unwrap();
+
+        let entry =
+            extract_tag_features(&video, &mut palm, &mut hand, &palm_anchors, frames).unwrap();
+        let flat: Vec<f32> = entry.sequence.iter().flatten().copied().collect();
+        assert_eq!(flat.len(), frames * DICT_FEATURE_DIM);
+
+        let ranked =
+            transformer_burn::recognition::predict_from_features(&model_dir, &flat, frames, 5)
+                .unwrap();
+        eprintln!("ranked = {:?}", ranked);
+        assert!(
+            ranked.iter().any(|(tag, _)| tag == "0205"),
+            "top-5 に正解タグ 0205 が含まれない: {:?}",
+            ranked
+        );
+    }
 }

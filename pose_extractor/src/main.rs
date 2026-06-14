@@ -1496,8 +1496,11 @@ fn overlay_target_indices(
     if save_overlay.is_none() {
         return vec![];
     }
+    // 実際に処理されるフレーム数 = min(max_frames, frame_count)。
+    // 旧実装 m.min(frame_count.max(m)) は max_frames > frame_count のとき常に
+    // max_frames になり、存在しないフレーム番号を overlay 対象にしてしまうバグだった。
     let upper = match max_frames {
-        Some(m) => m.min(frame_count.max(m)),
+        Some(m) => m.min(frame_count),
         None => frame_count,
     };
     if upper == 0 {
@@ -1769,7 +1772,14 @@ fn probe_video(path: &PathBuf) -> Result<VideoInfo> {
 fn parse_frame_rate(s: &str) -> Result<f64> {
     let parts: Vec<&str> = s.split('/').collect();
     match parts.as_slice() {
-        [n, d] => Ok(n.parse::<f64>()? / d.parse::<f64>()?),
+        [n, d] => {
+            let num = n.parse::<f64>()?;
+            let den = d.parse::<f64>()?;
+            if den == 0.0 {
+                anyhow::bail!("Invalid frame rate (division by zero): {}", s);
+            }
+            Ok(num / den)
+        }
         [n] => Ok(n.parse::<f64>()?),
         _ => anyhow::bail!("Invalid frame rate format: {}", s),
     }
@@ -1827,6 +1837,32 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlay_indices_stay_within_frame_count() {
+        let save = PathBuf::from("dummy.png");
+        // max_frames > frame_count: 存在しないフレームを指してはいけない
+        let idx = overlay_target_indices(Some(&save), 5, Some(10), 3);
+        assert!(idx.iter().all(|&i| i < 5), "範囲外インデックス: {:?}", idx);
+        assert_eq!(idx, vec![0, 2, 4]);
+        // max_frames < frame_count: max_frames 側で頭打ち
+        let idx = overlay_target_indices(Some(&save), 100, Some(4), 4);
+        assert_eq!(idx, vec![0, 1, 2, 3]);
+        // overlay 無効なら空
+        assert!(overlay_target_indices(None, 5, None, 3).is_empty());
+        // frame_count=0(nb_frames 不明)なら overlay 無効
+        assert!(overlay_target_indices(Some(&save), 0, Some(10), 3).is_empty());
+    }
+
+    #[test]
+    fn parse_frame_rate_cases() {
+        assert!((parse_frame_rate("30/1").unwrap() - 30.0).abs() < 1e-9);
+        assert!((parse_frame_rate("30000/1001").unwrap() - 29.97).abs() < 0.01);
+        assert!((parse_frame_rate("60").unwrap() - 60.0).abs() < 1e-9);
+        // 0除算は Ok(inf) ではなくエラー
+        assert!(parse_frame_rate("30000/0").is_err());
+        assert!(parse_frame_rate("abc").is_err());
+    }
 
     /// 動画→タグ直結パスの E2E スモーク(in-sample)。
     /// ffmpeg + Palm/Hand ONNX + rec_smoke モデルの実体に依存するため #[ignore]。

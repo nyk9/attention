@@ -212,10 +212,15 @@ fn write_output(
         Format::Tsv => {
             writeln!(writer, "start_ms\tend_ms\ttier_id\tvalue")?;
             for r in records {
+                // ELAN の tier_id / 注釈値はタブや改行を含み得るため、
+                // TSV を壊さないよう空白に置換してから出力する。
                 writeln!(
                     writer,
                     "{}\t{}\t{}\t{}",
-                    r.start_ms, r.end_ms, r.tier_id, r.value
+                    r.start_ms,
+                    r.end_ms,
+                    sanitize_tsv(&r.tier_id),
+                    sanitize_tsv(&r.value)
                 )?;
             }
         }
@@ -225,4 +230,21 @@ fn write_output(
         }
     }
     Ok(())
+}
+
+/// TSV を壊さないよう、タブ・改行・復帰を空白に置換する。
+fn sanitize_tsv(s: &str) -> String {
+    s.replace(['\t', '\n', '\r'], " ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_tsv_replaces_separators() {
+        assert_eq!(sanitize_tsv("a\tb\nc\rd"), "a b c d");
+        assert_eq!(sanitize_tsv("plain"), "plain");
+        assert_eq!(sanitize_tsv("multi\n\nline"), "multi  line");
+    }
 }

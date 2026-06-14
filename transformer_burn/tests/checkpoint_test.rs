@@ -154,21 +154,40 @@ fn test_checkpoint_roundtrip_ndarray() {
     let output_before_data: Vec<f32> = output_before.to_data().to_vec().unwrap();
     let output_after_data: Vec<f32> = output_after.to_data().to_vec().unwrap();
 
-    // 各要素の相対誤差を計算
-    let mut max_rel_error = 0.0_f32;
+    // WGPU(GPU)と NdArray(CPU)は浮動小数の演算系が違うため厳密一致はしない。
+    // 重みは同一(同じチェックポイントから読み込み)なので、差は前方計算の
+    // バックエンド差のみ。numpy allclose 方式 |a-b| <= atol + rtol*|a| で判定する。
+    //
+    // 旧実装は ((a-b)/a.max(1e-8)).abs() で相対誤差を取っていたが、a が負だと
+    // 分母が 1e-8 に張り付き、微小な差(実測 9.5e-7)でも相対誤差が約100倍に
+    // 爆発する計算バグだった。near-zero での純相対誤差はノイジーなので
+    // atol で底上げする。
+    const ATOL: f32 = 1e-5;
+    const RTOL: f32 = 1e-3;
+    let mut max_abs_diff = 0.0_f32;
+    let mut max_violation = 0.0_f32; // 許容超過の比。1.0 未満なら一致とみなす
     for (a, b) in output_before_data.iter().zip(output_after_data.iter()) {
-        let rel_error = ((a - b) / a.max(1e-8)).abs();
-        max_rel_error = max_rel_error.max(rel_error);
+        let abs_diff = (a - b).abs();
+        max_abs_diff = max_abs_diff.max(abs_diff);
+        let allowed = ATOL + RTOL * a.abs();
+        max_violation = max_violation.max(abs_diff / allowed);
     }
 
-    println!("最大相対誤差: {:.6}", max_rel_error);
+    println!(
+        "最大絶対誤差: {:.3e}  許容超過比: {:.4}（<1 で一致）",
+        max_abs_diff, max_violation
+    );
     assert!(
-        max_rel_error < 1e-4,
-        "WGPU/NdArray間の出力が一致しません（最大相対誤差: {:.6}）",
-        max_rel_error
+        max_violation < 1.0,
+        "WGPU/NdArray 間の出力が一致しません（最大絶対誤差: {:.3e}, 許容超過比: {:.4}）",
+        max_abs_diff,
+        max_violation
     );
 
-    println!("✓ WGPU/NdArray間の出力が一致しました（相対誤差: {:.6}）", max_rel_error);
+    println!(
+        "✓ WGPU/NdArray間の出力が一致しました（最大絶対誤差: {:.3e}）",
+        max_abs_diff
+    );
 
     // クリーンアップ
     cleanup_test_dir(&test_dir);

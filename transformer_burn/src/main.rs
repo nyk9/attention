@@ -6,6 +6,10 @@ mod jsl_data;
 mod jsl_vocabulary;
 mod metrics;
 mod model;
+mod pose_data;
+mod recognition;
+mod recognition_training;
+mod tag_vocabulary;
 mod training;
 
 use checkpoint::{TrainingBackend, load_model, save_model};
@@ -45,12 +49,33 @@ struct Args {
     /// Attention行列をCSVエクスポート（推論時のみ）
     #[arg(long)]
     export_attn: bool,
+
+    /// 認識モデル訓練: build-dict が出力した pose dict JSON を指定
+    #[arg(long)]
+    train_pose: Option<PathBuf>,
+
+    /// 認識モデル推論: pose dict JSON の各エントリを top-5 評価（--load 必須）
+    #[arg(long)]
+    predict_pose: Option<PathBuf>,
+
+    /// 認識モデルのエポック数
+    #[arg(long, default_value_t = config::POSE_EPOCHS)]
+    epochs: usize,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start_time = Instant::now();
 
     let args = Args::parse();
+
+    // 認識モデル(手ポーズ列→タグ)のモード。足場の Seq2Seq とはモデルも語彙も別物なので
+    // ここで分岐して早期 return する
+    if args.train_pose.is_some() || args.predict_pose.is_some() {
+        run_recognition(&args)?;
+        let duration = start_time.elapsed();
+        println!("\n実行時間: {:.2}秒", duration.as_secs_f64());
+        return Ok(());
+    }
 
     let jsl_vocab = jsl_vocabulary::JslVocabulary::new();
     let training_device = WgpuDevice::default();
@@ -113,6 +138,70 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let duration = start_time.elapsed();
     println!("\n実行時間: {:.2}秒", duration.as_secs_f64());
+
+    Ok(())
+}
+
+/// 認識モデル(手ポーズ列→タグ)の訓練・推論を実行する
+///
+/// 使用例:
+///   訓練: cargo run --release -- --train-pose data/pose_dict_smoke.json --save models/rec001
+///   推論: cargo run --release -- --load models/rec001 --predict-pose data/pose_dict_smoke.json
+fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let device = WgpuDevice::default();
+
+    // --- 訓練モード ---
+    if let Some(dict_path) = &args.train_pose {
+        println!("\n===== 認識モデル訓練(手ポーズ列→タグ) =====");
+        println!("pose dict: {}", dict_path.display());
+
+        if args.load.is_some() {
+            // 継続訓練は語彙の一致確認が必要になるため未対応(将来課題)
+            return Err("--train-pose と --load の併用(継続訓練)は未対応です".into());
+        }
+
+        let data = pose_data::PoseTrainingData::load(dict_path)?;
+        let vocab = data.build_vocabulary();
+        println!(
+            "サンプル数: {} / タグ数: {} ({:?})",
+            data.len(),
+            vocab.tags.len(),
+            vocab.tags
+        );
+
+        let model =
+            recognition::RecognitionModel::<TrainingBackend>::new(vocab.vocab_size(), &device);
+        let (model, loss_history) =
+            recognition_training::train_recognition(model, &data, &vocab, &device, args.epochs);
+
+        println!(
+            "訓練完了: Loss {:.6} → {:.6}",
+            loss_history.first().unwrap_or(&0.0),
+            loss_history.last().unwrap_or(&0.0)
+        );
+
+        // 学習データ自身での top-5 確認(ループが回っているかのスモーク)
+        recognition_training::evaluate_topk(&model, &data, &vocab, &device);
+
+        if let Some(save_dir) = &args.save {
+            recognition::save_recognition_model(&model, &vocab, save_dir)?;
+        }
+        return Ok(());
+    }
+
+    // --- 推論モード ---
+    if let Some(dict_path) = &args.predict_pose {
+        println!("\n===== 認識モデル推論(手ポーズ列→タグ) =====");
+        let load_dir = args
+            .load
+            .as_ref()
+            .ok_or("--predict-pose には --load <モデルディレクトリ> が必要です")?;
+
+        let (model, vocab) =
+            recognition::load_recognition_model::<TrainingBackend>(load_dir, &device)?;
+        let data = pose_data::PoseTrainingData::load(dict_path)?;
+        recognition_training::evaluate_topk(&model, &data, &vocab, &device);
+    }
 
     Ok(())
 }

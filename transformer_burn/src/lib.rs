@@ -8,4 +8,8 @@ pub mod jsl_data;
 pub mod jsl_vocabulary;
 pub mod metrics;
 pub mod model;
+pub mod pose_data;
+pub mod recognition;
+pub mod recognition_training;
+pub mod tag_vocabulary;
 pub mod training;

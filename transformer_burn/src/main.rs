@@ -161,6 +161,11 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // --- 未見テイク評価モード(Phase 0a の合否判定) ---
     if let Some(dict_path) = &args.eval_holdout {
+        // train から新規学習するモードなので、--load(既存モデル読み込み)は意味を持たない。
+        // 黙って無視すると誤用に気づきにくいのでエラーにする
+        if args.load.is_some() {
+            return Err("--eval-holdout は train から新規学習するため --load とは併用できません".into());
+        }
         println!("\n===== 未見テイク評価(手ポーズ列→タグ) =====");
         println!("pose dict: {}", dict_path.display());
         println!("holdout_per_label: {}", args.holdout_per_label);

@@ -201,26 +201,39 @@ impl PoseTrainingData {
         let mut per_label = Vec::new();
         let mut train_only = Vec::new();
 
-        for (label, mut group) in by_label {
-            // テイク番号昇順(番号なしは 0 扱い)。stable sort なので同番号は元順を維持
-            group.sort_by_key(|e| e.take.unwrap_or(0));
-            let n = group.len();
+        for (label, group) in by_label {
+            // held-out 候補はテイク番号付きのみ。番号なし(「最後のテイク」が定義できない)は
+            // 常に train に入れ、評価対象にしない。これで held-out が stem 順に左右されない
+            let (mut numbered, unnumbered): (Vec<RawEntry>, Vec<RawEntry>) =
+                group.into_iter().partition(|e| e.take.is_some());
+            numbered.sort_by_key(|e| e.take.expect("partition で Some のみが numbered に入る"));
+            let numbered_count = numbered.len();
+            let unnumbered_count = unnumbered.len();
 
-            if n <= held_out_per_label {
-                // held-out を切ると train が空/不足。全部 train に入れ test には出さない
+            // 番号なしは無条件で train
+            for e in unnumbered {
+                train_samples.push(PoseSample {
+                    features: e.features,
+                    label: label.clone(),
+                });
+            }
+
+            if numbered_count <= held_out_per_label {
+                // 番号付きテイクが足りず held-out を作れない → 残りも全部 train
                 train_only.push(label.clone());
-                for e in group {
+                for e in numbered {
                     train_samples.push(PoseSample {
                         features: e.features,
                         label: label.clone(),
                     });
                 }
-                per_label.push((label, n, 0));
+                per_label.push((label, numbered_count + unnumbered_count, 0));
                 continue;
             }
 
-            let split_at = n - held_out_per_label;
-            for (i, e) in group.into_iter().enumerate() {
+            // テイク番号昇順の後ろ held_out_per_label 件を held-out にする
+            let split_at = numbered_count - held_out_per_label;
+            for (i, e) in numbered.into_iter().enumerate() {
                 let sample = PoseSample {
                     features: e.features,
                     label: label.clone(),
@@ -231,7 +244,7 @@ impl PoseTrainingData {
                     test_samples.push(sample);
                 }
             }
-            per_label.push((label, split_at, held_out_per_label));
+            per_label.push((label, split_at + unnumbered_count, held_out_per_label));
         }
 
         if test_samples.is_empty() {
@@ -347,7 +360,7 @@ mod tests {
                 "feature_dim": POSE_FEATURE_DIM,
                 "feature_layout": "",
                 "normalization": "",
-                "tag_count": 2
+                "tag_count": 4
             },
             "tags": {
                 "0205-01": entry.clone(),
@@ -371,6 +384,55 @@ mod tests {
         assert_eq!(split.test.len(), 1, "held-out = 0205 の take3 のみ");
         assert!(split.test.samples.iter().all(|s| s.label == "0205"));
         assert!(split.train_only.contains(&"0225".to_string()));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn holdout_split_holds_out_only_numbered_takes() {
+        use std::io::Write;
+        let row = vec![0.0f32; POSE_FEATURE_DIM];
+        let entry = serde_json::json!({
+            "sequence": [row],
+            "left_hand_coverage": 1.0,
+            "right_hand_coverage": 1.0,
+            "source": "x"
+        });
+        // ラベル "word": 番号付き 2 + 番号なし 1。ラベル "solo": 番号なし 1 のみ
+        let dict = serde_json::json!({
+            "metadata": {
+                "frames": 1,
+                "feature_dim": POSE_FEATURE_DIM,
+                "feature_layout": "",
+                "normalization": "",
+                "tag_count": 4
+            },
+            "tags": {
+                "word-01": entry.clone(),
+                "word-02": entry.clone(),
+                "word":    entry.clone(),
+                "solo":    entry
+            }
+        });
+
+        let dir =
+            std::env::temp_dir().join(format!("pose_holdout_num_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dict.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(dict.to_string().as_bytes())
+            .unwrap();
+
+        let split = PoseTrainingData::load_holdout_split(&path, 1).unwrap();
+        // held-out は番号付きの最後(word-02)のみ。番号なし "word" と "solo" は train。
+        assert_eq!(split.test.len(), 1, "held-out = word の take2 のみ");
+        assert!(split.test.samples.iter().all(|s| s.label == "word"));
+        // train = word-01 + word(番号なし) + solo
+        assert_eq!(split.train.len(), 3);
+        // solo は番号付きテイクが無いので train_only、word は held-out できたので含まれない
+        assert!(split.train_only.contains(&"solo".to_string()));
+        assert!(!split.train_only.contains(&"word".to_string()));
 
         std::fs::remove_dir_all(&dir).ok();
     }

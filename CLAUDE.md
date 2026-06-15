@@ -33,7 +33,7 @@
 
 ### 4. pose_extractor - 動画→姿勢ランドマーク抽出CLI
 - BlazePose ONNX(MediaPipe Pose 変換版)を `ort` クレートで呼び、動画フレームから39 keypoints(33+6補助)を抽出
-- **ステータス**: Phase 0a-pipe-v1 の S1-S6(機能側)完了。対話ウィザード CLI 化 + バッチ処理対応済み。**精度上の課題が S6 検証で発見(下記参照)**
+- **ステータス**: Phase 0a-pipe-v1 の機能側は **S1〜S8 + 動画→タグ直結パスまで実装完了**(PR #1 で main にマージ、2026-06-14)。対話ウィザード CLI・バッチ処理・撮影進捗ツール対応済み。残るは**撮影データ依存の Phase 0a 終了基準判定(先頭10語の未見テイクで top-5 に正解)**で、撮影待ち。**精度上の課題が S6 検証で発見済み(下記参照)**のため、認識は手ポーズ(C 系)中心で進行中
 - **使用クレート**: ort 2.0.0-rc.12, ndarray 0.16, image 0.25, clap 4, dialoguer 0.11, serde, anyhow
 - **外部依存**: ffmpeg 8.1.1(`brew install ffmpeg`、CLI subprocess 経由で動画読み込み)
 - **モデル**: `models/blazepose_full.onnx`(5.3MB、HF `opencv/pose_estimation_mediapipe`)。git管理外
@@ -80,12 +80,17 @@
   - CLI: `--train-pose <dict.json> [--epochs N] [--save dir]` / `--load dir --predict-pose <dict.json>`
   - スモーク結果(既存6動画=2ラベル×3テイク、300エポック・約47秒・WGPU): Loss 4.50 → 0.00、in-sample top-1 6/6。save→load 往復も一致
   - 注意: 2クラス in-sample の 100% は配線確認であって精度の証拠ではない。本判定は撮影後の未見テイクで行う
-- **次のステップ(認識方向)**:
-  - 前提: S6 のランドマーク品質問題への取り組み継続。ただし認識は手ポーズ(C 系)中心で進められる
-  - 撮影した先頭10語を `build-dict` → `--train-pose` に通し、未見テイクで Phase 0a 終了基準(10語で top-5 に正解)を判定
-  - ✅ 動画1本→タグ出力の**直結パス: 実装完了**(2026-06-13)。pose-extract メニュー「動画からタグを認識(推論)」。pose_extractor が transformer_burn を lib 依存し、動画→手ポーズ列(126次元)→ 認識モデル(CPU/NdArray)を 1 プロセスで通す。既存6動画+rec_smoke で E2E スモーク通過(0205-01.mp4 → top-1 "0205" 確率1.0)。学習は引き続き build-dict→`--train-pose`。回帰用に `#[ignore]` テスト `recognize_smoke_in_sample` を同梱(`cargo test recognize_smoke_in_sample -- --ignored`)。代償: pose_extractor の初回ビルドが Burn 取り込みで重くなる(将来 feature ゲート化で軽量化は可能、今回は受容)
+- **動画→タグ直結パス 完了(2026-06-14、PR #1 で main にマージ)**:
+  - pose-extract メニュー「動画からタグを認識(推論)」。pose_extractor が transformer_burn を lib 依存し、動画→手ポーズ列(126次元)→ 認識モデル(CPU/NdArray)→ top-k タグを **1 プロセスで完結**(S7 抽出 + S8 推論を結線)。学習は引き続き build-dict→`--train-pose`。
+  - E2E スモーク通過(既存6動画+rec_smoke、0205-01.mp4 → top-1 "0205" 確率1.0)。回帰用に `#[ignore]` テスト `recognize_smoke_in_sample` 同梱(`cargo test recognize_smoke_in_sample -- --ignored`)。
+  - 同 PR で checkpoint クロスバックエンドテストのバグ修正、レビュー指摘3件(overlay範囲 / フレームレート0除算 / TSVサニタイズ)も対応。大きい/private な生成物(`models/rec_*`・`data/pose_dict*.json`・`data/raw_jsl/`)は gitignore で非追跡。
+  - 代償: pose_extractor の初回ビルドが Burn 取り込みで重くなる(将来 feature ゲート化で軽量化可能、今回は受容)。
+  - 注意: in-sample の一致は配線確認であって精度の証拠ではない。本判定は撮影後の未見テイクで。
+- **次のステップ(認識方向、撮影データ待ち)**:
+  - 撮影した先頭10語を `build-dict` → `--train-pose` に通し、未見テイクで **Phase 0a 終了基準(10語で top-5 に正解)を判定**(これが Phase 0a の出口)
   - タグ → 自然な日本語(部品C)は LLM 整形を後段で(①プロンプト→②LoRA→③自作の順で安く試す)
-  - 任意: Hand Landmark の回転アラインメント実装で指関節精度向上
+  - 任意: Hand Landmark の回転アラインメント実装で指関節精度向上(現状は回転正規化なしで指関節精度がやや劣る)
+  - 前提: S6 のランドマーク品質問題への取り組み継続。ただし認識は手ポーズ(C 系)中心で進められる
 
 ---
 
@@ -250,4 +255,4 @@ cargo build --release
 
 ---
 
-**最終更新**: 2026年6月13日(動画→タグ直結パスを実装。pose-extract メニュー「動画からタグを認識(推論)」で動画1本→手ポーズ列→認識モデル(CPU)を1プロセス完結。transformer_burn を lib 依存。E2E スモーク通過。撮影データ待ちの状態)
+**最終更新**: 2026年6月14日(認識方向パイプライン S1〜S8 + 動画→タグ直結パスを PR #1 で main にマージ。checkpoint クロスバックエンドテストのバグ修正・レビュー指摘3件対応済み。Phase 0a の出口=先頭10語の未見テイクで top-5 判定で、撮影データ待ちの状態)

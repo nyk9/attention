@@ -86,8 +86,13 @@
   - 同 PR で checkpoint クロスバックエンドテストのバグ修正、レビュー指摘3件(overlay範囲 / フレームレート0除算 / TSVサニタイズ)も対応。大きい/private な生成物(`models/rec_*`・`data/pose_dict*.json`・`data/raw_jsl/`)は gitignore で非追跡。
   - 代償: pose_extractor の初回ビルドが Burn 取り込みで重くなる(将来 feature ゲート化で軽量化可能、今回は受容)。
   - 注意: in-sample の一致は配線確認であって精度の証拠ではない。本判定は撮影後の未見テイクで。
+- **未見テイク評価ハーネス 完了(2026-06-15)**:
+  - `transformer_burn --eval-holdout <dict.json> [--holdout-per-label N]`。pose dict を**テイク単位で train/held-out に分割**(各ラベルでテイク番号の後ろ N 件=既定1を未見に)→ train だけで学習 → **未見テイクで top-k を測る**。Phase 0a の合否判定を1コマンド化(従来は train/predict 用に dict を手で2つ作る必要があった)。
+  - `pose_data.rs` に `take_from_stem` / `load_holdout_split`(+ユニットテスト)、`main.rs` に `--eval-holdout` 分岐を追加。学習・評価は既存 `train_recognition` / `evaluate_topk` を再利用。
+  - ドライラン(既存6動画、各語 take3 を未見): train=4 / 未見=2 に正しく分割・学習・評価。top-1 1/2・top-5 2/2(2クラス極小なので配線確認。ただし take3 は学習未使用=**従来の in-sample と違い真の out-of-sample**)。
+  - テイクが N 以下のラベルは held-out を作れないため train のみに入れ評価対象外(警告)。
 - **次のステップ(認識方向、撮影データ待ち)**:
-  - 撮影した先頭10語を `build-dict` → `--train-pose` に通し、未見テイクで **Phase 0a 終了基準(10語で top-5 に正解)を判定**(これが Phase 0a の出口)
+  - 撮影した先頭10語を `build-dict` → **`--eval-holdout`(上記ハーネス)で未見テイク評価**し、**Phase 0a 終了基準(10語で top-5 に正解)を判定**(これが Phase 0a の出口)。機構は用意済みで、あとは撮影データ待ち
   - タグ → 自然な日本語(部品C)は LLM 整形を後段で(①プロンプト→②LoRA→③自作の順で安く試す)
   - 任意: Hand Landmark の回転アラインメント実装で指関節精度向上(現状は回転正規化なしで指関節精度がやや劣る)
   - 前提: S6 のランドマーク品質問題への取り組み継続。ただし認識は手ポーズ(C 系)中心で進められる
@@ -255,4 +260,4 @@ cargo build --release
 
 ---
 
-**最終更新**: 2026年6月14日(認識方向パイプライン S1〜S8 + 動画→タグ直結パスを PR #1 で main にマージ。checkpoint クロスバックエンドテストのバグ修正・レビュー指摘3件対応済み。Phase 0a の出口=先頭10語の未見テイクで top-5 判定で、撮影データ待ちの状態)
+**最終更新**: 2026年6月15日(未見テイク評価ハーネス `--eval-holdout` を実装=Phase 0a の合否判定を1コマンド化、ドライラン通過。これに先立ち認識方向パイプライン S1〜S8 + 動画→タグ直結パスを PR #1、Phase 0a 現状の文書化を PR #2 で main にマージ済み。機構は揃い、あとは撮影データ待ち)

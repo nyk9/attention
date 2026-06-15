@@ -61,6 +61,14 @@ struct Args {
     /// 認識モデルのエポック数
     #[arg(long, default_value_t = config::POSE_EPOCHS)]
     epochs: usize,
+
+    /// 未見テイク評価: pose dict をテイク単位で train/held-out に分割し、学習後に未見テイクで top-k を測る
+    #[arg(long)]
+    eval_holdout: Option<PathBuf>,
+
+    /// held-out にするテイク数(ラベルごと、テイク番号の後ろから)。--eval-holdout 用
+    #[arg(long, default_value_t = 1)]
+    holdout_per_label: usize,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -70,7 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 認識モデル(手ポーズ列→タグ)のモード。足場の Seq2Seq とはモデルも語彙も別物なので
     // ここで分岐して早期 return する
-    if args.train_pose.is_some() || args.predict_pose.is_some() {
+    if args.train_pose.is_some() || args.predict_pose.is_some() || args.eval_holdout.is_some() {
         run_recognition(&args)?;
         let duration = start_time.elapsed();
         println!("\n実行時間: {:.2}秒", duration.as_secs_f64());
@@ -147,8 +155,60 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// 使用例:
 ///   訓練: cargo run --release -- --train-pose data/pose_dict_smoke.json --save models/rec001
 ///   推論: cargo run --release -- --load models/rec001 --predict-pose data/pose_dict_smoke.json
+///   未見テイク評価: cargo run --release -- --eval-holdout data/pose_dict_smoke.json [--holdout-per-label 1]
 fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let device = WgpuDevice::default();
+
+    // --- 未見テイク評価モード(Phase 0a の合否判定) ---
+    if let Some(dict_path) = &args.eval_holdout {
+        println!("\n===== 未見テイク評価(手ポーズ列→タグ) =====");
+        println!("pose dict: {}", dict_path.display());
+        println!("holdout_per_label: {}", args.holdout_per_label);
+
+        let split =
+            pose_data::PoseTrainingData::load_holdout_split(dict_path, args.holdout_per_label)?;
+
+        println!("\n--- テイク単位の分割 ---");
+        for (label, tr, te) in &split.per_label {
+            println!("  {:<12} train={} held-out={}", label, tr, te);
+        }
+        if !split.train_only.is_empty() {
+            println!(
+                "  注意: テイク不足で held-out を作れず train のみに入れたラベル: {:?}",
+                split.train_only
+            );
+        }
+        println!(
+            "学習サンプル {} 件 / 未見テイク {} 件",
+            split.train.len(),
+            split.test.len()
+        );
+
+        // 語彙は学習データ(train)から構築。held-out のラベルは train の部分集合なので必ず含まれる
+        let vocab = split.train.build_vocabulary();
+        let model =
+            recognition::RecognitionModel::<TrainingBackend>::new(vocab.vocab_size(), &device);
+        let (model, loss_history) = recognition_training::train_recognition(
+            model,
+            &split.train,
+            &vocab,
+            &device,
+            args.epochs,
+        );
+        println!(
+            "訓練完了: Loss {:.6} → {:.6}",
+            loss_history.first().unwrap_or(&0.0),
+            loss_history.last().unwrap_or(&0.0)
+        );
+
+        println!("\n===== 未見テイクでの評価(これが Phase 0a の合否判定) =====");
+        recognition_training::evaluate_topk(&model, &split.test, &vocab, &device);
+
+        if let Some(save_dir) = &args.save {
+            recognition::save_recognition_model(&model, &vocab, save_dir)?;
+        }
+        return Ok(());
+    }
 
     // --- 訓練モード ---
     if let Some(dict_path) = &args.train_pose {

@@ -1308,80 +1308,132 @@ struct HandPreprocess {
     cx_orig: f32,
     cy_orig: f32,
     crop_size: f32,
+    /// 回転正規化の cos/sin(クロップ→元画像の逆変換に使う)。回転なしなら cos=1, sin=0。
+    cos_r: f32,
+    sin_r: f32,
 }
 
-// [TEST向き] 決定論的なクロップ変換。PalmBoxからの切り出し範囲・出力shapeを既知入力で固定
-fn preprocess_for_hand_landmark(frame: &Array3<u8>, palm: &PalmBox) -> Result<HandPreprocess> {
-    let fh = frame.shape()[0] as i32;
-    let fw = frame.shape()[1] as i32;
+// === Hand 回転アラインメント(MediaPipe 手パイプライン準拠) ===
 
+/// 角度を (-π, π] に正規化する(MediaPipe NormalizeRadians 相当)。
+#[inline]
+fn normalize_radians(angle: f32) -> f32 {
+    use std::f32::consts::PI;
+    angle - 2.0 * PI * ((angle + PI) / (2.0 * PI)).floor()
+}
+
+/// Palm keypoint から手の回転正規化角(ラジアン)を求める。
+/// keypoint[0]=手首中心, keypoint[2]=中指 MCP を結ぶベクトルが
+/// 「上向き(target=90°)」になる回転角。MediaPipe DetectionsToRectsCalculator と同式。
+/// keypoint が 3 点未満なら 0(回転なし=従来の軸並行クロップ)へフォールバック。
+fn palm_rotation(palm: &PalmBox) -> f32 {
+    if palm.keypoints.len() < 3 {
+        return 0.0;
+    }
+    let (x1, y1) = (palm.keypoints[0][0], palm.keypoints[0][1]);
+    let (x2, y2) = (palm.keypoints[2][0], palm.keypoints[2][1]);
+    let target = std::f32::consts::FRAC_PI_2;
+    // 画像座標は y 下向きなので atan2 の y を符号反転して数学的な向きへ揃える。
+    let angle = target - (-(y2 - y1)).atan2(x2 - x1);
+    normalize_radians(angle)
+}
+
+/// モデル入力(回転済み HAND_INPUT_SIZE 正方)座標 (mx,my) を元画像座標へ写すアフィン変換。
+/// crop_size でスケール・(cos_r,sin_r) で回転・(cx,cy) で平行移動。
+/// 回転なし(cos=1,sin=0)のとき (mx-center)*scale + c{x,y} に一致し従来挙動と後方互換。
+#[inline]
+fn hand_model_to_orig(
+    mx: f32,
+    my: f32,
+    crop_size: f32,
+    cos_r: f32,
+    sin_r: f32,
+    cx: f32,
+    cy: f32,
+) -> (f32, f32) {
+    let dx = mx / HAND_INPUT_SIZE as f32 - 0.5;
+    let dy = my / HAND_INPUT_SIZE as f32 - 0.5;
+    (
+        crop_size * (cos_r * dx - sin_r * dy) + cx,
+        crop_size * (sin_r * dx + cos_r * dy) + cy,
+    )
+}
+
+/// 元画像(Array3<u8>, [H,W,3])を実数座標 (x,y) で双線形サンプリングする。
+/// 範囲外の隅は黒(0)として寄与させる(MediaPipe の border=ZERO 相当)。
+#[inline]
+fn sample_bilinear(frame: &Array3<u8>, x: f32, y: f32) -> [f32; 3] {
+    let w = frame.shape()[1] as i32;
+    let h = frame.shape()[0] as i32;
+    let x0 = x.floor() as i32;
+    let y0 = y.floor() as i32;
+    let fx = x - x0 as f32;
+    let fy = y - y0 as f32;
+    let mut out = [0.0f32; 3];
+    for (dy, wy) in [(0i32, 1.0 - fy), (1, fy)] {
+        let yy = y0 + dy;
+        if yy < 0 || yy >= h {
+            continue;
+        }
+        for (dx, wx) in [(0i32, 1.0 - fx), (1, fx)] {
+            let xx = x0 + dx;
+            if xx < 0 || xx >= w {
+                continue;
+            }
+            let wgt = wx * wy;
+            for ch in 0..3 {
+                out[ch] += frame[[yy as usize, xx as usize, ch]] as f32 * wgt;
+            }
+        }
+    }
+    out
+}
+
+// [TEST向き] 回転正規化付きクロップ変換。PalmBox の回転角でクロップを回し、双線形で
+// HAND_INPUT_SIZE 正方へサンプリングする。回転 0 のとき従来の軸並行クロップに一致。
+fn preprocess_for_hand_landmark(frame: &Array3<u8>, palm: &PalmBox) -> Result<HandPreprocess> {
     let palm_w = palm.x2 - palm.x1;
     let palm_h = palm.y2 - palm.y1;
     let palm_cx = (palm.x1 + palm.x2) / 2.0;
     let palm_cy = (palm.y1 + palm.y2) / 2.0;
 
-    let shifted_cy = palm_cy + HAND_CROP_SHIFT_Y * palm_h;
     let palm_size = palm_w.max(palm_h);
-    let crop_size = palm_size * HAND_CROP_ENLARGE;
-    let crop_size_i = crop_size.round().max(1.0) as i32;
-    let half = crop_size_i as f32 / 2.0;
-    let crop_x1 = (palm_cx - half).round() as i32;
-    let crop_y1 = (shifted_cy - half).round() as i32;
-    let crop_x2 = crop_x1 + crop_size_i;
-    let crop_y2 = crop_y1 + crop_size_i;
+    let crop_size = (palm_size * HAND_CROP_ENLARGE).max(1.0);
 
-    let raw: Vec<u8> = frame.iter().copied().collect();
-    let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_raw(fw as u32, fh as u32, raw)
-        .context("failed to construct ImageBuffer for hand preprocess")?;
-    let mut canvas: ImageBuffer<Rgb<u8>, Vec<u8>> =
-        ImageBuffer::from_pixel(crop_size_i as u32, crop_size_i as u32, Rgb([0u8, 0, 0]));
+    // MediaPipe 手パイプライン準拠の回転正規化角(手首→中指MCP を上向きに揃える)。
+    let theta = palm_rotation(palm);
+    let cos_r = theta.cos();
+    let sin_r = theta.sin();
 
-    let src_x1 = crop_x1.max(0);
-    let src_y1 = crop_y1.max(0);
-    let src_x2 = crop_x2.min(fw);
-    let src_y2 = crop_y2.min(fh);
-    if src_x2 > src_x1 && src_y2 > src_y1 {
-        let dst_x = (src_x1 - crop_x1) as i64;
-        let dst_y = (src_y1 - crop_y1) as i64;
-        let sub = image::imageops::crop_imm(
-            &img,
-            src_x1 as u32,
-            src_y1 as u32,
-            (src_x2 - src_x1) as u32,
-            (src_y2 - src_y1) as u32,
-        )
-        .to_image();
-        image::imageops::overlay(&mut canvas, &sub, dst_x, dst_y);
+    // クロップ中心シフトは回転後フレームの y 軸方向へ適用(MediaPipe RectTransformation 準拠)。
+    // theta=0 では cy = palm_cy + HAND_CROP_SHIFT_Y*palm_h となり従来の shifted_cy に一致する。
+    let shift = HAND_CROP_SHIFT_Y * palm_h;
+    let cx = palm_cx - sin_r * shift;
+    let cy = palm_cy + cos_r * shift;
+
+    let size = HAND_INPUT_SIZE as usize;
+    let mut data: Vec<f32> = Vec::with_capacity(size * size * 3);
+    // NHWC: 行(y)優先で各画素 RGB を [0,1] 正規化して詰める。
+    for my in 0..size {
+        for mx in 0..size {
+            // 画素中心でサンプリング。
+            let (sx, sy) =
+                hand_model_to_orig(mx as f32 + 0.5, my as f32 + 0.5, crop_size, cos_r, sin_r, cx, cy);
+            let px = sample_bilinear(frame, sx, sy);
+            data.push(px[0] / 255.0);
+            data.push(px[1] / 255.0);
+            data.push(px[2] / 255.0);
+        }
     }
 
-    let resized = image::imageops::resize(
-        &canvas,
-        HAND_INPUT_SIZE,
-        HAND_INPUT_SIZE,
-        FilterType::Triangle,
-    );
-    let data: Vec<f32> = resized
-        .pixels()
-        .flat_map(|p| {
-            [
-                p[0] as f32 / 255.0,
-                p[1] as f32 / 255.0,
-                p[2] as f32 / 255.0,
-            ]
-        })
-        .collect();
-
     Ok(HandPreprocess {
-        shape: vec![
-            1usize,
-            HAND_INPUT_SIZE as usize,
-            HAND_INPUT_SIZE as usize,
-            3,
-        ],
+        shape: vec![1usize, size, size, 3],
         data,
-        cx_orig: palm_cx,
-        cy_orig: shifted_cy,
-        crop_size: crop_size_i as f32,
+        cx_orig: cx,
+        cy_orig: cy,
+        crop_size,
+        cos_r,
+        sin_r,
     })
 }
 
@@ -1411,13 +1463,20 @@ fn run_hand_landmark(
     }
 
     let hand_score: f32 = handedness[0];
+    // z はクロップ面内の深さ尺度なので回転不変。x,y は回転を含む逆アフィンで元画像へ戻す。
     let scale = pre.crop_size / HAND_INPUT_SIZE as f32;
-    let center = HAND_INPUT_SIZE as f32 / 2.0;
     let mut landmarks: Vec<HandLandmarkPoint> = Vec::with_capacity(21);
     for i in 0..21 {
         let off = i * 3;
-        let x = (ld[off] - center) * scale + pre.cx_orig;
-        let y = (ld[off + 1] - center) * scale + pre.cy_orig;
+        let (x, y) = hand_model_to_orig(
+            ld[off],
+            ld[off + 1],
+            pre.crop_size,
+            pre.cos_r,
+            pre.sin_r,
+            pre.cx_orig,
+            pre.cy_orig,
+        );
         let z = ld[off + 2] * scale;
         landmarks.push(HandLandmarkPoint { x, y, z });
     }
@@ -1852,6 +1911,82 @@ mod tests {
         assert!(overlay_target_indices(None, 5, None, 3).is_empty());
         // frame_count=0(nb_frames 不明)なら overlay 無効
         assert!(overlay_target_indices(Some(&save), 0, Some(10), 3).is_empty());
+    }
+
+    /// テスト用 PalmBox を作る(回転は keypoints[0],[2] で決まるので bbox は適当でよい)。
+    fn palm_with_kps(wrist: [f32; 2], middle_mcp: [f32; 2]) -> PalmBox {
+        // index 1 はダミー。回転には index 0(手首)と 2(中指MCP)だけ使う。
+        let keypoints = vec![wrist, [0.0, 0.0], middle_mcp];
+        PalmBox {
+            score: 1.0,
+            x1: 0.0,
+            y1: 0.0,
+            x2: 100.0,
+            y2: 100.0,
+            keypoints,
+        }
+    }
+
+    #[test]
+    fn palm_rotation_basic_orientations() {
+        use std::f32::consts::FRAC_PI_2;
+        // 上向き(中指MCP が手首の真上=画像座標で y 小)→ 回転 0。
+        let up = palm_rotation(&palm_with_kps([100.0, 200.0], [100.0, 100.0]));
+        assert!(up.abs() < 1e-4, "上向きは回転0のはず: {up}");
+        // 右向き(中指MCP が右)→ +90°。
+        let right = palm_rotation(&palm_with_kps([100.0, 100.0], [200.0, 100.0]));
+        assert!((right - FRAC_PI_2).abs() < 1e-4, "右向きは+π/2のはず: {right}");
+        // 左向き(中指MCP が左)→ -90°。
+        let left = palm_rotation(&palm_with_kps([100.0, 100.0], [0.0, 100.0]));
+        assert!((left + FRAC_PI_2).abs() < 1e-4, "左向きは-π/2のはず: {left}");
+        // keypoint 不足は 0 にフォールバック。
+        let degenerate = PalmBox {
+            score: 1.0,
+            x1: 0.0,
+            y1: 0.0,
+            x2: 1.0,
+            y2: 1.0,
+            keypoints: vec![[0.0, 0.0]],
+        };
+        assert_eq!(palm_rotation(&degenerate), 0.0);
+    }
+
+    #[test]
+    fn hand_model_to_orig_center_and_rotation() {
+        let center = HAND_INPUT_SIZE as f32 / 2.0;
+        let crop = 300.0;
+        let (cx, cy) = (500.0, 400.0);
+        // モデル中心(112,112)は回転に関わらずクロップ中心へ写る。
+        for &(c, s) in &[(1.0_f32, 0.0_f32), (0.0, 1.0), (-1.0, 0.0)] {
+            let (ox, oy) = hand_model_to_orig(center, center, crop, c, s, cx, cy);
+            assert!((ox - cx).abs() < 1e-3 && (oy - cy).abs() < 1e-3);
+        }
+        // 回転0なら従来式 (m-center)*scale + c に一致。
+        let scale = crop / HAND_INPUT_SIZE as f32;
+        let (ox, oy) = hand_model_to_orig(200.0, 50.0, crop, 1.0, 0.0, cx, cy);
+        assert!((ox - ((200.0 - center) * scale + cx)).abs() < 1e-3);
+        assert!((oy - ((50.0 - center) * scale + cy)).abs() < 1e-3);
+        // +90°回転(c=0,s=1): モデル上端中央(112,0)は中心の右(+crop/2, 0)へ。
+        let (ox, oy) = hand_model_to_orig(center, 0.0, crop, 0.0, 1.0, cx, cy);
+        assert!((ox - (cx + crop / 2.0)).abs() < 1e-3, "ox={ox}");
+        assert!((oy - cy).abs() < 1e-3, "oy={oy}");
+    }
+
+    #[test]
+    fn sample_bilinear_exact_and_oob() {
+        // 2x2 グレースケール風: (y,x) 値を R に入れる。
+        let mut frame = Array3::<u8>::zeros((2, 2, 3));
+        frame[[0, 0, 0]] = 10;
+        frame[[0, 1, 0]] = 20;
+        frame[[1, 0, 0]] = 30;
+        frame[[1, 1, 0]] = 40;
+        // 整数格子点は元値ぴったり。
+        assert!((sample_bilinear(&frame, 0.0, 0.0)[0] - 10.0).abs() < 1e-4);
+        assert!((sample_bilinear(&frame, 1.0, 1.0)[0] - 40.0).abs() < 1e-4);
+        // 中点は4画素平均 = (10+20+30+40)/4 = 25。
+        assert!((sample_bilinear(&frame, 0.5, 0.5)[0] - 25.0).abs() < 1e-4);
+        // 範囲外は黒。
+        assert_eq!(sample_bilinear(&frame, -5.0, -5.0), [0.0, 0.0, 0.0]);
     }
 
     #[test]

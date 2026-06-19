@@ -84,8 +84,11 @@
   - pose-extract メニュー「動画からタグを認識(推論)」。pose_extractor が transformer_burn を lib 依存し、動画→手ポーズ列(126次元)→ 認識モデル(CPU/NdArray)→ top-k タグを **1 プロセスで完結**(S7 抽出 + S8 推論を結線)。学習は引き続き build-dict→`--train-pose`。
   - E2E スモーク通過(既存6動画+rec_smoke、0205-01.mp4 → top-1 "0205" 確率1.0)。回帰用に `#[ignore]` テスト `recognize_smoke_in_sample` 同梱(`cargo test recognize_smoke_in_sample -- --ignored`)。
   - 同 PR で checkpoint クロスバックエンドテストのバグ修正、レビュー指摘3件(overlay範囲 / フレームレート0除算 / TSVサニタイズ)も対応。大きい/private な生成物(`models/rec_*`・`data/pose_dict*.json`・`data/raw_jsl/`)は gitignore で非追跡。
-  - 代償: pose_extractor の初回ビルドが Burn 取り込みで重くなる(将来 feature ゲート化で軽量化可能、今回は受容)。
   - 注意: in-sample の一致は配線確認であって精度の証拠ではない。本判定は撮影後の未見テイクで。
+- **ビルド軽量化(feature ゲート化)完了(2026-06-19)**:
+  - 直結パス導入時の代償だった「pose_extractor の初回ビルドが Burn(wgpu)取り込みで重い」を解消。transformer_burn 側で **wgpu(+autodiff)を `wgpu` feature でゲート**(`default = ["wgpu"]`、`ndarray` は CPU 推論で常用するため常時有効)。wgpu に触れるモジュール(checkpoint / inference / training / recognition_training)は `#[cfg(feature = "wgpu")]` で限定し、CPU 推論経路(recognition ほか)は常時公開。bin には `required-features = ["wgpu"]` を付与し、wgpu 無効時はビルド対象外にする。
+  - pose_extractor は `transformer_burn = { path = "../transformer_burn", default-features = false }` で取り込み、wgpu バックエンド一式のコンパイルを回避。
+  - 検証: 軽量 lib のみ `cargo check --no-default-features` 30秒(wgpu/naga/wgpu-hal 非コンパイル)/ pose_extractor `cargo check` 47秒(同上)/ transformer_burn `cargo test`(default=wgpu)全15件パス・回帰なし。学習・推論の機能と精度は不変(burn のバックエンド差し替えのみ)。
 - **未見テイク評価ハーネス 完了(2026-06-15)**:
   - `transformer_burn --eval-holdout <dict.json> [--holdout-per-label N]`。pose dict を**テイク単位で train/held-out に分割**(各ラベルでテイク番号の後ろ N 件=既定1を未見に)→ train だけで学習 → **未見テイクで top-k を測る**。Phase 0a の合否判定を1コマンド化(従来は train/predict 用に dict を手で2つ作る必要があった)。
   - `pose_data.rs` に `take_from_stem` / `load_holdout_split`(+ユニットテスト)、`main.rs` に `--eval-holdout` 分岐を追加。学習・評価は既存 `train_recognition` / `evaluate_topk` を再利用。
@@ -260,4 +263,4 @@ cargo build --release
 
 ---
 
-**最終更新**: 2026年6月15日(未見テイク評価ハーネス `--eval-holdout` を実装=Phase 0a の合否判定を1コマンド化、ドライラン通過。これに先立ち認識方向パイプライン S1〜S8 + 動画→タグ直結パスを PR #1、Phase 0a 現状の文書化を PR #2 で main にマージ済み。機構は揃い、あとは撮影データ待ち)
+**最終更新**: 2026年6月19日(ビルド軽量化=transformer_burn の wgpu を feature ゲート化し、pose_extractor は `default-features = false` で取り込み wgpu バックエンドのコンパイルを回避。lib のみビルド30秒・pose_extractor check 47秒・transformer_burn テスト全15件パスで検証。機能・精度は不変。これに先立ち未見テイク評価ハーネス `--eval-holdout`=Phase 0a の合否判定を1コマンド化(PR #3)、認識方向パイプライン S1〜S8 + 動画→タグ直結パス(PR #1)、Phase 0a 現状の文書化(PR #2)を main にマージ済み。機構は揃い、あとは撮影データ待ち)

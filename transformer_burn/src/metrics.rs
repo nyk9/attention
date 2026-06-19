@@ -188,7 +188,7 @@ fn save_readme(
 ### 推論（WGPU）
 
 ```bash
-cargo run --release -p transformer_burn --features "wgpu,autodiff,ndarray" -- \
+cargo run --release -p transformer_burn -- \
   --load {} \
   --backend wgpu \
   --predict "ありがとう"
@@ -197,7 +197,7 @@ cargo run --release -p transformer_burn --features "wgpu,autodiff,ndarray" -- \
 ### 推論（NdArray / CPU）
 
 ```bash
-cargo run --release -p transformer_burn --features "wgpu,autodiff,ndarray" -- \
+cargo run --release -p transformer_burn -- \
   --load {} \
   --backend ndarray \
   --predict "ありがとう"
@@ -206,7 +206,7 @@ cargo run --release -p transformer_burn --features "wgpu,autodiff,ndarray" -- \
 ### 推論（自動選択）
 
 ```bash
-cargo run --release -p transformer_burn --features "wgpu,autodiff,ndarray" -- \
+cargo run --release -p transformer_burn -- \
   --load {} \
   --backend auto \
   --predict "ありがとう"

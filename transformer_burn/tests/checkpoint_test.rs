@@ -1,3 +1,7 @@
+// このテストは TrainingBackend(Autodiff<Wgpu>)と WGPU 推論を検証するため wgpu 必須。
+// wgpu feature 無効時(pose_extractor 由来の軽量ビルド構成)はテストごとスキップする。
+#![cfg(feature = "wgpu")]
+
 use burn::backend::ndarray::NdArray;
 use burn::backend::wgpu::WgpuDevice;
 use burn::prelude::*;

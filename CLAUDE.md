@@ -69,7 +69,7 @@
 - **進捗(2026-06-04 時点)**:
   - A: 実装完了。confidence は向上したが身体ランドマークは破綻したまま(人物が正方形内で小さい)
   - C-1(Palm Detection): 完了。SSD anchors 2016 を埋め込み、両手検出可能
-  - C-2(Hand Landmark): 完了。21 keypoints/手を取得。回転アラインメントは未実装のため指関節の精度は MediaPipe 純正よりやや劣る
+  - C-2(Hand Landmark): 完了。21 keypoints/手を取得。**回転アラインメント実装完了(2026-06-20)**: Palm keypoint[0]=手首・[2]=中指MCP を結ぶ向きが上向き(90°)になる回転角を求め(OpenCV Zoo `mp_handpose` / MediaPipe `DetectionsToRectsCalculator` と同式)、クロップを回転して双線形サンプリング→手ランドマークモデルへ。出力は逆アフィンで元画像へ戻す。回転角0のとき従来の軸並行クロップに一致する一般化(後方互換)。中心シフトも回転後フレームの y 軸方向へ適用(MediaPipe RectTransformation 準拠)
   - S7(動画→手ポーズ列 抽出基盤): `build-dict` サブコマンド実装完了。`<タグ名>.mp4` 群から 1 フレーム=126 次元(左右の手 21点×xyz、手のみ。身体ランドマークは破綻のため不採用)の手ポーズ列を抽出。`--frames` でダウンサンプル(既定 10=SEQ_LEN)、座標は width/height で正規化。既存動画 1 本でスモークテスト済み(coverage 約 62%)
 - **S7-8 の方向性(2026-06-04: 生成補強を一度採用 → 同日 認識へ戻す reverted)**:
   - 一時、認識ではなく**生成補強**(日本語→タグ + `build-dict` のポーズ辞書引き)を採用したが、これは認識がランドマーク破綻で詰まったための**暫定回避策**。本来の目標(手話→日本語 認識)に戻すため**取り消し**。
@@ -97,7 +97,7 @@
 - **次のステップ(認識方向、撮影データ待ち)**:
   - 撮影した先頭10語を `build-dict` → **`--eval-holdout`(上記ハーネス)で未見テイク評価**し、**Phase 0a 終了基準(10語で top-5 に正解)を判定**(これが Phase 0a の出口)。機構は用意済みで、あとは撮影データ待ち
   - タグ → 自然な日本語(部品C)は LLM 整形を後段で(①プロンプト→②LoRA→③自作の順で安く試す)
-  - 任意: Hand Landmark の回転アラインメント実装で指関節精度向上(現状は回転正規化なしで指関節精度がやや劣る)
+  - ~~任意: Hand Landmark の回転アラインメント実装で指関節精度向上~~ → **2026-06-20 実装完了**(上記 C-2 参照)。注意: 既存の認識モデル(`rec_smoke` 等)は回転なし特徴で学習済みのため、特徴分布が変わる。撮影データで本学習する際は回転あり特徴で `build-dict` し直して学習する(過学習スモークは回転後特徴でも top-1 維持を確認済み)
   - 前提: S6 のランドマーク品質問題への取り組み継続。ただし認識は手ポーズ(C 系)中心で進められる
 
 ---
@@ -263,4 +263,4 @@ cargo build --release
 
 ---
 
-**最終更新**: 2026年6月19日(ビルド軽量化=transformer_burn の wgpu を feature ゲート化し、pose_extractor は `default-features = false` で取り込み wgpu バックエンドのコンパイルを回避。lib のみビルド30秒・pose_extractor check 47秒・transformer_burn テスト全15件パスで検証。機能・精度は不変。これに先立ち未見テイク評価ハーネス `--eval-holdout`=Phase 0a の合否判定を1コマンド化(PR #3)、認識方向パイプライン S1〜S8 + 動画→タグ直結パス(PR #1)、Phase 0a 現状の文書化(PR #2)を main にマージ済み。機構は揃い、あとは撮影データ待ち)
+**最終更新**: 2026年6月20日(Hand Landmark の**回転アラインメント実装**。Palm keypoint[0]手首→[2]中指MCP の向きが上向きになる回転角でクロップを回転・双線形サンプリングし、出力は逆アフィンで元画像へ戻す=OpenCV Zoo `mp_handpose`/MediaPipe 純正と同式。回転角0で従来の軸並行クロップに一致する後方互換。新規の純関数 `palm_rotation`/`normalize_radians`/`hand_model_to_orig`/`sample_bilinear` にユニットテスト追加、pose_extractor 全テスト緑+回転後特徴での E2E スモーク(`recognize_smoke_in_sample`)も top-1 維持で通過。注意: 既存 `rec_smoke` は回転なし特徴で学習済みのため本学習時は要再 `build-dict`。直前の更新=ビルド軽量化=transformer_burn の wgpu を feature ゲート化し pose_extractor は `default-features = false` で取り込み(2026-06-19、PR #4)。これに先立ち未見テイク評価ハーネス `--eval-holdout`(PR #3)、認識方向パイプライン S1〜S8 + 動画→タグ直結パス(PR #1)、Phase 0a 現状の文書化(PR #2)を main にマージ済み。機構は揃い、あとは撮影データ待ち)

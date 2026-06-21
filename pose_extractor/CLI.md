@@ -62,8 +62,9 @@ iPhone で撮った `.MOV` も AirDrop でこのディレクトリに入れれ�
 
 追加機能 (space で選択, enter で確定)
   [x] sigmoid を visibility/presence に適用
-  [ ] ランドマーク オーバーレイ PNG 保存
+  [ ] ランドマーク オーバーレイ保存(動画 mp4 / PNG)
   [ ] フレーム数制限 (動作確認用)
+  [ ] MediaPipe Hands (Palm + Landmark) を並走
 
 出力ファイル (空欄=stdout)
   > /tmp/result.json
@@ -75,18 +76,26 @@ iPhone で撮った `.MOV` も AirDrop でこのディレクトリに入れれ�
   - **TSV**: 1 行 = 1 フレーム、197 列(`frame_idx`, `confidence`, `x0..pres38`)
 - **追加機能(複数選択可)**:
   - **sigmoid**: 生のロジット値を [0,1] に正規化(visibility/presence のみ。confidence はモデル側で正規化済み)
-  - **オーバーレイ PNG**: 等間隔のフレームにランドマークを描画し PNG 保存
-    - 選択時に「保存先ディレクトリ」「枚数(既定 3)」を追加質問
-    - 緑=visibility > 0.5、赤=visibility ≤ 0.5(BlazePose)
-    - シアン枠=palm bbox、黄色ドット=palm 7 keypoints(MediaPipe Palm Detection)
-    - マゼンタ/青ドット=hand 21 landmarks(handedness で色分け、MediaPipe Hand Landmark)
+  - **オーバーレイ保存**: フレームにランドマークを描画する。選択時に「保存先ディレクトリ」と
+    出力形式を質問:
+    - **動画 mp4(全フレーム・手の骨格つき/品質チェック向き)**: 全フレームを `frame_%05d.png` で
+      吐き、ffmpeg で `overlay.mp4` に束ねる。手話のジェスチャーを通しで確認でき、回転アラインメント
+      後に指が正しく曲がっているかの目視に向く(撮影品質チェックの主用途)
+    - **PNG 数枚(サンプル)**: 等間隔の N フレームのみ PNG 保存(選択時に「枚数(既定 3)」を追加質問)
+    - 色の凡例(両形式共通):
+      - 緑=visibility > 0.5、赤=visibility ≤ 0.5(BlazePose 39 点)
+      - シアン枠=palm bbox、黄色ドット=palm 7 keypoints(MediaPipe Palm Detection)
+      - マゼンタ/青=hand 21 landmarks(handedness で色分け)。**21 本の骨格線(ボーン)で関節を接続**し、
+        指の曲がりを可視化(MediaPipe Hand Landmark)
+    - 手の骨格線・並走 Hands を見るには「MediaPipe Hands を並走」も併せて選ぶ
   - **フレーム数制限**: 動作確認用に先頭 N フレームのみ処理
     - 選択時に「最大フレーム数(既定 10)」を追加質問
   - **MediaPipe Hands (Palm + Landmark) を並走**: 手指検出を並列実行
     - `models/palm_detection_mediapipe.onnx` で手の bbox を抽出
     - `models/handpose_estimation_mediapipe.onnx` で 21 keypoints/手 を抽出
     - JSON 出力に `palm_frames` と `hand_frames` フィールドが追加される(TSV は pose のみ)
-    - 注:回転アラインメントは未実装。`HAND_CROP_ENLARGE=3.0` の簡易クロップのため、指関節の位置精度は MediaPipe 純正よりやや劣る
+    - 回転アラインメント実装済み(2026-06-20)。palm keypoint[0]手首→[2]中指MCP の向きが上向きに
+      なる回転角でクロップを回転・双線形サンプリングしてから Hand Landmark へ渡す(MediaPipe 純正と同式)
 - **出力ファイル**: 空欄で stdout、パス指定でそのファイルに書き出し
 
 ## 出力スキーマ

@@ -688,9 +688,18 @@ fn run_extraction(cfg: RunConfig) -> Result<()> {
     // オーバーレイは上のループ内で PNG として描画済み。動画モードなら束ねて mp4 にする。
     if let Some(dir) = &cfg.save_overlay {
         if cfg.overlay_video {
-            let mp4 = dir.join("overlay.mp4");
-            encode_overlay_video(dir, &mp4, sequence.video.fps)?;
-            eprintln!("wrote overlay video: {}", mp4.display());
+            if sequence.frames.is_empty() {
+                // フレームが1枚も無い(空/破損動画・max_frames=0)と ffmpeg が入力なしで失敗する。
+                // pose 抽出自体は続行できるので、抽出全体を巻き込まず警告に留める。
+                eprintln!("warning: フレームが無いためオーバーレイ動画をスキップしました");
+            } else {
+                let mp4 = dir.join("overlay.mp4");
+                encode_overlay_video(dir, &mp4, sequence.video.fps)?;
+                eprintln!(
+                    "wrote overlay video: {}(中間 PNG frame_*.png も同じディレクトリに残ります)",
+                    mp4.display()
+                );
+            }
         } else {
             eprintln!("wrote overlay PNGs to: {}", dir.display());
         }
@@ -2095,6 +2104,27 @@ mod tests {
             assert!(a < HAND_POINTS, "a={} が範囲外", a);
             assert!(b < HAND_POINTS, "b={} が範囲外", b);
             assert_ne!(a, b, "自己ループは無効: ({}, {})", a, b);
+        }
+    }
+
+    #[test]
+    fn hand_connections_topology() {
+        // ボーン定義が壊れても構造的に検知する。各点の次数(つながるボーン数)で検証:
+        // - 指先(4,8,12,16,20)は末端なので degree 1
+        // - 手首(0)は親指根・人差し指根・小指根へ伸びるので degree 3
+        // - 21 点すべてがいずれかのボーンに含まれる(孤立点なし)
+        use std::collections::HashMap;
+        let mut degree: HashMap<usize, usize> = HashMap::new();
+        for &(a, b) in HAND_CONNECTIONS {
+            *degree.entry(a).or_default() += 1;
+            *degree.entry(b).or_default() += 1;
+        }
+        for tip in [4usize, 8, 12, 16, 20] {
+            assert_eq!(degree.get(&tip).copied().unwrap_or(0), 1, "指先 {} の次数が 1 でない", tip);
+        }
+        assert_eq!(degree.get(&0).copied().unwrap_or(0), 3, "手首(0)の次数が 3 でない");
+        for p in 0..HAND_POINTS {
+            assert!(degree.contains_key(&p), "点 {} がどのボーンにも含まれない", p);
         }
     }
 

@@ -33,6 +33,24 @@ const HAND_CONF_THRESHOLD: f32 = 0.5;
 const HAND_POINTS: usize = 21;
 const DICT_FEATURE_DIM: usize = HAND_POINTS * 3 * 2; // = 126
 
+// MediaPipe Hands の 21 ランドマークを結ぶ骨格(21 本のボーン)。
+// 各タプル (a, b) は landmarks[a]-landmarks[b] を線で結ぶ。回転アラインメント後に
+// 指が解剖学的に正しく曲がっているかをオーバーレイ動画で目視するために使う。
+const HAND_CONNECTIONS: &[(usize, usize)] = &[
+    // 親指
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    // 人差し指
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    // 中指
+    (5, 9), (9, 10), (10, 11), (11, 12),
+    // 薬指
+    (9, 13), (13, 14), (14, 15), (15, 16),
+    // 小指
+    (13, 17), (17, 18), (18, 19), (19, 20),
+    // 手のひら基部
+    (0, 17),
+];
+
 // CLI はフラグを使わず、引数なし起動のトップレベルメニュー(質問形式)で全機能に入る。
 // 設定値はすべて dialoguer の Select/Input/MultiSelect で対話的に尋ねる。
 const RAW_JSL_DIR: &str = "../transformer_burn/data/raw_jsl";
@@ -55,6 +73,8 @@ struct RunConfig {
     apply_sigmoid: bool,
     save_overlay: Option<PathBuf>,
     overlay_count: usize,
+    /// オーバーレイを全フレームの mp4 動画として書き出すか(false なら従来の PNG 数枚)
+    overlay_video: bool,
     max_frames: Option<usize>,
     output: Option<PathBuf>,
 }
@@ -538,19 +558,21 @@ fn run_extraction(cfg: RunConfig) -> Result<()> {
         cfg.max_frames,
         cfg.overlay_count,
     );
+    // オーバーレイ保存先を先に作る。動画モードは全フレームの PNG をここに連番で貯め、
+    // ループ後に ffmpeg で mp4 へ束ねる(生フレームをメモリに溜めない)。
+    if let Some(dir) = &cfg.save_overlay {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("create dir {}", dir.display()))?;
+    }
     let mut frames: Vec<PoseFrame> = Vec::new();
     let mut palm_frames: Vec<PalmFrame> = Vec::new();
     let mut hand_frames: Vec<HandFrame> = Vec::new();
-    let mut overlay_buffer: Vec<(usize, Array3<u8>)> = Vec::new();
 
     extract_frames(&cfg.input, info.width, info.height, |idx, frame| {
         if let Some(m) = cfg.max_frames {
             if idx >= m {
                 return Ok(());
             }
-        }
-        if overlay_targets.contains(&idx) {
-            overlay_buffer.push((idx, frame.clone()));
         }
         let (shape, data) = preprocess_frame(&frame)?;
         let input_value = Value::from_array((shape, data))?;
@@ -559,13 +581,15 @@ fn run_extraction(cfg: RunConfig) -> Result<()> {
         let (_, ld_data) = outputs["Identity"].try_extract_tensor::<f32>()?;
         let (_, conf_data) = outputs["Identity_1"].try_extract_tensor::<f32>()?;
         let landmarks = parse_landmarks(ld_data)?;
-
-        frames.push(PoseFrame {
+        let pose_frame = PoseFrame {
             frame_idx: idx,
             confidence: conf_data[0],
             landmarks,
-        });
+        };
 
+        // palm / hand はこのフレームのローカル結果として持ち、オーバーレイ描画にも使う
+        let mut palm_frame_local: Option<PalmFrame> = None;
+        let mut hand_frame_local: Option<HandFrame> = None;
         if let Some(palm_s) = palm_session.as_mut() {
             let palms = run_palm_detection(palm_s, &frame, &palm_anchors)?;
             let mut hands_this_frame: Vec<Hand> = Vec::new();
@@ -576,16 +600,40 @@ fn run_extraction(cfg: RunConfig) -> Result<()> {
                     }
                 }
             }
-            palm_frames.push(PalmFrame {
+            palm_frame_local = Some(PalmFrame {
                 frame_idx: idx,
                 palms,
             });
             if hand_session.is_some() {
-                hand_frames.push(HandFrame {
+                hand_frame_local = Some(HandFrame {
                     frame_idx: idx,
                     hands: hands_this_frame,
                 });
             }
+        }
+
+        // オーバーレイ描画。動画モードは全フレーム、PNG モードは overlay_targets のみ。
+        // sigmoid は描画側で適用するため未適用(false)で渡す(可視性の色判定は sigmoid 適用後と同値)。
+        if let Some(dir) = &cfg.save_overlay {
+            if cfg.overlay_video || overlay_targets.contains(&idx) {
+                let path = dir.join(format!("frame_{:05}.png", idx));
+                draw_overlay(
+                    &frame,
+                    &pose_frame,
+                    false,
+                    palm_frame_local.as_ref(),
+                    hand_frame_local.as_ref(),
+                    &path,
+                )?;
+            }
+        }
+
+        frames.push(pose_frame);
+        if let Some(pf) = palm_frame_local {
+            palm_frames.push(pf);
+        }
+        if let Some(hf) = hand_frame_local {
+            hand_frames.push(hf);
         }
 
         Ok(())
@@ -637,30 +685,23 @@ fn run_extraction(cfg: RunConfig) -> Result<()> {
 
     print_stats(&sequence);
 
+    // オーバーレイは上のループ内で PNG として描画済み。動画モードなら束ねて mp4 にする。
     if let Some(dir) = &cfg.save_overlay {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("create dir {}", dir.display()))?;
-        for (idx, frame) in &overlay_buffer {
-            if let Some(pose_frame) = sequence.frames.iter().find(|f| f.frame_idx == *idx) {
-                let palm_frame = sequence
-                    .palm_frames
-                    .as_ref()
-                    .and_then(|v| v.iter().find(|p| p.frame_idx == *idx));
-                let hand_frame = sequence
-                    .hand_frames
-                    .as_ref()
-                    .and_then(|v| v.iter().find(|h| h.frame_idx == *idx));
-                let path = dir.join(format!("frame_{:05}.png", idx));
-                draw_overlay(
-                    frame,
-                    pose_frame,
-                    sequence.sigmoid_applied,
-                    palm_frame,
-                    hand_frame,
-                    &path,
-                )?;
-                eprintln!("wrote overlay: {}", path.display());
+        if cfg.overlay_video {
+            if sequence.frames.is_empty() {
+                // フレームが1枚も無い(空/破損動画・max_frames=0)と ffmpeg が入力なしで失敗する。
+                // pose 抽出自体は続行できるので、抽出全体を巻き込まず警告に留める。
+                eprintln!("warning: フレームが無いためオーバーレイ動画をスキップしました");
+            } else {
+                let mp4 = dir.join("overlay.mp4");
+                encode_overlay_video(dir, &mp4, sequence.video.fps)?;
+                eprintln!(
+                    "wrote overlay video: {}(中間 PNG frame_*.png も同じディレクトリに残ります)",
+                    mp4.display()
+                );
             }
+        } else {
+            eprintln!("wrote overlay PNGs to: {}", dir.display());
         }
     }
 
@@ -969,7 +1010,7 @@ fn run_wizard() -> Result<Vec<RunConfig>> {
 
     let feature_labels = &[
         "sigmoid を visibility/presence に適用",
-        "ランドマーク オーバーレイ PNG 保存",
+        "ランドマーク オーバーレイ保存(動画 mp4 / PNG)",
         "フレーム数制限 (動作確認用)",
         "MediaPipe Hands (Palm + Landmark) を並走",
     ];
@@ -982,7 +1023,7 @@ fn run_wizard() -> Result<Vec<RunConfig>> {
     let want_limit = selected.contains(&2);
     let want_hands = selected.contains(&3);
 
-    let (overlay_root, overlay_count) = if want_overlay {
+    let (overlay_root, overlay_count, overlay_video) = if want_overlay {
         let prompt = if batch_mode {
             "オーバーレイ保存先(動画ごとにサブディレクトリを作成)"
         } else {
@@ -992,13 +1033,26 @@ fn run_wizard() -> Result<Vec<RunConfig>> {
             .with_prompt(prompt)
             .default("/tmp/overlay".into())
             .interact_text()?;
-        let count: usize = Input::with_theme(&theme)
-            .with_prompt("オーバーレイ枚数")
-            .default(3)
-            .interact_text()?;
-        (Some(PathBuf::from(dir.trim())), count)
+        // 動画 mp4(全フレーム・手の骨格つき)か、サンプル PNG 数枚か
+        let mode_idx = Select::with_theme(&theme)
+            .with_prompt("オーバーレイの出力形式")
+            .items(&[
+                "動画 mp4(全フレーム・手の骨格つき/品質チェック向き)",
+                "PNG 数枚(サンプル)",
+            ])
+            .default(0)
+            .interact()?;
+        if mode_idx == 0 {
+            (Some(PathBuf::from(dir.trim())), 0, true)
+        } else {
+            let count: usize = Input::with_theme(&theme)
+                .with_prompt("オーバーレイ枚数")
+                .default(3)
+                .interact_text()?;
+            (Some(PathBuf::from(dir.trim())), count, false)
+        }
     } else {
-        (None, 3)
+        (None, 3, false)
     };
 
     let max_frames = if want_limit {
@@ -1073,6 +1127,7 @@ fn run_wizard() -> Result<Vec<RunConfig>> {
                 apply_sigmoid,
                 save_overlay,
                 overlay_count,
+                overlay_video,
                 max_frames,
                 output,
             }
@@ -1665,6 +1720,15 @@ fn draw_overlay(
         let blue = Rgb([60u8, 120, 255]);
         for h in &hand_frame.hands {
             let color = if h.handedness > 0.5 { magenta } else { blue };
+            // 骨格線(ボーン)を先に描き、その上に関節ドットを重ねる。
+            // これで指の曲がり方(回転アラインメントの効果)が目視できる。
+            if h.landmarks.len() >= HAND_POINTS {
+                for &(a, b) in HAND_CONNECTIONS {
+                    let p = &h.landmarks[a];
+                    let q = &h.landmarks[b];
+                    draw_line(&mut img, p.x, p.y, q.x, q.y, color, 1);
+                }
+            }
             for lm in &h.landmarks {
                 draw_dot(&mut img, lm.x, lm.y, 3, color);
             }
@@ -1694,6 +1758,54 @@ fn draw_dot(
             if px >= 0 && py >= 0 && px < w && py < h {
                 img.put_pixel(px as u32, py as u32, color);
             }
+        }
+    }
+}
+
+/// 2 点間にブレゼンハム直線を引く。`thickness` は中心からの半径(0 で 1px、1 で 3px 幅)。
+/// 手の骨格(指の曲がり)をオーバーレイ動画で目視するために使う。
+fn draw_line(
+    img: &mut ImageBuffer<Rgb<u8>, Vec<u8>>,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    color: Rgb<u8>,
+    thickness: i32,
+) {
+    let mut x = x0.round() as i32;
+    let mut y = y0.round() as i32;
+    let x1 = x1.round() as i32;
+    let y1 = y1.round() as i32;
+    let dx = (x1 - x).abs();
+    let dy = -(y1 - y).abs();
+    let sx = if x < x1 { 1 } else { -1 };
+    let sy = if y < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+    let w = img.width() as i32;
+    let h = img.height() as i32;
+    loop {
+        // 太さ分の小さな矩形を塗る
+        for oy in -thickness..=thickness {
+            for ox in -thickness..=thickness {
+                let px = x + ox;
+                let py = y + oy;
+                if px >= 0 && py >= 0 && px < w && py < h {
+                    img.put_pixel(px as u32, py as u32, color);
+                }
+            }
+        }
+        if x == x1 && y == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y += sy;
         }
     }
 }
@@ -1893,6 +2005,40 @@ where
     Ok(())
 }
 
+/// オーバーレイ PNG 群(frame_00000.png ...)を ffmpeg で 1 本の mp4 に束ねる。
+/// フレーム番号は 0 からの連番なので image2 デマルチプレクサ(%05d)で読める。
+fn encode_overlay_video(dir: &Path, out: &Path, fps: f64) -> Result<()> {
+    // fps が不明(ffprobe で 0)なら 30 にフォールバック
+    let fps = if fps > 0.0 { fps } else { 30.0 };
+    let pattern = dir.join("frame_%05d.png");
+    let status = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-y",
+            "-framerate",
+            &format!("{:.6}", fps),
+            "-start_number",
+            "0",
+            "-i",
+            pattern.to_str().context("overlay dir path must be UTF-8")?,
+            // libx264 は偶数サイズ必須。奇数解像度でも安全側に丸める
+            "-vf",
+            "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            out.to_str().context("overlay output path must be UTF-8")?,
+        ])
+        .status()
+        .context("Failed to spawn ffmpeg for overlay video")?;
+    if !status.success() {
+        anyhow::bail!("ffmpeg (overlay video) exited with status: {}", status);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1911,6 +2057,93 @@ mod tests {
         assert!(overlay_target_indices(None, 5, None, 3).is_empty());
         // frame_count=0(nb_frames 不明)なら overlay 無効
         assert!(overlay_target_indices(Some(&save), 0, Some(10), 3).is_empty());
+    }
+
+    /// 実モデル(pose+palm+hand)で動画→オーバーレイ動画を生成する E2E スモーク。
+    /// ONNX が重いので通常はスキップ。明示実行: `cargo test overlay_video_smoke -- --ignored`
+    #[test]
+    #[ignore]
+    fn overlay_video_smoke() {
+        let video = PathBuf::from("videos/0205-01.mp4");
+        if !video.exists() {
+            eprintln!("skip: {} が無い(撮影/モデル未配置)", video.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join("pose_overlay_smoke");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = RunConfig {
+            input: video,
+            model: PathBuf::from(DEFAULT_MODEL),
+            palm_model: Some(PathBuf::from(PALM_MODEL)),
+            hand_model: Some(PathBuf::from(HAND_MODEL)),
+            format: OutputFormat::Tsv,
+            apply_sigmoid: false,
+            save_overlay: Some(dir.clone()),
+            overlay_count: 0,
+            overlay_video: true,
+            max_frames: Some(8), // 速度のため先頭 8 フレームのみ
+            output: Some(dir.join("out.tsv")),
+        };
+        run_extraction(cfg).expect("run_extraction 失敗");
+
+        // 全フレーム PNG と束ねた mp4 が出来ていること
+        let mp4 = dir.join("overlay.mp4");
+        assert!(mp4.exists(), "overlay.mp4 が無い");
+        assert!(
+            std::fs::metadata(&mp4).unwrap().len() > 0,
+            "overlay.mp4 が空"
+        );
+        assert!(dir.join("frame_00000.png").exists(), "先頭フレーム PNG が無い");
+    }
+
+    #[test]
+    fn hand_connections_cover_21_bones() {
+        // MediaPipe Hands の骨格は 21 本。indices は 0..21 に収まり自己ループはない。
+        assert_eq!(HAND_CONNECTIONS.len(), 21);
+        for &(a, b) in HAND_CONNECTIONS {
+            assert!(a < HAND_POINTS, "a={} が範囲外", a);
+            assert!(b < HAND_POINTS, "b={} が範囲外", b);
+            assert_ne!(a, b, "自己ループは無効: ({}, {})", a, b);
+        }
+    }
+
+    #[test]
+    fn hand_connections_topology() {
+        // ボーン定義が壊れても構造的に検知する。各点の次数(つながるボーン数)で検証:
+        // - 指先(4,8,12,16,20)は末端なので degree 1
+        // - 手首(0)は親指根・人差し指根・小指根へ伸びるので degree 3
+        // - 21 点すべてがいずれかのボーンに含まれる(孤立点なし)
+        use std::collections::HashMap;
+        let mut degree: HashMap<usize, usize> = HashMap::new();
+        for &(a, b) in HAND_CONNECTIONS {
+            *degree.entry(a).or_default() += 1;
+            *degree.entry(b).or_default() += 1;
+        }
+        for tip in [4usize, 8, 12, 16, 20] {
+            assert_eq!(degree.get(&tip).copied().unwrap_or(0), 1, "指先 {} の次数が 1 でない", tip);
+        }
+        assert_eq!(degree.get(&0).copied().unwrap_or(0), 3, "手首(0)の次数が 3 でない");
+        for p in 0..HAND_POINTS {
+            assert!(degree.contains_key(&p), "点 {} がどのボーンにも含まれない", p);
+        }
+    }
+
+    #[test]
+    fn draw_line_plots_endpoints_and_skips_oob() {
+        let mut img: ImageBuffer<Rgb<u8>, Vec<u8>> =
+            ImageBuffer::from_pixel(10, 10, Rgb([0, 0, 0]));
+        let red = Rgb([255u8, 0, 0]);
+        // 水平線(太さ 0 = 1px)。両端と中間が塗られる。
+        draw_line(&mut img, 1.0, 1.0, 8.0, 1.0, red, 0);
+        assert_eq!(*img.get_pixel(1, 1), red);
+        assert_eq!(*img.get_pixel(8, 1), red);
+        assert_eq!(*img.get_pixel(5, 1), red);
+        // 線から外れた点は黒のまま
+        assert_eq!(*img.get_pixel(5, 5), Rgb([0u8, 0, 0]));
+        // 画像外へ伸びる線でもパニックしない(クリップされる)
+        draw_line(&mut img, -5.0, 5.0, 5.0, 5.0, red, 0);
+        assert_eq!(*img.get_pixel(0, 5), red);
+        assert_eq!(*img.get_pixel(5, 5), red);
     }
 
     /// テスト用 PalmBox を作る(回転は keypoints[0],[2] で決まるので bbox は適当でよい)。

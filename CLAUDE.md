@@ -19,9 +19,10 @@
 
 ### 2. translator_ja_en - 日英翻訳AI
 - 日本語→英語の機械翻訳(手話データ準備期間中の学習継続)
-- **ステータス**: 初期セットアップ完了
-- **語彙**: 未定(日本語 + 英語 + 特殊トークン)
-- **データ**: 準備中(50-100サンプル予定)
+- **ステータス**: Phase 1〜3完了(データセット・語彙・モデルスケールアップ)。Phase 4(実用化)はビームサーチ推論まで実装済み、BLEU評価は未着手。**2026-07-02 訂正**: 本節は 2025-11-01 の学習後も約8ヶ月間「初期セットアップ完了」のまま未更新だった(pose_extractor 側の作業に集中していたため)。以下は実態に合わせた最新値
+- **語彙**: 日本語168 + 英語798(特殊トークン込み)
+- **データ**: 2879サンプル(`data/` 配下に複数データセットを統合: 基本文・挨拶拡張・文章拡張・英国英語表現など)
+- **モデル**: d_model=128、4ヘッド、Encoder/Decoder各4層、d_ff=512、seq_len=30。`models/test/` に150エポック学習済みモデルあり(2025-11-01訓練、final loss 0.162)
 
 ### 3. elan_parser - ELAN .eaf アノテーション抽出CLI
 - ELAN(手話研究のデファクトアノテーションツール)出力の `.eaf` XML から、gloss 列を TSV/JSON 形式で抽出
@@ -94,6 +95,10 @@
   - `pose_data.rs` に `take_from_stem` / `load_holdout_split`(+ユニットテスト)、`main.rs` に `--eval-holdout` 分岐を追加。学習・評価は既存 `train_recognition` / `evaluate_topk` を再利用。
   - ドライラン(既存6動画、各語 take3 を未見): train=4 / 未見=2 に正しく分割・学習・評価。top-1 1/2・top-5 2/2(2クラス極小なので配線確認。ただし take3 は学習未使用=**従来の in-sample と違い真の out-of-sample**)。
   - テイクが N 以下のラベルは held-out を作れないため train のみに入れ評価対象外(警告)。
+- **オーバーレイ可視化ツール 完了(2026-06-21、PR #6)**:
+  - pose-extract「動画から姿勢/手を抽出」のオーバーレイを強化。手ランドマーク21点に**骨格線(MediaPipe 21本のボーン)**を描き、指の曲がりを目視できるように(回転アラインメント PR #5 の効果確認用)。S6 の教訓「数値でなく目で確かめる」の本丸で、撮影開始後の手トラッキング品質チェックの主導線。
+  - 出力形式に**オーバーレイ動画 mp4(全フレーム)**を追加(従来はサンプル PNG 数枚のみ)。全フレームを `frame_%05d.png` で吐き ffmpeg で `overlay.mp4` に束ねる。描画を抽出ループ内へ移し生フレームの全バッファ(`Vec<Array3<u8>>`)を廃止=メモリ削減。ゼロフレーム時は動画化をスキップし警告に降格。
+  - 実装は `pose_extractor/src/main.rs`(`HAND_CONNECTIONS` / `draw_line` / `encode_overlay_video`、`RunConfig.overlay_video`)。ユニットテスト(骨格トポロジ・線描画)+ 実モデルでの E2E スモーク `overlay_video_smoke`(`#[ignore]`)を同梱。CLI.md 更新。サブエージェントレビュー対応済み(ゼロフレーム致命化の是正・骨格トポロジテスト追加ほか)。
 - **次のステップ(認識方向、撮影データ待ち)**:
   - 撮影した先頭10語を `build-dict` → **`--eval-holdout`(上記ハーネス)で未見テイク評価**し、**Phase 0a 終了基準(10語で top-5 に正解)を判定**(これが Phase 0a の出口)。機構は用意済みで、あとは撮影データ待ち
   - タグ → 自然な日本語(部品C)は LLM 整形を後段で(①プロンプト→②LoRA→③自作の順で安く試す)
@@ -216,15 +221,13 @@ cargo build --release
 
 ## translator_ja_en - 次のステップ
 
-### Phase 1(基盤構築)
-- [ ] 日英対訳データセット準備(50-100サンプル、TSV形式)
-- [ ] 語彙モジュール実装(translation_vocabulary.rs)
-  - 日本語トークナイザー(1文字単位)
-  - 英語トークナイザー(単語単位、小文字化、句読点処理)
-  - 分離語彙空間(src_vocab, tgt_vocab)
-- [ ] データローダー実装(translation_data.rs)
-- [ ] 設定ファイル更新(config.rs)
-- [ ] 初回訓練実行(動作確認)
+### Phase 1〜3(完了)
+- ✓ 日英対訳データセット準備(2879サンプル、`data/` 配下に複数ファイルへ分割: 基本文・挨拶拡張・文章拡張・英国英語表現など)
+- ✓ 語彙モジュール実装(translation_vocabulary.rs、日本語168語 + 英語798語、分離語彙空間)
+- ✓ データローダー実装(translation_data.rs)
+- ✓ シーケンス長拡張(seq_len=30)
+- ✓ モデルスケールアップ(d_model=128、4ヘッド、Encoder/Decoder各4層、d_ff=512)
+- ✓ ビームサーチ推論実装(translation_model.rs::generate_with_beam_search、CLIの--beam-widthで貪欲探索/ビーム探索を切替)
 
 ### データセット例(data/translation_data_ja_en.txt)
 ```
@@ -234,10 +237,9 @@ cargo build --release
 私は学生です	I am a student
 ```
 
-### Phase 2以降
-- Phase 2: シーケンス長拡張(20-50トークン)
-- Phase 3: モデルスケールアップ(d_model=64-128、4-8ヘッド)
-- Phase 4: 実用化(BLEU評価、ビーム探索)
+### Phase 4(実用化、残タスク)
+- [ ] BLEU評価の実装
+- [ ] 訓練済みモデル(`models/test/`、150エポック、final loss 0.162、2025-11-01訓練)の翻訳品質を定性チェック
 
 ---
 
@@ -263,4 +265,4 @@ cargo build --release
 
 ---
 
-**最終更新**: 2026年6月20日(Hand Landmark の**回転アラインメント実装**。Palm keypoint[0]手首→[2]中指MCP の向きが上向きになる回転角でクロップを回転・双線形サンプリングし、出力は逆アフィンで元画像へ戻す=OpenCV Zoo `mp_handpose`/MediaPipe 純正と同式。回転角0で従来の軸並行クロップに一致する後方互換。新規の純関数 `palm_rotation`/`normalize_radians`/`hand_model_to_orig`/`sample_bilinear` にユニットテスト追加、pose_extractor 全テスト緑+回転後特徴での E2E スモーク(`recognize_smoke_in_sample`)も top-1 維持で通過。注意: 既存 `rec_smoke` は回転なし特徴で学習済みのため本学習時は要再 `build-dict`。直前の更新=ビルド軽量化=transformer_burn の wgpu を feature ゲート化し pose_extractor は `default-features = false` で取り込み(2026-06-19、PR #4)。これに先立ち未見テイク評価ハーネス `--eval-holdout`(PR #3)、認識方向パイプライン S1〜S8 + 動画→タグ直結パス(PR #1)、Phase 0a 現状の文書化(PR #2)を main にマージ済み。機構は揃い、あとは撮影データ待ち)
+**最終更新**: 2026年7月2日(**ドキュメント訂正**: `translator_ja_en` 節が実態より約8ヶ月古いまま放置されていたのを修正。2025-11-01 時点で既に日英データ2879サンプル・d_model=128・ビームサーチ推論まで実装・学習済みだったが、pose_extractor 側の作業に集中していた間 CLAUDE.md は「初期セットアップ完了」のまま未更新だった。ステータス・次のステップを実態に合わせて更新、コード変更なし。直前の更新(2026-06-21)=**オーバーレイ可視化ツール**を pose-extract に追加(PR #6)。手ランドマーク21点に骨格線(MediaPipe 21本のボーン)を描き指の曲がりを目視可能にし、オーバーレイを全フレームの mp4 動画として出力できるようにした(従来はサンプルPNG数枚のみ)。さらに前=Hand Landmark の回転アラインメント実装(PR #5)、ビルド軽量化(PR #4)、未見テイク評価ハーネス `--eval-holdout`(PR #3)、認識方向パイプライン S1〜S8 + 動画→タグ直結パス(PR #1)を main にマージ済み。pose_extractor は機構が揃い、あとは撮影データ待ち)

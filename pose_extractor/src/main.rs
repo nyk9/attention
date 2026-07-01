@@ -283,7 +283,7 @@ fn session_wizard(theme: &ColorfulTheme) -> Result<()> {
     let hand = Select::with_theme(theme)
         .with_prompt("取り込み時の手検出チェック")
         .items(&[
-            "有効(カバレッジが低いテイクを ng_hands フラグ+撮り直し提案)",
+            "有効(手の検出が連続して続かなかったテイクを ng_hands フラグ+撮り直し提案)",
             "無効(取り込みが速い)",
         ])
         .default(0)

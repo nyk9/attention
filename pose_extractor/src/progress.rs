@@ -58,8 +58,13 @@ const INDEX_HEADER: &str =
 const DURATION_MIN_MS: u64 = 2000;
 const DURATION_MAX_MS: u64 = 10000;
 
-/// 手検出カバレッジがこの値未満なら ng_hands フラグ(撮り直し推奨)
-const HAND_COVERAGE_THRESHOLD: f32 = 0.5;
+/// 「手が連続して検出できた最長区間」がこの秒数に満たなければ ng_hands フラグ
+/// (撮り直し推奨)。一人撮影では録画の前後に手を下げた時間ができるため、動画
+/// 全体の平均カバレッジではなく、連続して手が検出できた最長区間の長さで判定する。
+const MIN_HAND_RUN_SECONDS: f32 = 1.0;
+/// 連続区間の判定で許容する瞬断(誤検出・モーションブラーによる1サンプル分の谷)。
+/// これを超えて検出が途切れたら別区間として数え直す。
+const MAX_RUN_GAP_SAMPLES: usize = 1;
 
 /// Phase 0a の50語リスト(ろう者協力者レビュー前の暫定)。
 /// stage 1 = 先頭10語(挨拶8 + わたし/あなた)、target_takes は編集可
@@ -806,19 +811,20 @@ fn ingest(
         match c.coverage(&dest) {
             Ok((left, right)) => {
                 let best = left.max(right);
-                quality_flag = if best >= HAND_COVERAGE_THRESHOLD {
+                quality_flag = if best >= MIN_HAND_RUN_SECONDS {
                     "ok".to_string()
                 } else {
                     "ng_hands".to_string()
                 };
                 println!(
-                    "  手検出: L={:.0}% R={:.0}% → {}",
-                    left * 100.0,
-                    right * 100.0,
-                    quality_flag
+                    "  手検出: L連続{:.1}秒 R連続{:.1}秒 → {}",
+                    left, right, quality_flag
                 );
                 if quality_flag == "ng_hands" {
-                    println!("  → 撮り直し推奨(手がほとんど検出できていません。このテイクは NG フラグ付きで記録し、目標数には数えません)");
+                    println!(
+                        "  → 撮り直し推奨(手が連続して検出できた時間が{:.1}秒未満です。このテイクは NG フラグ付きで記録し、目標数には数えません)",
+                        MIN_HAND_RUN_SECONDS
+                    );
                 }
             }
             Err(e) => eprintln!("  手検出チェック失敗(スキップ): {:#}", e),
@@ -842,8 +848,31 @@ fn ingest(
 
 // ===== 手検出チェック(段階4) =====
 
+/// サンプル列(検出できた/できなかった)のうち、連続して検出できた最長区間を秒で返す。
+/// モーションブラー等による瞬断は MAX_RUN_GAP_SAMPLES 個までなら同一区間とみなして橋渡しする。
+// [TEST向き] 純粋関数。ギャップ許容の境界ケースを固定
+fn longest_run_seconds(hits: &[bool], samples_per_sec: f32) -> f32 {
+    let mut best = 0usize;
+    let mut run = 0usize;
+    let mut gap = 0usize;
+    for &h in hits {
+        if h {
+            run += 1;
+            gap = 0;
+        } else {
+            gap += 1;
+            if gap > MAX_RUN_GAP_SAMPLES {
+                best = best.max(run);
+                run = 0;
+            }
+        }
+    }
+    best = best.max(run);
+    best as f32 / samples_per_sec
+}
+
 /// 取り込んだテイクに Palm + Hand 検出をサンプルフレームだけ実行して
-/// 左右の手のカバレッジを返す(全フレームは回さないので数秒で終わる)
+/// 左右それぞれ「連続して検出できた最長区間」を秒で返す(全フレームは回さないので数秒で終わる)
 struct HandChecker {
     palm: Session,
     hand: Session,
@@ -865,10 +894,11 @@ impl HandChecker {
         })
     }
 
-    /// 毎秒3フレーム程度をサンプリングして (左手カバレッジ, 右手カバレッジ) を返す
+    /// 毎秒3フレーム程度をサンプリングして (左手の連続検出最長秒数, 右手の連続検出最長秒数) を返す
     fn coverage(&mut self, video: &PathBuf) -> Result<(f32, f32)> {
         let info = crate::probe_video(video)?;
         let step = ((info.fps / 3.0).round() as usize).max(1);
+        let samples_per_sec = info.fps as f32 / step as f32;
 
         let Self {
             palm,
@@ -876,14 +906,12 @@ impl HandChecker {
             anchors,
         } = self;
 
-        let mut sampled = 0u32;
-        let mut left = 0u32;
-        let mut right = 0u32;
+        let mut left_hits = Vec::new();
+        let mut right_hits = Vec::new();
         crate::extract_frames(video, info.width, info.height, |idx, frame| {
             if idx % step != 0 {
                 return Ok(());
             }
-            sampled += 1;
             let palms = crate::run_palm_detection(palm, &frame, anchors)?;
             let mut l = false;
             let mut r = false;
@@ -896,21 +924,17 @@ impl HandChecker {
                     }
                 }
             }
-            if l {
-                left += 1;
-            }
-            if r {
-                right += 1;
-            }
+            left_hits.push(l);
+            right_hits.push(r);
             Ok(())
         })?;
 
-        if sampled == 0 {
+        if left_hits.is_empty() {
             anyhow::bail!("フレームが1枚も取れませんでした");
         }
         Ok((
-            left as f32 / sampled as f32,
-            right as f32 / sampled as f32,
+            longest_run_seconds(&left_hits, samples_per_sec),
+            longest_run_seconds(&right_hits, samples_per_sec),
         ))
     }
 }
@@ -994,5 +1018,42 @@ mod tests {
     #[test]
     fn sanitize_tsv_strips_separators() {
         assert_eq!(sanitize_tsv("a\tb\nc"), "a b c");
+    }
+
+    // [TEST向き] 連続区間検出の境界ケース。samples_per_sec=3.0 で固定
+    #[test]
+    fn longest_run_seconds_all_hits() {
+        let hits = [true, true, true, true, true, true];
+        // 期待値の根拠: 6サンプル全てヒット = 6/3.0秒
+        assert_eq!(longest_run_seconds(&hits, 3.0), 2.0);
+    }
+
+    #[test]
+    fn longest_run_seconds_no_hits() {
+        let hits = [false, false, false];
+        assert_eq!(longest_run_seconds(&hits, 3.0), 0.0);
+    }
+
+    #[test]
+    fn longest_run_seconds_bridges_single_gap() {
+        // 期待値の根拠: F は1個(MAX_RUN_GAP_SAMPLES=1)までなら橋渡しされ、
+        // 前後の T がひと続きの区間として合算される(2+2=4サンプル分)
+        let hits = [true, true, false, true, true];
+        assert_eq!(longest_run_seconds(&hits, 3.0), 4.0 / 3.0);
+    }
+
+    #[test]
+    fn longest_run_seconds_splits_on_large_gap() {
+        // 期待値の根拠: F が2個連続(ギャップ超過)で区間が分断される。
+        // 前半2サンプル・後半3サンプルのうち長い方(3)が採用される
+        let hits = [true, true, false, false, true, true, true];
+        assert_eq!(longest_run_seconds(&hits, 3.0), 3.0 / 3.0);
+    }
+
+    #[test]
+    fn longest_run_seconds_trailing_run_counts() {
+        // 期待値の根拠: 末尾が途切れずに終わっても最後の run が確定処理される
+        let hits = [false, false, true, true, true];
+        assert_eq!(longest_run_seconds(&hits, 3.0), 1.0);
     }
 }

@@ -38,6 +38,7 @@ iPhone で撮った `.MOV` も AirDrop でこのディレクトリに入れれ�
   > 動画から姿勢/手を抽出
     撮影セッション(録画フォルダを監視して自動取り込み)
     撮影進捗を確認
+    撮影テイクを build-dict 用にエクスポート
     タグ→ポーズ辞書を構築(build-dict)
     動画からタグを認識(推論)
     [dev] ONNXモデルの入出力を調査(inspect)
@@ -324,6 +325,40 @@ OBS / QuickTime の保存先を監視し、新しい録画を**自動で命名�
 
 > 撮影は既製ツール(OBS/QuickTime)のまま。session はそれを置き換えず横で取り込みを担う
 > (ツール内録画は Phase 0b 以降。プレビュー確保のため現状は既製ツールを使う方針)。
+
+### build-dict 用にエクスポート(メニュー:「撮影テイクを build-dict 用にエクスポート」)
+
+raw_jsl の `<word_id>_<romaji>/<rep>.mp4`(ネスト構成)から、build-dict が読める
+`<romaji>-<rep>.mp4`(フラット構成)へテイクを並べ直す。stage 1 では手作業だった工程の自動化。
+
+メニューで選ぶと以下を質問されます:
+
+```
+撮影データのルート            [../transformer_burn/data/raw_jsl]
+対象 stage
+  > すべての stage
+    stage 1
+    stage 2
+エクスポート先ディレクトリ    [videos/dict_export_stage1 など(選んだ stage で変わる)]
+続けて build-dict(ポーズ辞書構築)を実行しますか
+  > はい
+    いいえ(エクスポートのみ)
+```
+
+動作:
+
+- index.tsv を実ファイルと同期した内容から、**`quality_flag` が `ng` で始まるテイクを除外**して
+  エクスポートする(進捗表示の有効テイクと同じ規則。`ok`・空欄・手書きフラグは対象)
+- ファイルはハードリンクで置く(容量を消費しない。別ボリューム等で失敗したらコピー)。
+  **raw_jsl 側には一切書き込まない**
+- **テイク番号は raw_jsl の番号をそのまま使う**(NG 除外で欠番になっても付け替えない。
+  例: konnichiwa の ok テイクが 05〜07 なら `konnichiwa-05.mp4`〜`konnichiwa-07.mp4`)。
+  番号を保持することで raw_jsl のどのテイクかを後から追跡できる
+- 語ごとの本数と目標未達をサマリ表示する
+- 「はい」を選ぶとそのまま build-dict に進み、出力 JSON(既定
+  `../transformer_burn/data/pose_dict_stage<N>.json`)とフレーム数を聞いて辞書を構築する
+- 実データでの回帰テスト: `cargo test export_stage1_smoke -- --ignored`
+  (stage 1 のエクスポート結果が既存 pose_dict_stage1.json の30タグ名と一致することを確認)
 
 ## 開発用メニュー(inspect / test-infer)
 

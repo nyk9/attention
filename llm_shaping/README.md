@@ -39,6 +39,5 @@ CLAUDE.md のロードマップどおり **①プロンプト → ②LoRA → �
 
 ## 語彙表の同期ルール
 
-プロンプト内の語彙表は `transformer_burn/data/raw_jsl/words.tsv` から生成している。
+プロンプト内の語彙表は `transformer_burn/data/raw_jsl/words.tsv` から生成している(50語)。
 words.tsv や認識モデルのタグ語彙(tag_vocab.json)を変えたら語彙表も更新すること。
-word_id 022 は words.tsv 上で未決定(`???`)のため含めていない。

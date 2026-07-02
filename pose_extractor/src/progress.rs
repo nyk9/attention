@@ -10,7 +10,7 @@
 
 use anyhow::{Context, Result};
 use ort::session::Session;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -846,6 +846,107 @@ fn ingest(
     Ok(())
 }
 
+// ===== build-dict 用エクスポート =====
+
+/// エクスポート対象かどうか。NG フラグ(ng で始まる)は take_counts と同じ規則で除外。
+/// stage は words.tsv から引いた値(無い word_id は None)。stage_filter 指定時、
+/// words.tsv に無い語は stage 不明なので除外する
+// [TEST向き] 純粋関数。ng 判定と stage フィルタの組み合わせ
+fn should_export(quality_flag: &str, stage: Option<u32>, stage_filter: Option<u32>) -> bool {
+    if quality_flag.starts_with("ng") {
+        return false;
+    }
+    match (stage_filter, stage) {
+        (None, _) => true,
+        (Some(f), Some(s)) => f == s,
+        (Some(_), None) => false,
+    }
+}
+
+/// エクスポート先のファイル名: `<romaji>-<rep 2桁>.<ext>`。stem が build-dict のタグ名になり、
+/// transformer_burn 側の label_from_stem が末尾 `-NN` を剥がして romaji ラベルに戻す。
+/// テイク番号は raw_jsl の番号をそのまま使う(NG 除外で欠番になっても付け替えない。
+/// stage 1 の手動整理と同じ流儀: konnichiwa-05..07 など)
+// [TEST向き] 純粋関数。2桁ゼロ埋め・拡張子引き継ぎ・romaji 中の '-' 許容
+fn export_file_name(romaji: &str, rep_idx: u32, ext: &str) -> String {
+    format!("{}-{:02}.{}", romaji, rep_idx, ext)
+}
+
+/// words.tsv に現れる stage の一覧(昇順・重複なし)。エクスポートウィザードの選択肢用
+pub fn list_stages(data_dir: &Path) -> Result<Vec<u32>> {
+    let words = load_words(data_dir)?;
+    let set: BTreeSet<u32> = words.iter().map(|w| w.stage).collect();
+    Ok(set.into_iter().collect())
+}
+
+/// 撮影テイクを build-dict が読めるフラット構成(<romaji>-<rep>.mp4)へエクスポートする。
+/// index.tsv を実ファイルと同期した内容から NG フラグ以外のテイクを選び、out_dir へ
+/// ハードリンク(別ボリューム等で失敗したらコピー)する。data_dir 側には書き込まない。
+/// 戻り値はエクスポートした本数
+pub fn run_export(data_dir: &Path, out_dir: &Path, stage_filter: Option<u32>) -> Result<usize> {
+    let words = load_words(data_dir)?;
+    let (scanned, mut warnings) = scan_takes(data_dir)?;
+    let existing = load_index(&data_dir.join(INDEX_FILE))?;
+    let rows = merge_index(&scanned, &existing, &words, &mut warnings);
+    for w in &warnings {
+        eprintln!("警告: {}", w);
+    }
+
+    let word_map: HashMap<&str, &WordSpec> =
+        words.iter().map(|w| (w.word_id.as_str(), w)).collect();
+
+    std::fs::create_dir_all(out_dir)
+        .with_context(|| format!("create dir {}", out_dir.display()))?;
+
+    let mut exported = 0usize;
+    let mut skipped_ng = 0usize;
+    let mut per_word: HashMap<String, u32> = HashMap::new();
+    for r in &rows {
+        let stage = word_map.get(r.word_id.as_str()).map(|w| w.stage);
+        if !should_export(&r.quality_flag, stage, stage_filter) {
+            // サマリ用: 対象 stage 内の NG だけ数える(フィルタ外の語はそもそも対象外)
+            let in_scope = stage_filter.is_none() || stage == stage_filter;
+            if r.quality_flag.starts_with("ng") && in_scope {
+                skipped_ng += 1;
+            }
+            continue;
+        }
+        let src = data_dir.join(&r.file_path);
+        let ext = src
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_lowercase())
+            .unwrap_or_else(|| "mp4".into());
+        let dest = out_dir.join(export_file_name(&r.word_romaji, r.rep_idx, &ext));
+        if dest.exists() {
+            std::fs::remove_file(&dest)
+                .with_context(|| format!("remove {}", dest.display()))?;
+        }
+        if std::fs::hard_link(&src, &dest).is_err() {
+            std::fs::copy(&src, &dest)
+                .with_context(|| format!("copy {} -> {}", src.display(), dest.display()))?;
+        }
+        *per_word.entry(r.word_id.clone()).or_default() += 1;
+        exported += 1;
+    }
+
+    println!("\n=== エクスポート結果: {} ===", out_dir.display());
+    for w in &words {
+        if stage_filter.is_some() && stage_filter != Some(w.stage) {
+            continue;
+        }
+        let n = per_word.get(&w.word_id).copied().unwrap_or(0);
+        let mark = if n >= w.target_takes {
+            String::new()
+        } else {
+            format!(" ← 目標 {} に未達", w.target_takes)
+        };
+        println!("  {} {:<14} {} 本{}", w.word_id, w.romaji, n, mark);
+    }
+    println!("合計 {} 本(NG フラグで除外 {} 本)", exported, skipped_ng);
+    Ok(exported)
+}
+
 // ===== 手検出チェック(段階4) =====
 
 /// サンプル列(検出できた/できなかった)のうち、連続して検出できた最長区間を秒で返す。
@@ -1055,5 +1156,115 @@ mod tests {
         // 期待値の根拠: 末尾が途切れずに終わっても最後の run が確定処理される
         let hits = [false, false, true, true, true];
         assert_eq!(longest_run_seconds(&hits, 3.0), 1.0);
+    }
+
+    // [TEST向き] エクスポート名の生成。2桁ゼロ埋め・拡張子引き継ぎ
+    #[test]
+    fn export_file_name_cases() {
+        // 期待値の根拠: stage 1 の手動整理と同じ 2桁ゼロ埋め(konnichiwa-05 など)
+        assert_eq!(export_file_name("anata", 1, "mp4"), "anata-01.mp4");
+        assert_eq!(export_file_name("konnichiwa", 5, "mp4"), "konnichiwa-05.mp4");
+        // romaji 中の '-' は許容(label_from_stem は末尾の数字サフィックスだけ剥がす)
+        assert_eq!(export_file_name("are-sore", 12, "mov"), "are-sore-12.mov");
+    }
+
+    // [TEST向き] エクスポート対象判定。ng 除外と stage フィルタの組み合わせ
+    #[test]
+    fn should_export_cases() {
+        // ng で始まるフラグは常に除外(take_counts と同じ規則)
+        assert!(!should_export("ng_hands", Some(1), None));
+        assert!(!should_export("ng_hands", Some(1), Some(1)));
+        // ok / 空 / 手書きの任意フラグは有効
+        assert!(should_export("ok", Some(1), None));
+        assert!(should_export("", Some(1), None));
+        // stage フィルタ
+        assert!(should_export("ok", Some(2), Some(2)));
+        assert!(!should_export("ok", Some(1), Some(2)));
+        // words.tsv に無い語(stage 不明)はフィルタ指定時は除外、無指定なら通す
+        assert!(!should_export("ok", None, Some(1)));
+        assert!(should_export("ok", None, None));
+    }
+
+    #[test]
+    fn run_export_flattens_ok_takes() {
+        // 一時 data_dir に words.tsv + テイク + index.tsv(1本を ng_hands に)を作り、
+        // NG 除外・stage フィルタ・命名を通しで確認する。動画の中身は使わない
+        // (index に無いファイルへの ffprobe は失敗して警告になるが、行は作られる)
+        let dir = std::env::temp_dir().join(format!("export_test_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let data_dir = dir.join("raw");
+        std::fs::create_dir_all(data_dir.join("001_aaa")).unwrap();
+        std::fs::create_dir_all(data_dir.join("011_bbb")).unwrap();
+        std::fs::write(
+            data_dir.join(WORDS_FILE),
+            "word_id\tromaji\tlabel_ja\tstage\ttarget_takes\n001\taaa\tあ\t1\t2\n011\tbbb\tい\t2\t1\n",
+        )
+        .unwrap();
+        std::fs::write(data_dir.join("001_aaa/01.mp4"), b"x").unwrap();
+        std::fs::write(data_dir.join("001_aaa/02.mp4"), b"x").unwrap();
+        std::fs::write(data_dir.join("011_bbb/01.mp4"), b"x").unwrap();
+        // 02 を ng_hands にしておく(merge_index が既存行の quality_flag を保持する)
+        std::fs::write(
+            data_dir.join(INDEX_FILE),
+            format!(
+                "{}\n001_aaa/02.mp4\t001\taaa\tあ\t2\t\t0\tng_hands\t\n",
+                INDEX_HEADER
+            ),
+        )
+        .unwrap();
+
+        // stage フィルタなし: aaa-01 と bbb-01 の2本(02 は NG 除外)
+        let out_dir = dir.join("flat");
+        let n = run_export(&data_dir, &out_dir, None).unwrap();
+        assert_eq!(n, 2);
+        assert!(out_dir.join("aaa-01.mp4").is_file());
+        assert!(!out_dir.join("aaa-02.mp4").exists());
+        assert!(out_dir.join("bbb-01.mp4").is_file());
+
+        // stage 1 のみ: aaa-01 だけ
+        let out_dir_s1 = dir.join("flat_s1");
+        let n = run_export(&data_dir, &out_dir_s1, Some(1)).unwrap();
+        assert_eq!(n, 1);
+        assert!(out_dir_s1.join("aaa-01.mp4").is_file());
+        assert!(!out_dir_s1.join("bbb-01.mp4").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 実データスモーク: stage 1 の raw_jsl をエクスポートすると、手動整理で作った
+    /// pose_dict_stage1.json の30タグ名と完全一致するはず(ng 除外+元テイク番号保持の検証)。
+    /// 実データ(git 管理外)前提のため #[ignore]。
+    /// 実行: cargo test export_stage1_smoke -- --ignored
+    #[test]
+    #[ignore]
+    fn export_stage1_smoke() {
+        let data_dir = Path::new("../transformer_burn/data/raw_jsl");
+        let dict_path = Path::new("../transformer_burn/data/pose_dict_stage1.json");
+        assert!(
+            data_dir.is_dir() && dict_path.is_file(),
+            "実データ(raw_jsl と pose_dict_stage1.json)が必要です"
+        );
+
+        let out_dir = std::env::temp_dir().join(format!("export_smoke_{}", std::process::id()));
+        std::fs::remove_dir_all(&out_dir).ok();
+        let n = run_export(data_dir, &out_dir, Some(1)).unwrap();
+        assert_eq!(n, 30);
+
+        let exported: BTreeSet<String> = std::fs::read_dir(&out_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                e.path()
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+            })
+            .collect();
+
+        let dict: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dict_path).unwrap()).unwrap();
+        let expected: BTreeSet<String> = dict["tags"].as_object().unwrap().keys().cloned().collect();
+
+        assert_eq!(exported, expected);
+        std::fs::remove_dir_all(&out_dir).ok();
     }
 }

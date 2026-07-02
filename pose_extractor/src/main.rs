@@ -197,6 +197,7 @@ fn main() -> Result<()> {
         "動画から姿勢/手を抽出",
         "撮影セッション(録画フォルダを監視して自動取り込み)",
         "撮影進捗を確認",
+        "撮影テイクを build-dict 用にエクスポート",
         "タグ→ポーズ辞書を構築(build-dict)",
         "動画からタグを認識(推論)",
         "[dev] ONNXモデルの入出力を調査(inspect)",
@@ -214,10 +215,11 @@ fn main() -> Result<()> {
         0 => run_extraction_wizard(),
         1 => session_wizard(&theme),
         2 => progress_wizard(&theme),
-        3 => build_dict_wizard(&theme),
-        4 => recognize_wizard(&theme),
-        5 => inspect_wizard(&theme),
-        6 => test_infer_wizard(&theme),
+        3 => export_wizard(&theme),
+        4 => build_dict_wizard(&theme),
+        5 => recognize_wizard(&theme),
+        6 => inspect_wizard(&theme),
+        7 => test_infer_wizard(&theme),
         _ => {
             println!("終了します");
             Ok(())
@@ -294,6 +296,65 @@ fn session_wizard(theme: &ColorfulTheme) -> Result<()> {
         Path::new(watch.trim()),
         hand == 1,
     )
+}
+
+/// エクスポートウィザード。raw_jsl の <word_id>_<romaji>/<rep>.mp4 から NG フラグ以外を
+/// <romaji>-<rep>.mp4 のフラット構成に並べ直す(stage 1 では手作業だった工程)。
+/// 続けて build-dict まで実行できる
+fn export_wizard(theme: &ColorfulTheme) -> Result<()> {
+    let data_dir: String = Input::with_theme(theme)
+        .with_prompt("撮影データのルート")
+        .default(RAW_JSL_DIR.into())
+        .interact_text()?;
+    let data_dir = PathBuf::from(data_dir.trim());
+
+    let stages = progress::list_stages(&data_dir)?;
+    let mut items: Vec<String> = vec!["すべての stage".into()];
+    items.extend(stages.iter().map(|s| format!("stage {}", s)));
+    let idx = Select::with_theme(theme)
+        .with_prompt("対象 stage")
+        .items(&items)
+        .default(0)
+        .interact()?;
+    let stage_filter = if idx == 0 { None } else { Some(stages[idx - 1]) };
+
+    let default_out = match stage_filter {
+        Some(s) => format!("{}/dict_export_stage{}", VIDEO_DIR, s),
+        None => format!("{}/dict_export_all", VIDEO_DIR),
+    };
+    let out_dir: String = Input::with_theme(theme)
+        .with_prompt("エクスポート先ディレクトリ")
+        .default(default_out)
+        .interact_text()?;
+    let out_dir = PathBuf::from(out_dir.trim());
+
+    let exported = progress::run_export(&data_dir, &out_dir, stage_filter)?;
+    if exported == 0 {
+        println!("エクスポートできるテイクがありませんでした");
+        return Ok(());
+    }
+
+    let go = Select::with_theme(theme)
+        .with_prompt("続けて build-dict(ポーズ辞書構築)を実行しますか")
+        .items(&["はい", "いいえ(エクスポートのみ)"])
+        .default(0)
+        .interact()?;
+    if go == 0 {
+        let default_json = match stage_filter {
+            Some(s) => format!("../transformer_burn/data/pose_dict_stage{}.json", s),
+            None => "../transformer_burn/data/pose_dict_all.json".into(),
+        };
+        let output: String = Input::with_theme(theme)
+            .with_prompt("出力 JSON パス")
+            .default(default_json)
+            .interact_text()?;
+        let frames: usize = Input::with_theme(theme)
+            .with_prompt("ダウンサンプルするフレーム数(transformer_burn の SEQ_LEN と揃える)")
+            .default(10)
+            .interact_text()?;
+        build_dict(&out_dir, Path::new(output.trim()), frames)?;
+    }
+    Ok(())
 }
 
 /// build-dict ウィザード

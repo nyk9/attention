@@ -72,6 +72,89 @@ pub fn take_from_stem(stem: &str) -> Option<u32> {
     suffix.parse::<u32>().ok()
 }
 
+/// 手が「使われている」とみなす最小カバレッジ。
+/// build-dict は各テイクから均等 T フレーム(既定10)をサンプルするので、0.2 ≒ 2/10 フレーム
+const USED_HAND_THRESHOLD: f32 = 0.2;
+
+/// テイクの左右手カバレッジから「使われた手」を分類する
+// [TEST向き] 純粋な分類。境界(閾値ちょうど・両手・両手なし)
+fn used_hands(left_cov: f32, right_cov: f32) -> &'static str {
+    match (
+        left_cov >= USED_HAND_THRESHOLD,
+        right_cov >= USED_HAND_THRESHOLD,
+    ) {
+        (true, true) => "LR",
+        (true, false) => "L",
+        (false, true) => "R",
+        (false, false) => "-",
+    }
+}
+
+/// pose dict をラベル別に集計し、各テイクの左右手カバレッジ表を表示。
+/// テイク間で「使われた手」が食い違うラベル(anata で起きた左右手ゆれ)を警告し、
+/// 食い違ったラベル名の一覧を返す(テスト用)。学習は行わない診断専用
+pub fn inspect_dict(path: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let (entries, frames, feature_dim) = read_raw_entries(path)?;
+    println!(
+        "pose dict: {} (frames={} feature_dim={})",
+        path.display(),
+        frames,
+        feature_dim
+    );
+
+    let mut by_label: BTreeMap<String, Vec<RawEntry>> = BTreeMap::new();
+    for e in entries {
+        by_label.entry(e.label.clone()).or_default().push(e);
+    }
+
+    let label_count = by_label.len();
+    let mut flagged = Vec::new();
+    for (label, mut group) in by_label {
+        // テイク番号昇順(番号なしは後ろに stem 順)。holdout 分割と同じ「後ろが未見」感覚で読めるように
+        group.sort_by(|a, b| match (a.take, b.take) {
+            (Some(x), Some(y)) => x.cmp(&y),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.stem.cmp(&b.stem),
+        });
+
+        println!("\nラベル '{}' ({}テイク):", label, group.len());
+        let mut kinds = std::collections::BTreeSet::new();
+        for e in &group {
+            let hands = used_hands(e.left_cov, e.right_cov);
+            kinds.insert(hands);
+            println!(
+                "  {:<24} L={:>3.0}% R={:>3.0}%  [{}]",
+                e.stem,
+                e.left_cov * 100.0,
+                e.right_cov * 100.0,
+                hands
+            );
+        }
+        if kinds.len() > 1 {
+            let kinds_str: Vec<&str> = kinds.into_iter().collect();
+            println!(
+                "  警告: テイク間で使われた手が食い違っています ({})。126次元特徴の左右枠が\n        テイクごとに変わるため、未見テイクの誤認識(anata 問題)の原因になります",
+                kinds_str.join(" / ")
+            );
+            flagged.push(label);
+        }
+    }
+
+    println!("\n--- 集計 ---");
+    if flagged.is_empty() {
+        println!("{}ラベル中、使われた手の食い違い: なし", label_count);
+    } else {
+        println!(
+            "{}ラベル中 {}ラベルで使われた手が食い違い: {}",
+            label_count,
+            flagged.len(),
+            flagged.join(", ")
+        );
+    }
+    Ok(flagged)
+}
+
 /// 検証済みの 1 エントリ(分割前の中間表現)
 struct RawEntry {
     stem: String,
@@ -341,6 +424,62 @@ mod tests {
         assert_eq!(take_from_stem("挨拶"), None);
         assert_eq!(take_from_stem("hello-world"), None);
         assert_eq!(take_from_stem("tag-"), None);
+    }
+
+    // [TEST向き] 使われた手の分類。境界(閾値ちょうど 0.2 は「使用」側)
+    #[test]
+    fn used_hands_cases() {
+        // 期待値の根拠: USED_HAND_THRESHOLD = 0.2、以上で「使用」
+        assert_eq!(used_hands(0.5, 0.5), "LR");
+        assert_eq!(used_hands(0.2, 0.19), "L"); // 閾値ちょうどは使用扱い
+        assert_eq!(used_hands(0.0, 0.35), "R");
+        assert_eq!(used_hands(0.1, 0.1), "-");
+    }
+
+    #[test]
+    fn inspect_dict_flags_hand_mismatch() {
+        use std::io::Write;
+        let row = vec![0.0f32; POSE_FEATURE_DIM];
+        // "anata": take1-2 は右手のみ、take3 は左手のみ → 食い違いフラグ
+        // "konnichiwa": 全テイク両手 → フラグなし
+        let entry = |l: f32, r: f32| {
+            serde_json::json!({
+                "sequence": [row.clone()],
+                "left_hand_coverage": l,
+                "right_hand_coverage": r,
+                "source": "x"
+            })
+        };
+        let dict = serde_json::json!({
+            "metadata": {
+                "frames": 1,
+                "feature_dim": POSE_FEATURE_DIM,
+                "feature_layout": "",
+                "normalization": "",
+                "tag_count": 6
+            },
+            "tags": {
+                "anata-1": entry(0.0, 0.41),
+                "anata-2": entry(0.0, 0.35),
+                "anata-3": entry(0.36, 0.0),
+                "konnichiwa-1": entry(0.9, 0.9),
+                "konnichiwa-2": entry(0.8, 0.7),
+                "konnichiwa-3": entry(0.9, 0.8)
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("pose_inspect_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dict.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(dict.to_string().as_bytes())
+            .unwrap();
+
+        let flagged = inspect_dict(&path).unwrap();
+        assert_eq!(flagged, vec!["anata".to_string()]);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

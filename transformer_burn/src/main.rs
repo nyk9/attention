@@ -66,6 +66,10 @@ struct Args {
     #[arg(long)]
     eval_holdout: Option<PathBuf>,
 
+    /// 診断: pose dict の左右手カバレッジをラベル別に点検し、テイク間で使われた手が食い違う語を警告(学習なし)
+    #[arg(long)]
+    inspect_dict: Option<PathBuf>,
+
     /// held-out にするテイク数(ラベルごと、テイク番号の後ろから)。--eval-holdout 用
     #[arg(long, default_value_t = 1)]
     holdout_per_label: usize,
@@ -75,6 +79,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start_time = Instant::now();
 
     let args = Args::parse();
+
+    // 診断モード: モデルもバックエンドも使わない JSON 分析なのでここで完結させる
+    if let Some(dict_path) = &args.inspect_dict {
+        pose_data::inspect_dict(dict_path)?;
+        return Ok(());
+    }
 
     // 認識モデル(手ポーズ列→タグ)のモード。足場の Seq2Seq とはモデルも語彙も別物なので
     // ここで分岐して早期 return する

@@ -4,9 +4,8 @@
 下記「プロンプト本文」をシステムプロンプト(または会話の先頭)に置き、
 「入力形式」の形でスロット列を渡す。
 
-- 語彙表は words.tsv(`transformer_burn/data/raw_jsl/words.tsv`)から生成した。
+- 語彙表は words.tsv(`transformer_burn/data/raw_jsl/words.tsv`)から生成した(50語)。
   **認識モデルのタグ語彙(tag_vocab.json)を増やしたら語彙表も同期すること**
-- word_id 022 は words.tsv 上で未決定(`???`)のため語彙表に含めていない
 
 ---
 
@@ -43,6 +42,7 @@ wakaranai → わからない
 ok → OK
 ii → いい
 dame → ダメ
+tatoeba → 例えば
 taberu → 食べる
 nomu → 飲む
 iku → 行く

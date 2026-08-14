@@ -1009,10 +1009,8 @@ impl HandChecker {
 
         let mut left_hits = Vec::new();
         let mut right_hits = Vec::new();
-        crate::extract_frames(video, info.width, info.height, |idx, frame| {
-            if idx % step != 0 {
-                return Ok(());
-            }
+        // 非サンプルフレームはフィルタで弾く(バッファのクローンごとスキップされる)
+        crate::extract_frames_filtered(video, info.width, info.height, |idx| idx % step == 0, |_idx, frame| {
             let palms = crate::run_palm_detection(palm, &frame, anchors)?;
             let mut l = false;
             let mut r = false;

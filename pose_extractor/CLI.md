@@ -207,21 +207,29 @@ hand landmark: 170 frames with hands, 335 hands total
     "feature_dim": 126,
     "feature_layout": "left_hand[21*xyz] then right_hand[21*xyz]; missing hand = zeros",
     "normalization": "x/=width, y/=height, z/=width (z is relative depth)",
+    "coverage_basis": "selected frames only (the frames that became `sequence`)",
     "tag_count": 2
   },
   "tags": {
     "ありがとう": {
       "sequence": [[...126 floats...], ...10 frames...],
-      "left_hand_coverage": 0.62,
-      "right_hand_coverage": 0.61,
+      "left_hand_coverage": 0.6,
+      "right_hand_coverage": 0.6,
       "source": "ありがとう.mp4"
     }
   }
 }
 ```
 
-- **coverage**: そのタグで左右の手が検出できたフレームの割合。低い(< 0.3 等)なら
-  動画の撮り方(手が画角外/小さすぎ)を見直す目安。
+- **coverage**: **選択フレーム(= sequence になったフレーム)のうち**左右の手が検出できた割合。
+  低い(< 0.3 等)なら動画の撮り方(手が画角外/小さすぎ)を見直す目安。
+- **coverage の算出基準は 2026-07-15 に変更**: 旧版は動画の全フレームで算出していたが、
+  現在は選択フレームのみ(粒度は frames=10 なら 10% 刻み)。学習特徴になるフレームそのものの
+  手カバレッジなので診断としてはより的確だが、**旧 dict の数値と直接比較はできない**
+  (どちらの基準かは metadata の `coverage_basis` の有無で判別可)。
+- **処理時間**: 選択フレームだけに推論をかけるため、全フレーム推論だった旧版より速い
+  (実測で1本あたり約3倍。残りはデコードとパイプ転送のコスト)。sequence は
+  旧版と完全一致する(等価性スモーク `selected_frames_equivalence_smoke` で回帰確認可)。
 
 ## 動画からタグを認識(メニュー:「動画からタグを認識(推論)」)
 

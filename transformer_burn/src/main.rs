@@ -73,6 +73,11 @@ struct Args {
     /// held-out にするテイク数(ラベルごと、テイク番号の後ろから)。--eval-holdout 用
     #[arg(long, default_value_t = 1)]
     holdout_per_label: usize,
+
+    /// ミラー拡張: 学習データに左右反転コピーを追加する(--train-pose / --eval-holdout の train 側のみ。
+    /// held-out の未見テイクには適用しない)
+    #[arg(long)]
+    mirror_augment: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -199,13 +204,26 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             split.test.len()
         );
 
+        // ミラー拡張は train 側のみに適用する。held-out(未見テイク)は実撮影データの
+        // 分布のまま評価しないと「解けたことにする」測定になってしまうため対象外
+        let mut train_data = split.train;
+        if args.mirror_augment {
+            let before = train_data.len();
+            train_data = train_data.with_mirror_augmentation();
+            println!(
+                "ミラー拡張適用: 学習サンプル {} 件 → {} 件",
+                before,
+                train_data.len()
+            );
+        }
+
         // 語彙は学習データ(train)から構築。held-out のラベルは train の部分集合なので必ず含まれる
-        let vocab = split.train.build_vocabulary();
+        let vocab = train_data.build_vocabulary();
         let model =
             recognition::RecognitionModel::<TrainingBackend>::new(vocab.vocab_size(), &device);
         let (model, loss_history) = recognition_training::train_recognition(
             model,
-            &split.train,
+            &train_data,
             &vocab,
             &device,
             args.epochs,
@@ -235,7 +253,12 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             return Err("--train-pose と --load の併用(継続訓練)は未対応です".into());
         }
 
-        let data = pose_data::PoseTrainingData::load(dict_path)?;
+        let mut data = pose_data::PoseTrainingData::load(dict_path)?;
+        if args.mirror_augment {
+            let before = data.len();
+            data = data.with_mirror_augmentation();
+            println!("ミラー拡張適用: {} 件 → {} 件", before, data.len());
+        }
         let vocab = data.build_vocabulary();
         println!(
             "サンプル数: {} / タグ数: {} ({:?})",

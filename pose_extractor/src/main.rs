@@ -174,6 +174,8 @@ struct PoseDictMeta {
     feature_layout: String,
     /// 座標正規化の説明
     normalization: String,
+    /// coverage の算出基準の説明(旧版は全フレーム基準、現在は選択フレーム基準)
+    coverage_basis: String,
     /// 辞書に含めたタグ数
     tag_count: usize,
 }
@@ -182,9 +184,9 @@ struct PoseDictMeta {
 struct TagEntry {
     /// [T フレーム][feature_dim] の正規化済みハンドランドマーク列
     sequence: Vec<Vec<f32>>,
-    /// 左手が検出されたフレームの割合 [0,1]
+    /// 選択フレーム(=sequence になったフレーム)のうち左手が検出された割合 [0,1]
     left_hand_coverage: f32,
-    /// 右手が検出されたフレームの割合 [0,1]
+    /// 選択フレーム(=sequence になったフレーム)のうち右手が検出された割合 [0,1]
     right_hand_coverage: f32,
     /// 抽出元の動画ファイル名
     source: String,
@@ -855,6 +857,7 @@ fn build_dict(input_dir: &Path, output: &Path, frames: usize) -> Result<()> {
             feature_layout: "left_hand[21*xyz] then right_hand[21*xyz]; missing hand = zeros"
                 .into(),
             normalization: "x/=width, y/=height, z/=width (z is relative depth)".into(),
+            coverage_basis: "selected frames only (the frames that became `sequence`)".into(),
             tag_count: tags.len(),
         },
         tags,
@@ -889,39 +892,94 @@ fn extract_tag_features(
     palm_anchors: &[[f32; 2]],
     target: usize,
 ) -> Result<TagEntry> {
+    extract_tag_features_impl(video, palm_session, hand_session, palm_anchors, target, false)
+}
+
+/// `force_full_scan` は等価性テスト用: nb_frames が取れても全フレーム走査(従来経路)を強制する。
+fn extract_tag_features_impl(
+    video: &PathBuf,
+    palm_session: &mut Session,
+    hand_session: &mut Session,
+    palm_anchors: &[[f32; 2]],
+    target: usize,
+    force_full_scan: bool,
+) -> Result<TagEntry> {
+    if target == 0 {
+        anyhow::bail!("target frames must be >= 1");
+    }
     let info = probe_video(video)?;
     let width = info.width as f32;
     let height = info.height as f32;
 
-    // 全フレームの (特徴量, 左手検出, 右手検出) を集める
-    let mut per_frame: Vec<([f32; DICT_FEATURE_DIM], bool, bool)> = Vec::new();
-    extract_frames(video, info.width, info.height, |_idx, frame| {
-        let palms = run_palm_detection(palm_session, &frame, palm_anchors)?;
-        let mut hands: Vec<Hand> = Vec::new();
-        for palm in &palms {
-            if let Some(h) = run_hand_landmark(hand_session, &frame, palm)? {
-                hands.push(h);
+    // 選択された target 個分の (特徴量, 左手検出, 右手検出)。
+    // 間引きインデックスは総フレーム数だけで決まるので、nb_frames が事前に分かれば
+    // 選択フレームにだけ推論をかけられる(sequence は全フレーム推論→間引きと同一)。
+    let selected: Vec<([f32; DICT_FEATURE_DIM], bool, bool)> =
+        if info.frame_count > 0 && !force_full_scan {
+            // 高速経路: 選択フレームのみ推論(推論回数 全フレーム → 高々 target)
+            let indices = downsample_indices(info.frame_count as usize, target);
+            let wanted: std::collections::BTreeSet<usize> = indices.iter().copied().collect();
+            let mut got: BTreeMap<usize, ([f32; DICT_FEATURE_DIM], bool, bool)> = BTreeMap::new();
+            extract_frames_filtered(
+                video,
+                info.width,
+                info.height,
+                |idx| wanted.contains(&idx),
+                |idx, frame| {
+                    got.insert(
+                        idx,
+                        infer_frame_feature(
+                            &frame,
+                            palm_session,
+                            hand_session,
+                            palm_anchors,
+                            width,
+                            height,
+                        )?,
+                    );
+                    Ok(())
+                },
+            )?;
+            let (selected, missing) = assemble_selected(&indices, &got)
+                .ok_or_else(|| anyhow::anyhow!("no frames extracted from {}", video.display()))?;
+            if missing > 0 {
+                eprintln!(
+                    "  warning: 選択フレーム {} 個がデコードできず直前フレームの特徴で埋めました\
+                     (nb_frames={} が実フレーム数より多い可能性)",
+                    missing, info.frame_count
+                );
             }
-        }
-        per_frame.push(frame_hand_feature(&hands, width, height));
-        Ok(())
-    })?;
+            selected
+        } else {
+            // フォールバック: nb_frames 不明なら従来どおり全フレーム推論してから間引く
+            if !force_full_scan {
+                eprintln!("  note: nb_frames が取得できないため全フレーム推論にフォールバック");
+            }
+            let mut per_frame: Vec<([f32; DICT_FEATURE_DIM], bool, bool)> = Vec::new();
+            extract_frames(video, info.width, info.height, |_idx, frame| {
+                per_frame.push(infer_frame_feature(
+                    &frame,
+                    palm_session,
+                    hand_session,
+                    palm_anchors,
+                    width,
+                    height,
+                )?);
+                Ok(())
+            })?;
+            if per_frame.is_empty() {
+                anyhow::bail!("no frames extracted from {}", video.display());
+            }
+            let indices = downsample_indices(per_frame.len(), target);
+            indices.iter().map(|&i| per_frame[i]).collect()
+        };
 
-    if per_frame.is_empty() {
-        anyhow::bail!("no frames extracted from {}", video.display());
-    }
+    // coverage は選択フレーム(=学習特徴になるフレーム)のみで算出(2026-07-15 変更)。
+    // 全フレーム基準の旧値とは直接比較できない
+    let left_cov = selected.iter().filter(|(_, l, _)| *l).count() as f32 / selected.len() as f32;
+    let right_cov = selected.iter().filter(|(_, _, r)| *r).count() as f32 / selected.len() as f32;
 
-    let left_cov =
-        per_frame.iter().filter(|(_, l, _)| *l).count() as f32 / per_frame.len() as f32;
-    let right_cov =
-        per_frame.iter().filter(|(_, _, r)| *r).count() as f32 / per_frame.len() as f32;
-
-    // ダウンサンプル: 均等間隔で target 個のインデックスを取る
-    let indices = downsample_indices(per_frame.len(), target);
-    let sequence: Vec<Vec<f32>> = indices
-        .iter()
-        .map(|&i| per_frame[i].0.to_vec())
-        .collect();
+    let sequence: Vec<Vec<f32>> = selected.iter().map(|(f, _, _)| f.to_vec()).collect();
 
     Ok(TagEntry {
         sequence,
@@ -932,6 +990,56 @@ fn extract_tag_features(
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default(),
     })
+}
+
+/// 1 フレームに Palm 検出 → Hand ランドマークをかけ、126 次元特徴量を返す。
+fn infer_frame_feature(
+    frame: &Array3<u8>,
+    palm_session: &mut Session,
+    hand_session: &mut Session,
+    palm_anchors: &[[f32; 2]],
+    width: f32,
+    height: f32,
+) -> Result<([f32; DICT_FEATURE_DIM], bool, bool)> {
+    let palms = run_palm_detection(palm_session, frame, palm_anchors)?;
+    let mut hands: Vec<Hand> = Vec::new();
+    for palm in &palms {
+        if let Some(h) = run_hand_landmark(hand_session, frame, palm)? {
+            hands.push(h);
+        }
+    }
+    Ok(frame_hand_feature(&hands, width, height))
+}
+
+/// 間引きインデックス列に沿って、取得できたフレームの値を並べる。
+/// 取得できなかったインデックス(nb_frames の過大申告で実フレームが足りない場合)は
+/// 直前に取得できた値で埋める。返り値は (並べた値, 埋めた個数)。
+/// 先頭から取得できていない・インデックス列が空なら None。
+// [TEST向き] 純粋関数。末尾欠損の埋め・重複インデックス・全欠損の境界
+fn assemble_selected<T: Clone>(
+    indices: &[usize],
+    got: &BTreeMap<usize, T>,
+) -> Option<(Vec<T>, usize)> {
+    let mut out: Vec<T> = Vec::with_capacity(indices.len());
+    let mut missing = 0usize;
+    let mut last: Option<&T> = None;
+    for &i in indices {
+        match got.get(&i) {
+            Some(v) => {
+                last = Some(v);
+                out.push(v.clone());
+            }
+            None => {
+                missing += 1;
+                out.push(last?.clone());
+            }
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some((out, missing))
+    }
 }
 
 /// 検出されたハンドを左手スロット([0..63])と右手スロット([63..126])に割り当て、
@@ -2018,8 +2126,25 @@ fn parse_frame_rate(s: &str) -> Result<f64> {
 }
 
 // [評価/スモーク] ffmpeg外部依存。「1本デコードしてフレーム数が想定通り」程度のスモークまで
-fn extract_frames<F>(path: &PathBuf, width: u32, height: u32, mut callback: F) -> Result<()>
+fn extract_frames<F>(path: &PathBuf, width: u32, height: u32, callback: F) -> Result<()>
 where
+    F: FnMut(usize, Array3<u8>) -> Result<()>,
+{
+    extract_frames_filtered(path, width, height, |_| true, callback)
+}
+
+/// `keep(frame_idx)` が true のフレームだけ `callback` に渡す版。
+/// パイプはシークできないので全フレーム読み捨てるが、不要フレームは
+/// バッファのクローン(フルHDで約6MB/枚)と Array3 構築をスキップする。
+fn extract_frames_filtered<P, F>(
+    path: &PathBuf,
+    width: u32,
+    height: u32,
+    mut keep: P,
+    mut callback: F,
+) -> Result<()>
+where
+    P: FnMut(usize) -> bool,
     F: FnMut(usize, Array3<u8>) -> Result<()>,
 {
     let mut child = Command::new("ffmpeg")
@@ -2046,11 +2171,13 @@ where
     loop {
         match stdout.read_exact(&mut buf) {
             Ok(()) => {
-                let array = Array3::from_shape_vec(
-                    (height as usize, width as usize, 3),
-                    buf.clone(),
-                )?;
-                callback(frame_idx, array)?;
+                if keep(frame_idx) {
+                    let array = Array3::from_shape_vec(
+                        (height as usize, width as usize, 3),
+                        buf.clone(),
+                    )?;
+                    callback(frame_idx, array)?;
+                }
                 frame_idx += 1;
             }
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
@@ -2281,6 +2408,132 @@ mod tests {
         assert!((sample_bilinear(&frame, 0.5, 0.5)[0] - 25.0).abs() < 1e-4);
         // 範囲外は黒。
         assert_eq!(sample_bilinear(&frame, -5.0, -5.0), [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn assemble_selected_fills_missing_tail() {
+        let mut got: BTreeMap<usize, char> = BTreeMap::new();
+        got.insert(0, 'a');
+        got.insert(5, 'b');
+        // 欠損なし
+        let (v, missing) = assemble_selected(&[0, 5], &got).unwrap();
+        assert_eq!(v, vec!['a', 'b']);
+        assert_eq!(missing, 0);
+        // 末尾欠損(nb_frames 過大申告相当)は直前値で埋める
+        let (v, missing) = assemble_selected(&[0, 5, 9], &got).unwrap();
+        assert_eq!(v, vec!['a', 'b', 'b']);
+        assert_eq!(missing, 1);
+        // 重複インデックス(総フレーム数 < target 相当)はそのまま繰り返す
+        let (v, missing) = assemble_selected(&[0, 0, 5], &got).unwrap();
+        assert_eq!(v, vec!['a', 'a', 'b']);
+        assert_eq!(missing, 0);
+        // 1 フレームも取得できていなければ None
+        let empty: BTreeMap<usize, char> = BTreeMap::new();
+        assert!(assemble_selected(&[0, 5], &empty).is_none());
+        // インデックス列が空でも None
+        assert!(assemble_selected(&[], &got).is_none());
+    }
+
+    /// 高速経路(選択フレームのみ推論)と従来経路(全フレーム推論→間引き)で
+    /// sequence と coverage が完全一致することを確認する等価性スモーク。所要時間も表示する。
+    /// ffmpeg + Palm/Hand ONNX の実体に依存するため #[ignore]。
+    /// 手動実行: `cargo test selected_frames_equivalence_smoke -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn selected_frames_equivalence_smoke() {
+        let video = Path::new(VIDEO_DIR).join("0205-01.mp4");
+        for p in [video.as_path(), Path::new(PALM_MODEL), Path::new(HAND_MODEL)] {
+            if !p.exists() {
+                eprintln!("skip: fixture not found: {}", p.display());
+                return;
+            }
+        }
+        let video = video.to_path_buf();
+        let palm_anchors = load_palm_anchors();
+        let mut palm = Session::builder()
+            .unwrap()
+            .commit_from_file(PALM_MODEL)
+            .unwrap();
+        let mut hand = Session::builder()
+            .unwrap()
+            .commit_from_file(HAND_MODEL)
+            .unwrap();
+
+        let t = std::time::Instant::now();
+        let fast =
+            extract_tag_features_impl(&video, &mut palm, &mut hand, &palm_anchors, 10, false)
+                .unwrap();
+        let fast_elapsed = t.elapsed();
+        let t = std::time::Instant::now();
+        let full =
+            extract_tag_features_impl(&video, &mut palm, &mut hand, &palm_anchors, 10, true)
+                .unwrap();
+        let full_elapsed = t.elapsed();
+        eprintln!(
+            "fast(選択フレームのみ) = {:?} / full(全フレーム) = {:?}",
+            fast_elapsed, full_elapsed
+        );
+
+        assert_eq!(
+            fast.sequence, full.sequence,
+            "高速経路と従来経路で sequence が一致しない"
+        );
+        assert_eq!(fast.left_hand_coverage, full.left_hand_coverage);
+        assert_eq!(fast.right_hand_coverage, full.right_hand_coverage);
+    }
+
+    /// stage 1 実データで export → build-dict を回し、既存 pose_dict_stage1.json と
+    /// sequence が完全一致することを確認する回帰スモーク(coverage は算出基準が
+    /// 選択フレームのみに変わったため比較しない)。新 dict は temp に残しパスを表示する。
+    /// ffmpeg + Palm/Hand ONNX + raw_jsl 実データに依存するため #[ignore]。
+    /// 手動実行: `cargo test build_dict_stage1_sequence_regression --release -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn build_dict_stage1_sequence_regression() {
+        let data_dir = Path::new(RAW_JSL_DIR);
+        let old_dict_path = Path::new("../transformer_burn/data/pose_dict_stage1.json");
+        for p in [
+            data_dir,
+            old_dict_path,
+            Path::new(PALM_MODEL),
+            Path::new(HAND_MODEL),
+        ] {
+            if !p.exists() {
+                eprintln!("skip: fixture not found: {}", p.display());
+                return;
+            }
+        }
+
+        let out_dir =
+            std::env::temp_dir().join(format!("stage1_rebuild_{}", std::process::id()));
+        std::fs::remove_dir_all(&out_dir).ok();
+        let n = progress::run_export(data_dir, &out_dir, Some(1)).unwrap();
+        eprintln!("exported {} takes to {}", n, out_dir.display());
+
+        let new_dict_path = out_dir.join("pose_dict_stage1_new.json");
+        let t = std::time::Instant::now();
+        build_dict(&out_dir, &new_dict_path, 10).unwrap();
+        eprintln!("build-dict: {:?} ({} takes)", t.elapsed(), n);
+
+        let old: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(old_dict_path).unwrap()).unwrap();
+        let new: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&new_dict_path).unwrap()).unwrap();
+        let old_tags = old["tags"].as_object().unwrap();
+        let new_tags = new["tags"].as_object().unwrap();
+        assert_eq!(
+            old_tags.keys().collect::<Vec<_>>(),
+            new_tags.keys().collect::<Vec<_>>(),
+            "タグ集合が一致しない"
+        );
+        for (tag, old_entry) in old_tags {
+            assert_eq!(
+                old_entry["sequence"], new_tags[tag]["sequence"],
+                "sequence 不一致: {}",
+                tag
+            );
+        }
+        eprintln!("sequence 全 {} タグ一致。新 dict: {}", n, new_dict_path.display());
     }
 
     #[test]

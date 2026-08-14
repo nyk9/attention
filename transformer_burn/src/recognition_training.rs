@@ -1,24 +1,24 @@
 //! 認識モデル(手ポーズ列→タグ)の学習ループと評価
 
-use crate::checkpoint::TrainingBackend;
 use crate::config::{BATCH_SIZE, POSE_LEARNING_RATE};
 use crate::pose_data::PoseTrainingData;
 use crate::recognition::RecognitionModel;
 use crate::tag_vocabulary::TagVocabulary;
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
+use burn::tensor::backend::AutodiffBackend;
 use burn::tensor::Int;
 
 /// 認識モデルの学習を実行する。
 /// training.rs の train_jsl と同じ構成(Adam + Teacher Forcing)で、
 /// 入力がトークンID列ではなく手ポーズ列のテンソルになっている点だけが違う
-pub fn train_recognition(
-    model: RecognitionModel<TrainingBackend>,
+pub fn train_recognition<B: AutodiffBackend>(
+    model: RecognitionModel<B>,
     data: &PoseTrainingData,
     vocab: &TagVocabulary,
-    device: &<TrainingBackend as Backend>::Device,
+    device: &B::Device,
     epochs: usize,
-) -> (RecognitionModel<TrainingBackend>, Vec<f32>) {
+) -> (RecognitionModel<B>, Vec<f32>) {
     let mut optimizer = AdamConfig::new()
         .with_beta_1(0.9)
         .with_beta_2(0.999)
@@ -42,15 +42,14 @@ pub fn train_recognition(
 
         for (features, targets, batch_size) in data.batches(BATCH_SIZE, vocab) {
             // 手ポーズ列テンソル [batch, frames, feature_dim]
-            let pose = Tensor::<TrainingBackend, 1>::from_floats(features.as_slice(), device)
+            let pose = Tensor::<B, 1>::from_floats(features.as_slice(), device)
                 .reshape([batch_size, data.frames, data.feature_dim]);
 
             // ターゲット [batch, 3] = [SOS, タグID, EOS]
             let target_len = targets[0].len();
             let flat_targets: Vec<i32> = targets.iter().flatten().copied().collect();
-            let full_target =
-                Tensor::<TrainingBackend, 1, Int>::from_data(flat_targets.as_slice(), device)
-                    .reshape([batch_size, target_len]);
+            let full_target = Tensor::<B, 1, Int>::from_data(flat_targets.as_slice(), device)
+                .reshape([batch_size, target_len]);
 
             // Teacher Forcing: Decoder入力 [SOS, タグ] / 正解出力 [タグ, EOS]
             let tgt_input = full_target
@@ -73,7 +72,7 @@ pub fn train_recognition(
             let grads = GradientsParams::from_grads(loss.backward(), &model);
             model = optimizer.step(POSE_LEARNING_RATE, model, grads);
 
-            total_loss += loss.into_scalar();
+            total_loss += loss.into_scalar().elem::<f32>();
             batch_count += 1;
         }
 
@@ -89,16 +88,16 @@ pub fn train_recognition(
 }
 
 /// 位置ごとの CrossEntropy 損失の合計(training.rs の compute_loss の動的語彙版)
-fn compute_loss(
-    logits: &Tensor<TrainingBackend, 3>,
-    tgt_output: &Tensor<TrainingBackend, 2, Int>,
+fn compute_loss<B: AutodiffBackend>(
+    logits: &Tensor<B, 3>,
+    tgt_output: &Tensor<B, 2, Int>,
     batch_size: usize,
     target_len: usize,
     vocab_size: usize,
     pad_id: usize,
-    device: &<TrainingBackend as Backend>::Device,
-) -> Tensor<TrainingBackend, 1> {
-    let mut total_loss = Tensor::<TrainingBackend, 1>::from_data([0.0], device);
+    device: &B::Device,
+) -> Tensor<B, 1> {
+    let mut total_loss = Tensor::<B, 1>::from_data([0.0], device);
 
     for pos in 0..target_len - 1 {
         let logits_at_pos = logits
@@ -123,11 +122,11 @@ fn compute_loss(
 /// データ全件に対して top-1 / top-5 を測って表示する。
 /// 注意: 学習に使ったデータでの評価(in-sample)は「学習ループが正しく
 /// 回っているか」の確認にしかならない。本当の精度は未見のテイクで測ること
-pub fn evaluate_topk(
-    model: &RecognitionModel<TrainingBackend>,
+pub fn evaluate_topk<B: Backend>(
+    model: &RecognitionModel<B>,
     data: &PoseTrainingData,
     vocab: &TagVocabulary,
-    device: &<TrainingBackend as Backend>::Device,
+    device: &B::Device,
 ) {
     let k = 5;
     let mut top1_hits = 0;

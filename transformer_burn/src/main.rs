@@ -18,6 +18,7 @@ use metrics::save_metrics;
 use training::train_jsl;
 
 use burn::backend::wgpu::WgpuDevice;
+use burn::prelude::Backend;
 use clap::Parser;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -78,6 +79,12 @@ struct Args {
     /// held-out の未見テイクには適用しない)
     #[arg(long)]
     mirror_augment: bool,
+
+    /// 乱数シード(モデル重み初期化に使用)。--train-pose / --eval-holdout / --predict-pose で
+    /// 同じ値を指定すれば結果が再現できる。バッチの並び順は現状シャッフルしていないため、
+    /// 揺れの発生源は重み初期化のみ
+    #[arg(long, default_value_t = 42)]
+    seed: u64,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -173,6 +180,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///   未見テイク評価: cargo run --release -- --eval-holdout data/pose_dict_smoke.json [--holdout-per-label 1]
 fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let device = WgpuDevice::default();
+    // モデル重み初期化を再現可能にする(データのシャッフルは無いため揺れの発生源はここのみ)。
+    // モデル構築より前に呼ぶ必要がある
+    TrainingBackend::seed(args.seed);
+    println!("seed: {}", args.seed);
 
     // --- 未見テイク評価モード(Phase 0a の合否判定) ---
     if let Some(dict_path) = &args.eval_holdout {

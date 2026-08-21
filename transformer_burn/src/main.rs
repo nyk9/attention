@@ -125,6 +125,12 @@ struct Args {
     /// 認識モデルの学習率(未指定なら config::POSE_LEARNING_RATE)
     #[arg(long)]
     pose_lr: Option<f64>,
+
+    /// アブレーション: 手形記述子から落とす成分をカンマ区切りで指定
+    /// (angles / tipwrist / tippairs / wrist / offhand)。
+    /// 前処理を保存済みモデルから復元する手段が無いため --save とは併用できない
+    #[arg(long, default_value = "")]
+    drop_descriptor: String,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -227,6 +233,7 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // 認識モデルのサイズ設定を解決する(サイズ系フラグ未指定なら base = 現行 const と同じ値)。
     // 学習を始める前に検証エラーで落としたいので、モデルを組む前・分岐の外側で一度だけ呼ぶ
+    let parts = handshape_features::DescriptorParts::parse_drop(&args.drop_descriptor)?;
     let learning_rate = args.pose_lr.unwrap_or(config::POSE_LEARNING_RATE);
     if learning_rate <= 0.0 {
         return Err("--pose-lr には 0 より大きい値を指定してください".into());
@@ -241,6 +248,12 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         args.num_layers,
     )?
     .with_input_features(input_features);
+    // アブレーションで成分を落とした場合、入力次元も縮む
+    let model_config = if parts.is_full() {
+        model_config
+    } else {
+        model_config.with_input_dim(parts.feature_dim())
+    };
 
     // --predict-pose(--load 経由の推論)ではモデル構造は保存済みモデル側が真実。
     // サイズ系フラグを黙って無視すると誤用に気づけないため、何かを始める前にエラーで止める
@@ -250,6 +263,25 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         || args.num_heads.is_some()
         || args.d_ff.is_some()
         || args.num_layers.is_some();
+    if !parts.is_full() {
+        // 落とした成分の情報は model_config.json に載せられないので、保存すると
+        // 推論時に同じ前処理を再現できないモデルができてしまう。作らせない
+        if args.save.is_some() {
+            return Err(
+                "--drop-descriptor は測定用のアブレーション専用で、前処理を保存済みモデルから\
+                 復元できないため --save とは併用できません".into(),
+            );
+        }
+        if args.predict_pose.is_some() {
+            return Err("--drop-descriptor は --predict-pose では使えません".into());
+        }
+        if input_features.is_raw() {
+            return Err(
+                "--drop-descriptor は手形記述子専用です(--input-features handshape 系を指定してください)"
+                    .into(),
+            );
+        }
+    }
     if args.predict_pose.is_some() && args.standardize {
         return Err(
             "--predict-pose(--load 経由の推論)では標準化の有無も保存済みモデル側が真実のため、\
@@ -283,6 +315,9 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             if args.standardize { "あり" } else { "なし" }
         );
         println!("エポック数: {} / 学習率: {}", args.epochs, learning_rate);
+        if !parts.is_full() {
+            println!("記述子アブレーション: 落とした成分={}", parts.dropped_names());
+        }
         println!(
             "モデル構成: d_model={} / num_heads={} / d_head={} / d_ff={} / num_layers={}",
             model_config.d_model,
@@ -349,8 +384,8 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         // 生ポーズ → 手形記述子への変換(raw ならクローンのみで内容は不変)
-        let train_data = train_data.to_input_features(input_features);
-        let test_data = split.test.to_input_features(input_features);
+        let train_data = train_data.to_input_features_with_parts(input_features, parts);
+        let test_data = split.test.to_input_features_with_parts(input_features, parts);
 
         // 標準化の統計量は train からのみ算出する。held-out を混ぜて計算すると
         // 未見テイクの情報が前処理に漏れ、評価が甘くなる(転導的な情報漏洩)

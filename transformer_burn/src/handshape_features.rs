@@ -64,6 +64,133 @@ const FINGER_TIPS: [usize; 5] = [4, 8, 12, 16, 20];
 /// スケール基準に使うランドマーク(中指 MCP)。手首との距離を「手の大きさ」とみなす
 const SCALE_LANDMARK: usize = 9;
 
+/// 記述子のどの成分を残すか。アブレーション(どの成分が効いているかの切り分け)用。
+///
+/// 既定は全部残す(`all()`)。CLI `--drop-descriptor` で成分を落とす。
+/// 検出フラグは常に残す(その手が取れたかどうかは、どの成分を落としても意味が変わらない)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DescriptorParts {
+    /// 関節角 15 個
+    pub angles: bool,
+    /// 指先 - 手首の距離 5 個
+    pub tip_wrist: bool,
+    /// 指先どうしの距離 10 個
+    pub tip_pairs: bool,
+    /// 手首の画像内座標 xy
+    pub wrist_xy: bool,
+    /// 非主たる手のブロックまるごと
+    pub off_hand: bool,
+}
+
+impl Default for DescriptorParts {
+    fn default() -> Self {
+        Self::all()
+    }
+}
+
+impl DescriptorParts {
+    pub fn all() -> Self {
+        Self {
+            angles: true,
+            tip_wrist: true,
+            tip_pairs: true,
+            wrist_xy: true,
+            off_hand: true,
+        }
+    }
+
+    /// CLI の `--drop-descriptor` 指定(カンマ区切り)を解決する。
+    /// 空文字・未指定は `all()`。例: "wrist,offhand"
+    pub fn parse_drop(spec: &str) -> Result<Self, String> {
+        let mut parts = Self::all();
+        for raw in spec.split(',') {
+            let name = raw.trim();
+            if name.is_empty() {
+                continue;
+            }
+            match name {
+                "angles" => parts.angles = false,
+                "tipwrist" => parts.tip_wrist = false,
+                "tippairs" => parts.tip_pairs = false,
+                "wrist" => parts.wrist_xy = false,
+                "offhand" => parts.off_hand = false,
+                _ => {
+                    return Err(format!(
+                        "未知の記述子成分です: \"{}\"(angles / tipwrist / tippairs / wrist / offhand から選んでください)",
+                        name
+                    ))
+                }
+            }
+        }
+        if !parts.angles && !parts.tip_wrist && !parts.tip_pairs && !parts.wrist_xy {
+            return Err(
+                "主たる手の成分を全部落とすと検出フラグしか残りません。1 つ以上残してください"
+                    .to_string(),
+            );
+        }
+        Ok(parts)
+    }
+
+    /// 全部残しているか(既定経路の判定に使う)
+    pub fn is_full(self) -> bool {
+        self == Self::all()
+    }
+
+    /// 66 次元のうち残す次元の添字。手ブロックの順(主たる手 → 非主たる手)を保つ
+    pub fn kept_indices(self) -> Vec<usize> {
+        let mut kept = Vec::new();
+        let hands = if self.off_hand { 2 } else { 1 };
+        for s in 0..hands {
+            let base = s * HAND_BLOCK_DIM;
+            if self.angles {
+                kept.extend(base..base + 15);
+            }
+            if self.tip_wrist {
+                kept.extend(base + 15..base + 20);
+            }
+            if self.tip_pairs {
+                kept.extend(base + 20..base + 30);
+            }
+            if self.wrist_xy {
+                kept.extend(base + 30..base + 32);
+            }
+            // 検出フラグは常に残す
+            kept.push(base + 32);
+        }
+        kept
+    }
+
+    /// この成分構成での 1 フレームの次元
+    pub fn feature_dim(self) -> usize {
+        self.kept_indices().len()
+    }
+
+    /// 落とした成分の一覧(表示・記録用)。全部残していれば "なし"
+    pub fn dropped_names(self) -> String {
+        let mut dropped = Vec::new();
+        if !self.angles {
+            dropped.push("angles");
+        }
+        if !self.tip_wrist {
+            dropped.push("tipwrist");
+        }
+        if !self.tip_pairs {
+            dropped.push("tippairs");
+        }
+        if !self.wrist_xy {
+            dropped.push("wrist");
+        }
+        if !self.off_hand {
+            dropped.push("offhand");
+        }
+        if dropped.is_empty() {
+            "なし".to_string()
+        } else {
+            dropped.join(",")
+        }
+    }
+}
+
 /// 認識モデルへ与える入力特徴量の種類。CLI `--input-features` に対応する。
 /// `model_config.json` にも保存するので、保存済みモデルを読むときに
 /// 「このモデルはどの入力表現で学習されたか」が分かる
@@ -233,6 +360,34 @@ fn align_to_right_dominant(features: &[f32], frames: usize) -> std::borrow::Cow<
 /// - `HandshapeMean`: そもそも全フレームが平均値なので区別はない。検出フラグには
 ///   検出できたフレームの割合(カバレッジ)が入る
 pub fn handshape_sequence(features: &[f32], frames: usize, mode: InputFeatures) -> Vec<f32> {
+    handshape_sequence_with_parts(features, frames, mode, DescriptorParts::all())
+}
+
+/// `handshape_sequence` の成分選択版(アブレーション用)。
+/// まず 66 次元をすべて作り、そのあと残す次元だけを抜き出す。
+/// 「作ってから間引く」ので、成分を落としても残る次元の値は完全に同じになる
+pub fn handshape_sequence_with_parts(
+    features: &[f32],
+    frames: usize,
+    mode: InputFeatures,
+    parts: DescriptorParts,
+) -> Vec<f32> {
+    let full = handshape_sequence_full(features, frames, mode);
+    if parts.is_full() {
+        return full;
+    }
+    let kept = parts.kept_indices();
+    let mut out = Vec::with_capacity(frames * kept.len());
+    for t in 0..frames {
+        let base = t * HANDSHAPE_FEATURE_DIM;
+        for &j in &kept {
+            out.push(full[base + j]);
+        }
+    }
+    out
+}
+
+fn handshape_sequence_full(features: &[f32], frames: usize, mode: InputFeatures) -> Vec<f32> {
     assert!(
         !mode.is_raw(),
         "handshape_sequence は Raw(生 126 次元)には使えません"
@@ -514,6 +669,52 @@ mod tests {
         );
         // 手首 x はフレームごとに動かしているので、平均値は他フレームと一致しない
         assert!(block(2)[GEOMETRY_DIM] > 0.0);
+    }
+
+    // [TEST向き] 成分の指定と次元数
+    #[test]
+    fn descriptor_parts_parse_and_dim() {
+        assert_eq!(DescriptorParts::parse_drop("").unwrap(), DescriptorParts::all());
+        assert_eq!(DescriptorParts::all().feature_dim(), HANDSHAPE_FEATURE_DIM);
+
+        let no_wrist = DescriptorParts::parse_drop("wrist").unwrap();
+        assert!(!no_wrist.wrist_xy);
+        assert_eq!(no_wrist.feature_dim(), (33 - 2) * 2); // 62
+
+        let no_off = DescriptorParts::parse_drop("offhand").unwrap();
+        assert_eq!(no_off.feature_dim(), 33);
+
+        let both = DescriptorParts::parse_drop("wrist,offhand").unwrap();
+        assert_eq!(both.feature_dim(), 31);
+        assert_eq!(both.dropped_names(), "wrist,offhand");
+
+        assert!(DescriptorParts::parse_drop("bogus").is_err());
+        // 主たる手の成分を全部落とすのは禁止
+        assert!(DescriptorParts::parse_drop("angles,tipwrist,tippairs,wrist").is_err());
+    }
+
+    // [TEST向き] 成分を落としても、残る次元の値は落とさない場合と完全に一致すること
+    #[test]
+    fn dropping_parts_keeps_remaining_values_identical() {
+        let frames = 5;
+        let take = take_with_one_hand(frames, true, 0.4);
+        let full = handshape_sequence(&take, frames, InputFeatures::Handshape);
+
+        let parts = DescriptorParts::parse_drop("wrist").unwrap();
+        let reduced = handshape_sequence_with_parts(&take, frames, InputFeatures::Handshape, parts);
+        let kept = parts.kept_indices();
+        assert_eq!(reduced.len(), frames * kept.len());
+        for t in 0..frames {
+            for (i, &j) in kept.iter().enumerate() {
+                assert_eq!(
+                    reduced[t * kept.len() + i],
+                    full[t * HANDSHAPE_FEATURE_DIM + j],
+                    "フレーム{} 次元{} が一致しません",
+                    t,
+                    j
+                );
+            }
+        }
     }
 
     // [TEST向き] TakeMean は全フレーム同じ値になり、フラグにカバレッジが入ること

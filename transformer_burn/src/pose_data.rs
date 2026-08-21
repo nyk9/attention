@@ -1,6 +1,6 @@
 use crate::config::POSE_FEATURE_DIM;
 use crate::feature_stats::FeatureStats;
-use crate::handshape_features::{handshape_sequence, InputFeatures};
+use crate::handshape_features::{handshape_sequence_with_parts, DescriptorParts, InputFeatures};
 use crate::tag_vocabulary::TagVocabulary;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -425,6 +425,15 @@ impl PoseTrainingData {
     /// ラベル・サンプル件数・フレーム数は変わらず、1 フレームの次元だけが変わる。
     /// `InputFeatures::Raw` を渡した場合は変換せずクローンを返す(呼び出し側で分岐しなくて済む)
     pub fn to_input_features(&self, mode: InputFeatures) -> PoseTrainingData {
+        self.to_input_features_with_parts(mode, DescriptorParts::all())
+    }
+
+    /// `to_input_features` の成分選択版(アブレーション用)
+    pub fn to_input_features_with_parts(
+        &self,
+        mode: InputFeatures,
+        parts: DescriptorParts,
+    ) -> PoseTrainingData {
         if mode.is_raw() {
             return PoseTrainingData {
                 samples: self.samples.clone(),
@@ -436,14 +445,14 @@ impl PoseTrainingData {
             .samples
             .iter()
             .map(|s| PoseSample {
-                features: handshape_sequence(&s.features, self.frames, mode),
+                features: handshape_sequence_with_parts(&s.features, self.frames, mode, parts),
                 label: s.label.clone(),
             })
             .collect();
         PoseTrainingData {
             samples,
             frames: self.frames,
-            feature_dim: mode.feature_dim(),
+            feature_dim: parts.feature_dim(),
         }
     }
 

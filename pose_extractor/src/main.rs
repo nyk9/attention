@@ -3063,6 +3063,114 @@ mod tests {
         );
     }
 
+    /// 改善前後のオーバーレイを目視するための出力テスト(S6 の教訓「数値でなく目で確かめる」)。
+    /// 骨格線が実際に手の上に乗っているかを PNG で確認する。
+    ///
+    /// 環境変数:
+    ///   OVERLAY_VIDEO  対象動画のパス(既定 /tmp/palm_roi_measure/takes/arigatou-01.mp4)
+    ///   OVERLAY_MODE   full(既定) | center | sign | tiles3
+    ///   OVERLAY_FRAMES 先頭から何フレーム処理するか(既定 60)
+    ///   OVERLAY_OUT    出力先ディレクトリ(既定 /tmp/palm_roi_overlay/<mode>)
+    ///
+    /// 手動実行: `OVERLAY_MODE=tiles3 cargo test overlay_palm_roi --release -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn overlay_palm_roi() {
+        let video = PathBuf::from(
+            std::env::var("OVERLAY_VIDEO")
+                .unwrap_or_else(|_| "/tmp/palm_roi_measure/takes/arigatou-01.mp4".into()),
+        );
+        for p in [video.as_path(), Path::new(PALM_MODEL), Path::new(HAND_MODEL)] {
+            if !p.exists() {
+                eprintln!("skip: fixture not found: {}", p.display());
+                return;
+            }
+        }
+        let mode_name = std::env::var("OVERLAY_MODE").unwrap_or_else(|_| "full".into());
+        let mode = match mode_name.as_str() {
+            "full" => PalmRoiMode::FullFrame,
+            "center" => PalmRoiMode::CenterSquare,
+            "sign" => SIGN_ROI,
+            "tiles3" => PalmRoiMode::Tiles { count: 3 },
+            other => panic!("unknown OVERLAY_MODE: {}", other),
+        };
+        let frames: usize = std::env::var("OVERLAY_FRAMES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60);
+        let dir = PathBuf::from(
+            std::env::var("OVERLAY_OUT")
+                .unwrap_or_else(|_| format!("/tmp/palm_roi_overlay/{}", mode_name)),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = RunConfig {
+            input: video,
+            model: PathBuf::from(DEFAULT_MODEL),
+            palm_model: Some(PathBuf::from(PALM_MODEL)),
+            hand_model: Some(PathBuf::from(HAND_MODEL)),
+            format: OutputFormat::Tsv,
+            apply_sigmoid: false,
+            save_overlay: Some(dir.clone()),
+            overlay_count: 0,
+            overlay_video: false,
+            palm_roi: mode,
+            max_frames: Some(frames),
+            output: Some(dir.join("out.tsv")),
+        };
+        // overlay_count=0 かつ overlay_video=false だと PNG が出ないので、全フレーム出力にする
+        let mut cfg = cfg;
+        cfg.overlay_video = true;
+        run_extraction(cfg).expect("run_extraction 失敗");
+        eprintln!("mode={} ({}) overlay -> {}", mode_name, mode.label(), dir.display());
+    }
+
+    /// 指定した ROI モードで pose dict を作り直す(Step 5 の下流評価用)。
+    /// **既存の dict は上書きしない**。出力先は必ず新しいファイル名を指定すること。
+    ///
+    /// 環境変数:
+    ///   DICT_ROI_MODE full | center | sign | tiles3(既定 tiles3)
+    ///   DICT_OUT      出力 JSON パス(既定 ../transformer_burn/data/pose_dict_full_<mode>.json)
+    ///
+    /// 手動実行: `DICT_ROI_MODE=tiles3 cargo test build_dict_with_palm_roi --release -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn build_dict_with_palm_roi() {
+        let data_dir = Path::new(RAW_JSL_DIR);
+        for p in [data_dir, Path::new(PALM_MODEL), Path::new(HAND_MODEL)] {
+            if !p.exists() {
+                eprintln!("skip: fixture not found: {}", p.display());
+                return;
+            }
+        }
+        let mode_name = std::env::var("DICT_ROI_MODE").unwrap_or_else(|_| "tiles3".into());
+        let mode = match mode_name.as_str() {
+            "full" => PalmRoiMode::FullFrame,
+            "center" => PalmRoiMode::CenterSquare,
+            "sign" => SIGN_ROI,
+            "tiles3" => PalmRoiMode::Tiles { count: 3 },
+            other => panic!("unknown DICT_ROI_MODE: {}", other),
+        };
+        let out = PathBuf::from(std::env::var("DICT_OUT").unwrap_or_else(|_| {
+            format!("../transformer_burn/data/pose_dict_full_{}.json", mode_name)
+        }));
+        assert!(
+            !out.ends_with("pose_dict_full.json") && !out.ends_with("pose_dict_stage1.json")
+                && !out.ends_with("pose_dict_stage2.json"),
+            "既存 dict の上書きは禁止: {}",
+            out.display()
+        );
+
+        // ok テイクをフラット構成へ(build-dict の入力形)
+        let export_dir = std::env::temp_dir().join("palm_roi_dict_takes");
+        if !export_dir.exists() {
+            let n = progress::run_export(data_dir, &export_dir, None).unwrap();
+            eprintln!("exported {} takes", n);
+        }
+        let t = std::time::Instant::now();
+        build_dict_mode(&export_dir, &out, 10, mode).unwrap();
+        eprintln!("mode={} ({}) -> {} ({:?})", mode_name, mode.label(), out.display(), t.elapsed());
+    }
+
     #[test]
     fn parse_frame_rate_cases() {
         assert!((parse_frame_rate("30/1").unwrap() - 30.0).abs() < 1e-9);

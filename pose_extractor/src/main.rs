@@ -3132,6 +3132,11 @@ mod tests {
                             hands.push(h);
                         }
                     }
+                    // 本番経路(infer_frame_feature)と同じ重複統合をかける。
+                    // これを省くと、複数 ROI で同じ手を二重に数えた値を測ってしまう。
+                    if mode.is_multi_roi() {
+                        hands = dedup_hands_by_landmarks(hands, HAND_DEDUP_IOU);
+                    }
                     for (p, h) in palms.iter().zip(hands.iter()) {
                         let xs: Vec<f32> = h.landmarks.iter().map(|l| l.x).collect();
                         let ys: Vec<f32> = h.landmarks.iter().map(|l| l.y).collect();

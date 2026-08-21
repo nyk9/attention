@@ -703,6 +703,10 @@ fn run_extraction(cfg: RunConfig) -> Result<()> {
                         hands_this_frame.push(h);
                     }
                 }
+                if cfg.palm_roi.is_multi_roi() {
+                    hands_this_frame =
+                        dedup_hands_by_landmarks(hands_this_frame, HAND_DEDUP_IOU);
+                }
             }
             palm_frame_local = Some(PalmFrame {
                 frame_idx: idx,
@@ -1075,6 +1079,11 @@ fn infer_frame_feature(
             hands.push(h);
         }
     }
+    // 複数 ROI のときだけ重複統合する。単一 ROI(既定の FullFrame 含む)では
+    // 従来どおり NMS 済みの結果をそのまま使い、既定の出力を変えない。
+    if roi_mode.is_multi_roi() {
+        hands = dedup_hands_by_landmarks(hands, HAND_DEDUP_IOU);
+    }
     Ok(frame_hand_feature(&hands, width, height))
 }
 
@@ -1108,6 +1117,50 @@ fn assemble_selected<T: Clone>(
         Some((out, missing))
     }
 }
+
+/// ハンドランドマークの外接矩形が重なる検出を「同じ手」とみなして 1 つに統合する。
+/// confidence の高い方を残す。複数 ROI(タイル)で同じ手が二重に取れるのを防ぐためのもので、
+/// 放置すると `frame_hand_feature` が同一の手を左右両方のスロットに入れてしまう。
+///
+/// 手のひら bbox ではなくランドマーク外接で判定するのは、同じ手でも ROI が違うと
+/// 手のひら bbox のスケールが変わって IoU が下がる(実測で中央値 0.10)一方、
+/// ランドマーク外接は IoU 0.7-0.9 と明確に分離できるため。
+// [TEST向き] 純粋関数。重複あり/なし、confidence の高い方が残るか
+fn dedup_hands_by_landmarks(hands: Vec<Hand>, iou_threshold: f32) -> Vec<Hand> {
+    let bbox = |h: &Hand| -> [f32; 4] {
+        let mut b = [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
+        for lm in &h.landmarks {
+            b[0] = b[0].min(lm.x);
+            b[1] = b[1].min(lm.y);
+            b[2] = b[2].max(lm.x);
+            b[3] = b[3].max(lm.y);
+        }
+        b
+    };
+    let mut sorted = hands;
+    sorted.sort_by(|a, b| {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut kept: Vec<Hand> = Vec::with_capacity(sorted.len());
+    let mut kept_boxes: Vec<[f32; 4]> = Vec::with_capacity(sorted.len());
+    for h in sorted {
+        let b = bbox(&h);
+        if kept_boxes
+            .iter()
+            .any(|k| iou_xyxy(k, &b) > iou_threshold)
+        {
+            continue;
+        }
+        kept_boxes.push(b);
+        kept.push(h);
+    }
+    kept
+}
+
+/// 同じ手の二重検出とみなす IoU 閾値(ランドマーク外接どうし)。
+const HAND_DEDUP_IOU: f32 = 0.3;
 
 /// 検出されたハンドを左手スロット([0..63])と右手スロット([63..126])に割り当て、
 /// 正規化済みの 126 次元特徴量を作る。検出されなかった手はゼロ埋め。
@@ -1480,6 +1533,14 @@ enum PalmRoiMode {
 }
 
 impl PalmRoiMode {
+    /// 複数の ROI に分割するモードか。複数 ROI では**同じ手が別々の ROI から
+    /// 二重に検出されうる**(ROI ごとに手のひら bbox のスケールが変わるため、
+    /// 元フレーム座標に戻しても IoU が NMS 閾値に届かず生き残る)。
+    /// その場合はハンドランドマーク段で重複を落とす必要がある。
+    fn is_multi_roi(&self) -> bool {
+        matches!(self, PalmRoiMode::Tiles { count } if *count > 1)
+    }
+
     fn label(&self) -> String {
         match self {
             PalmRoiMode::FullFrame => "full-frame".into(),
@@ -2683,6 +2744,47 @@ mod tests {
             ox,
             oy
         );
+    }
+
+    #[test]
+    fn dedup_hands_removes_same_hand_detected_twice() {
+        let mk = |x: f32, y: f32, conf: f32| Hand {
+            confidence: conf,
+            handedness: 0.9,
+            landmarks: (0..21)
+                .map(|i| HandLandmarkPoint {
+                    x: x + (i % 5) as f32 * 10.0,
+                    y: y + (i / 5) as f32 * 10.0,
+                    z: 0.0,
+                })
+                .collect(),
+        };
+        // ほぼ同じ位置の 2 検出 → confidence の高い方だけ残る
+        let a = mk(100.0, 100.0, 0.7);
+        let b = mk(102.0, 101.0, 0.95);
+        let out = dedup_hands_by_landmarks(vec![a, b], HAND_DEDUP_IOU);
+        assert_eq!(out.len(), 1, "同一の手が統合されていない");
+        assert!((out[0].confidence - 0.95).abs() < 1e-6, "confidence の高い方が残っていない");
+
+        // 離れた 2 検出(別の手)は両方残る
+        let out = dedup_hands_by_landmarks(
+            vec![mk(100.0, 100.0, 0.9), mk(800.0, 600.0, 0.8)],
+            HAND_DEDUP_IOU,
+        );
+        assert_eq!(out.len(), 2, "別々の手が誤って統合された");
+
+        // 空入力
+        assert!(dedup_hands_by_landmarks(vec![], HAND_DEDUP_IOU).is_empty());
+    }
+
+    #[test]
+    fn multi_roi_flag_only_for_tiles() {
+        // 重複統合は複数 ROI のときだけ走る(既定の挙動を変えないため)
+        assert!(!PalmRoiMode::FullFrame.is_multi_roi());
+        assert!(!PalmRoiMode::CenterSquare.is_multi_roi());
+        assert!(!SIGN_ROI.is_multi_roi());
+        assert!(!PalmRoiMode::Tiles { count: 1 }.is_multi_roi());
+        assert!(PalmRoiMode::Tiles { count: 3 }.is_multi_roi());
     }
 
     #[test]

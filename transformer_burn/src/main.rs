@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 mod checkpoint;
 mod config;
+mod handshape_features;
 mod inference;
 mod jsl_data;
 mod jsl_vocabulary;
@@ -107,6 +108,13 @@ struct Args {
     /// 認識モデルの Transformer 層数を個別指定(未指定ならプリセット値)
     #[arg(long)]
     num_layers: Option<usize>,
+
+    /// 認識モデルの入力特徴量(raw / handshape / handshape-mean)。
+    /// raw(既定)= 従来通り生の 126 次元ハンドランドマーク。
+    /// handshape = フレームごとの手形記述子 66 次元(関節角・指先間距離・手首座標)。
+    /// handshape-mean = テイク平均の手形記述子を全フレームに複製したもの
+    #[arg(long, default_value = "raw")]
+    input_features: String,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -209,13 +217,16 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // 認識モデルのサイズ設定を解決する(サイズ系フラグ未指定なら base = 現行 const と同じ値)。
     // 学習を始める前に検証エラーで落としたいので、モデルを組む前・分岐の外側で一度だけ呼ぶ
+    // 入力特徴量の種類も、学習を始める前に解決しておく(未知の値なら理由付きで落とす)
+    let input_features = handshape_features::InputFeatures::parse(&args.input_features)?;
     let model_config = config::RecognitionModelConfig::resolve(
         args.model_size.as_deref(),
         args.d_model,
         args.num_heads,
         args.d_ff,
         args.num_layers,
-    )?;
+    )?
+    .with_input_features(input_features);
 
     // --predict-pose(--load 経由の推論)ではモデル構造は保存済みモデル側が真実。
     // サイズ系フラグを黙って無視すると誤用に気づけないため、何かを始める前にエラーで止める
@@ -225,6 +236,13 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         || args.num_heads.is_some()
         || args.d_ff.is_some()
         || args.num_layers.is_some();
+    if args.predict_pose.is_some() && !input_features.is_raw() {
+        return Err(
+            "--predict-pose(--load 経由の推論)では入力表現も保存済みモデル側が真実のため、\
+             --input-features は指定できません(モデルの model_config.json から自動で決まります)"
+                .into(),
+        );
+    }
     if args.predict_pose.is_some() && size_flag_given {
         return Err(
             "--predict-pose(--load 経由の推論)ではモデル構造は保存済みモデル側が真実のため、\
@@ -237,6 +255,11 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     // 構成が使われるため、ここで表示すると実際に読み込まれる構造と食い違って誤解を招く
     // (推論時の構成表示は load_recognition_model 側が行う)
     if args.predict_pose.is_none() {
+        println!(
+            "入力特徴量: {} ({}次元/フレーム)",
+            input_features.name(),
+            model_config.input_dim
+        );
         println!(
             "モデル構成: d_model={} / num_heads={} / d_head={} / d_ff={} / num_layers={}",
             model_config.d_model,
@@ -278,17 +301,33 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         );
 
         // ミラー拡張は train 側のみに適用する。held-out(未見テイク)は実撮影データの
-        // 分布のまま評価しないと「解けたことにする」測定になってしまうため対象外
+        // 分布のまま評価しないと「解けたことにする」測定になってしまうため対象外。
+        //
+        // 拡張は必ず「生の 126 次元のうちに」行う。手形記述子は左右反転に不変なので、
+        // 記述子へ変換したあとで反転しても完全に同じベクトルが増えるだけで拡張にならない
+        // (handshape_features::tests::mirror_invariance 参照)。そのため記述子を使うときは
+        // ミラー拡張を無効化し、黙って効かないのではなく理由を表示する
         let mut train_data = split.train;
         if args.mirror_augment {
-            let before = train_data.len();
-            train_data = train_data.with_mirror_augmentation();
-            println!(
-                "ミラー拡張適用: 学習サンプル {} 件 → {} 件",
-                before,
-                train_data.len()
-            );
+            if input_features.is_raw() {
+                let before = train_data.len();
+                train_data = train_data.with_mirror_augmentation();
+                println!(
+                    "ミラー拡張適用: 学習サンプル {} 件 → {} 件",
+                    before,
+                    train_data.len()
+                );
+            } else {
+                println!(
+                    "注意: --input-features {} は左右反転に不変な記述子のため、\
+                     --mirror-augment は同一ベクトルの複製にしかならず適用しません",
+                    input_features.name()
+                );
+            }
         }
+        // 生ポーズ → 手形記述子への変換(raw ならクローンのみで内容は不変)
+        let train_data = train_data.to_input_features(input_features);
+        let test_data = split.test.to_input_features(input_features);
 
         // 語彙は学習データ(train)から構築。held-out のラベルは train の部分集合なので必ず含まれる
         let vocab = train_data.build_vocabulary();
@@ -312,7 +351,7 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         );
 
         println!("\n===== 未見テイクでの評価(これが Phase 0a の合否判定) =====");
-        recognition_training::evaluate_topk(&model, &split.test, &vocab, &device);
+        recognition_training::evaluate_topk(&model, &test_data, &vocab, &device);
 
         if let Some(save_dir) = &args.save {
             recognition::save_recognition_model(&model, &vocab, &model_config, save_dir)?;
@@ -332,10 +371,21 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
         let mut data = pose_data::PoseTrainingData::load(dict_path)?;
         if args.mirror_augment {
-            let before = data.len();
-            data = data.with_mirror_augmentation();
-            println!("ミラー拡張適用: {} 件 → {} 件", before, data.len());
+            if input_features.is_raw() {
+                let before = data.len();
+                data = data.with_mirror_augmentation();
+                println!("ミラー拡張適用: {} 件 → {} 件", before, data.len());
+            } else {
+                // 理由は --eval-holdout 側のコメント参照(記述子は左右反転に不変)
+                println!(
+                    "注意: --input-features {} は左右反転に不変な記述子のため、\
+                     --mirror-augment は同一ベクトルの複製にしかならず適用しません",
+                    input_features.name()
+                );
+            }
         }
+        // 生ポーズ → 手形記述子への変換(raw ならクローンのみで内容は不変)
+        let data = data.to_input_features(input_features);
         let vocab = data.build_vocabulary();
         println!(
             "サンプル数: {} / タグ数: {} ({:?})",
@@ -377,9 +427,18 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             .as_ref()
             .ok_or("--predict-pose には --load <モデルディレクトリ> が必要です")?;
 
+        // モデルを組む前に、そのモデルがどの入力表現で学習されたかを読む
+        let saved_config = recognition::load_recognition_config(load_dir)?;
         let (model, vocab) =
             recognition::load_recognition_model::<TrainingBackend>(load_dir, &device)?;
-        let data = pose_data::PoseTrainingData::load(dict_path)?;
+        let data = pose_data::PoseTrainingData::load(dict_path)?
+            .to_input_features(saved_config.input_features);
+        if !saved_config.input_features.is_raw() {
+            println!(
+                "保存済みモデルの入力表現に合わせて pose dict を変換しました: {}",
+                saved_config.input_features.name()
+            );
+        }
         recognition_training::evaluate_topk(&model, &data, &vocab, &device);
     }
 

@@ -10,7 +10,7 @@
 //!   覗く「カンニング」を防ぐ。足場の Decoder は None を渡していて
 //!   この防御がない)
 
-use crate::config::{RecognitionModelConfig, D_HEAD, D_MODEL, NUM_HEADS, POSE_FEATURE_DIM};
+use crate::config::{RecognitionModelConfig, D_HEAD, D_MODEL, NUM_HEADS};
 use crate::model::{CustomCrossAttention, FeedForward, TransformerBlock};
 use crate::tag_vocabulary::TagVocabulary;
 use burn::nn::{Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig};
@@ -133,7 +133,7 @@ pub struct PoseEncoder<B: Backend> {
 impl<B: Backend> PoseEncoder<B> {
     /// 設定駆動の構築。認識モデルのサイズ縮小はここで寸法を渡すことで実現する
     pub fn new(config: &RecognitionModelConfig, device: &B::Device) -> Self {
-        let input_projection = LinearConfig::new(POSE_FEATURE_DIM, config.d_model).init(device);
+        let input_projection = LinearConfig::new(config.input_dim, config.d_model).init(device);
         let mut encoder_blocks = Vec::new();
         for _ in 0..config.num_layers {
             encoder_blocks.push(TransformerBlock::new_with_dims(
@@ -150,7 +150,14 @@ impl<B: Backend> PoseEncoder<B> {
         }
     }
 
-    /// pose: [batch, frames, POSE_FEATURE_DIM] → [batch, frames, d_model]
+    /// このエンコーダが受け付ける 1 フレームの次元(= 構築時の config.input_dim)。
+    /// Linear の重み形状から読むので、保存済みモデルを読み込んだ後でも正しい値が返る
+    pub fn input_dim(&self) -> usize {
+        // burn の Linear の weight は [d_input, d_output]
+        self.input_projection.weight.dims()[0]
+    }
+
+    /// pose: [batch, frames, input_dim] → [batch, frames, d_model]
     pub fn forward(&self, pose: Tensor<B, 3>) -> Tensor<B, 3> {
         let projected = self.input_projection.forward(pose);
         let mut x = add_positional_encoding(projected);
@@ -295,7 +302,9 @@ impl<B: Backend> RecognitionModel<B> {
 
     /// 1 サンプルの手ポーズ列から、確率上位 k 個のタグを返す。
     /// Phase 0a の終了基準「10語で top-5 に正解」の判定に使う。
-    /// features: [frames * POSE_FEATURE_DIM] のフラット列
+    /// features: [frames * 特徴次元] のフラット列。
+    /// 特徴次元は `features.len() / frames` から導出する(生ポーズ 126 次元でも
+    /// 手形記述子でも同じ経路で扱えるようにするため)
     pub fn predict_topk(
         &self,
         features: &[f32],
@@ -304,11 +313,24 @@ impl<B: Backend> RecognitionModel<B> {
         k: usize,
         device: &B::Device,
     ) -> Vec<(String, f32)> {
-        let pose = Tensor::<B, 1>::from_floats(features, device).reshape([
-            1,
-            frames,
-            POSE_FEATURE_DIM,
-        ]);
+        assert!(frames > 0, "frames には 1 以上を指定してください");
+        assert_eq!(
+            features.len() % frames,
+            0,
+            "features の長さ({})がフレーム数({})で割り切れません",
+            features.len(),
+            frames
+        );
+        let feature_dim = features.len() / frames;
+        assert_eq!(
+            feature_dim,
+            self.encoder.input_dim(),
+            "特徴次元がモデルの入力次元と一致しません(データ={} モデル={})。\
+             --input-features の指定と、読み込んだモデルの model_config.json を確認してください",
+            feature_dim,
+            self.encoder.input_dim()
+        );
+        let pose = Tensor::<B, 1>::from_floats(features, device).reshape([1, frames, feature_dim]);
         let encoder_output = self.encoder.forward(pose);
 
         // SOS だけを入力し、最初のタグ位置の分布を見る(単語認識なのでこれで十分)
@@ -372,28 +394,45 @@ pub fn save_recognition_model<B: Backend>(
 /// `model_config.json` があればそれで構造を復元し、無ければ `Default`(現行 const 相当)に
 /// フォールバックする。これにより `model_config.json` を持たない既存モデル
 /// (`models/rec_full` 等)もそのまま読める(後方互換)
+/// 保存済みモデルの寸法設定だけを読む(モデル本体は読まない)。
+/// 呼び出し側が「このモデルはどの入力表現で学習されたか」を、モデルを組む前に
+/// 知る必要があるため分離してある(例: 推論前に pose dict を手形記述子へ変換するか判断する)。
+/// `model_config.json` が無い既存モデルは `Default`(生ポーズ 126 次元)にフォールバックする
+pub fn load_recognition_config(
+    load_dir: &Path,
+) -> Result<RecognitionModelConfig, Box<dyn std::error::Error>> {
+    let config_path = load_dir.join("model_config.json");
+    if config_path.exists() {
+        let content = std::fs::read_to_string(&config_path)?;
+        Ok(serde_json::from_str::<RecognitionModelConfig>(&content)?)
+    } else {
+        Ok(RecognitionModelConfig::default())
+    }
+}
+
 pub fn load_recognition_model<B: Backend>(
     load_dir: &Path,
     device: &B::Device,
 ) -> Result<(RecognitionModel<B>, TagVocabulary), Box<dyn std::error::Error>> {
     let vocab = TagVocabulary::load(load_dir)?;
 
-    let config_path = load_dir.join("model_config.json");
-    let config = if config_path.exists() {
-        let content = std::fs::read_to_string(&config_path)?;
-        serde_json::from_str::<RecognitionModelConfig>(&content)?
-    } else {
+    if !load_dir.join("model_config.json").exists() {
         println!(
             "model_config.json が見つからないため既定サイズにフォールバックします: {}",
             load_dir.display()
         );
-        RecognitionModelConfig::default()
-    };
+    }
+    let config = load_recognition_config(load_dir)?;
     // 実際に器を組むのに使う構成を必ず表示する。CLI 側で表示している構成は
     // 学習経路のものなので、読み込み時はこちらが真実
     println!(
-        "モデル構成: d_model={} / num_heads={} / d_head={} / d_ff={} / num_layers={}",
-        config.d_model, config.num_heads, config.d_head, config.d_ff, config.num_layers
+        "モデル構成: input_dim={} / d_model={} / num_heads={} / d_head={} / d_ff={} / num_layers={}",
+        config.input_dim,
+        config.d_model,
+        config.num_heads,
+        config.d_head,
+        config.d_ff,
+        config.num_layers
     );
 
     let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
@@ -445,6 +484,8 @@ pub fn predict_from_features(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::POSE_FEATURE_DIM;
+    use crate::handshape_features::{InputFeatures, HANDSHAPE_FEATURE_DIM};
     use std::path::PathBuf;
 
     type TestBackend = InferenceBackend;
@@ -492,6 +533,36 @@ mod tests {
         cleanup(&dir);
     }
 
+    // [TEST向き] 手形記述子(66次元)で保存したモデルが、入力次元ごと復元されること
+    #[test]
+    fn handshape_config_roundtrip_preserves_input_dim() {
+        let device = <TestBackend as Backend>::Device::default();
+        let dir = test_dir("handshape_roundtrip");
+
+        let vocab = TagVocabulary::from_labels(vec!["a".to_string(), "b".to_string()]);
+        let config = RecognitionModelConfig::preset("tiny")
+            .unwrap()
+            .with_input_features(InputFeatures::Handshape);
+        let model =
+            RecognitionModel::<TestBackend>::new_with_config(vocab.vocab_size(), &config, &device);
+
+        save_recognition_model(&model, &vocab, &config, &dir).expect("保存に失敗");
+
+        let saved = load_recognition_config(&dir).expect("設定の読み込みに失敗");
+        assert_eq!(saved.input_dim, HANDSHAPE_FEATURE_DIM);
+        assert_eq!(saved.input_features, InputFeatures::Handshape);
+
+        let (loaded_model, loaded_vocab) =
+            load_recognition_model::<TestBackend>(&dir, &device).expect("読み込みに失敗");
+        let frames = 10;
+        let features = vec![0.0f32; frames * HANDSHAPE_FEATURE_DIM];
+        let preds = loaded_model.predict_topk(&features, frames, &loaded_vocab, 2, &device);
+        assert_eq!(preds.len(), 2);
+
+        cleanup(&dir);
+    }
+
+    // [TEST向き] 後方互換: model_config.json を持たない既存モデルは raw 126 次元として読めること
     #[test]
     fn missing_model_config_falls_back_to_default() {
         let device = <TestBackend as Backend>::Device::default();
@@ -513,6 +584,10 @@ mod tests {
         let features = vec![0.0f32; frames * POSE_FEATURE_DIM];
         let preds = loaded_model.predict_topk(&features, frames, &loaded_vocab, 1, &device);
         assert_eq!(preds.len(), 1);
+        // 入力表現も raw(生 126 次元)にフォールバックしていること
+        let fallback = load_recognition_config(&dir).expect("設定の読み込みに失敗");
+        assert_eq!(fallback.input_dim, POSE_FEATURE_DIM);
+        assert!(fallback.input_features.is_raw());
 
         cleanup(&dir);
     }

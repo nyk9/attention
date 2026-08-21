@@ -1,4 +1,5 @@
 use crate::config::POSE_FEATURE_DIM;
+use crate::handshape_features::{handshape_sequence, InputFeatures};
 use crate::tag_vocabulary::TagVocabulary;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -416,6 +417,32 @@ impl PoseTrainingData {
             samples,
             frames: self.frames,
             feature_dim: self.feature_dim,
+        }
+    }
+
+    /// 生の手ポーズ列(126次元)を手形記述子(66次元)に変換した学習データを返す。
+    /// ラベル・サンプル件数・フレーム数は変わらず、1 フレームの次元だけが変わる。
+    /// `InputFeatures::Raw` を渡した場合は変換せずクローンを返す(呼び出し側で分岐しなくて済む)
+    pub fn to_input_features(&self, mode: InputFeatures) -> PoseTrainingData {
+        if mode.is_raw() {
+            return PoseTrainingData {
+                samples: self.samples.clone(),
+                frames: self.frames,
+                feature_dim: self.feature_dim,
+            };
+        }
+        let samples = self
+            .samples
+            .iter()
+            .map(|s| PoseSample {
+                features: handshape_sequence(&s.features, self.frames, mode),
+                label: s.label.clone(),
+            })
+            .collect();
+        PoseTrainingData {
+            samples,
+            frames: self.frames,
+            feature_dim: mode.feature_dim(),
         }
     }
 

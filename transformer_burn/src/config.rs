@@ -28,6 +28,7 @@ pub const POSE_LEARNING_RATE: f64 = 0.0005; // 認識モデルの学習率
 // 現行構成(約48万パラメータ)はデータ量に対して大きすぎるのではという仮説がある。
 // これを安く検証するため、認識モデルだけ寸法を実行時に選べるようにする
 // (CLI フラグ未指定なら下の Default = 現行 const と完全に同じ値になる)。
+use crate::handshape_features::InputFeatures;
 use serde::{Deserialize, Serialize};
 
 /// 認識モデル(PoseEncoder + RecognitionDecoder)の寸法設定。
@@ -35,6 +36,17 @@ use serde::{Deserialize, Serialize};
 /// 保存時に `model_config.json` として書き出すことで読み込み時にも同じ構造を復元できる
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct RecognitionModelConfig {
+    /// エンコーダに入る 1 フレームの次元。既定は生の手ポーズ 126 次元だが、
+    /// `--input-features handshape` では手形記述子の次元になる。
+    /// `#[serde(default = ...)]` を付けているのは、このフィールドが無い時代に書かれた
+    /// `model_config.json` を読んでも 126 にフォールバックさせるため(後方互換)
+    #[serde(default = "default_input_dim")]
+    pub input_dim: usize,
+    /// 入力特徴量の種類。`input_dim` はここから決まるが、推論時には
+    /// 「pose dict をどう変換してからモデルに渡すか」を知る必要があるため別に保存する。
+    /// 旧 `model_config.json` には無いので `#[serde(default)]`(= Raw)
+    #[serde(default)]
+    pub input_features: InputFeatures,
     pub d_model: usize,
     pub num_heads: usize,
     pub d_head: usize, // d_model / num_heads を保存時点で確定させておく(毎回割り算しない)
@@ -42,11 +54,18 @@ pub struct RecognitionModelConfig {
     pub num_layers: usize,
 }
 
+/// `input_dim` を持たない古い `model_config.json` を読んだときの既定値
+fn default_input_dim() -> usize {
+    POSE_FEATURE_DIM
+}
+
 impl Default for RecognitionModelConfig {
     /// 「何も指定しない」ときの値。現行 const と完全に一致させることで、
     /// サイズ系フラグ未指定時の挙動を変えない
     fn default() -> Self {
         Self {
+            input_dim: POSE_FEATURE_DIM,
+            input_features: InputFeatures::Raw,
             d_model: D_MODEL,
             num_heads: NUM_HEADS,
             d_head: D_HEAD,
@@ -72,6 +91,8 @@ impl RecognitionModelConfig {
             return None;
         }
         Some(Self {
+            input_dim: POSE_FEATURE_DIM,
+            input_features: InputFeatures::Raw,
             d_model,
             num_heads,
             d_head: d_model / num_heads,
@@ -129,12 +150,29 @@ impl RecognitionModelConfig {
         }
 
         Ok(Self {
+            input_dim: POSE_FEATURE_DIM,
+            input_features: InputFeatures::Raw,
             d_model: resolved_d_model,
             num_heads: resolved_num_heads,
             d_head: resolved_d_model / resolved_num_heads,
             d_ff: resolved_d_ff,
             num_layers: resolved_num_layers,
         })
+    }
+
+    /// 入力次元だけを差し替えた設定を返す(種類は変えない)。テストや低レベルな用途向け
+    pub fn with_input_dim(mut self, input_dim: usize) -> Self {
+        self.input_dim = input_dim;
+        self
+    }
+
+    /// 入力特徴量の種類を差し替えた設定を返す。`input_dim` も種類から自動で決まるので、
+    /// 2 つのフィールドが食い違わない。`--input-features` の解決はこの入口を通す。
+    /// 寸法プリセットの解決(`resolve`)とは独立した軸なので builder に分けている
+    pub fn with_input_features(mut self, input_features: InputFeatures) -> Self {
+        self.input_features = input_features;
+        self.input_dim = input_features.feature_dim();
+        self
     }
 }
 
@@ -146,6 +184,7 @@ mod recognition_model_config_tests {
     fn default_matches_current_consts() {
         // 既定経路が現状から変わっていないことの回帰テスト
         let default = RecognitionModelConfig::default();
+        assert_eq!(default.input_dim, POSE_FEATURE_DIM);
         assert_eq!(default.d_model, D_MODEL);
         assert_eq!(default.num_heads, NUM_HEADS);
         assert_eq!(default.d_head, D_HEAD);
@@ -250,5 +289,65 @@ mod recognition_model_config_tests {
     #[test]
     fn resolve_rejects_unknown_preset() {
         assert!(RecognitionModelConfig::resolve(Some("giant"), None, None, None, None).is_err());
+    }
+
+    #[test]
+    fn resolve_keeps_raw_input_dim() {
+        // 入力次元はサイズ系フラグとは独立の軸。resolve は必ず生ポーズの 126 を返す
+        for preset in ["base", "small", "tiny", "micro"] {
+            let resolved =
+                RecognitionModelConfig::resolve(Some(preset), None, None, None, None).unwrap();
+            assert_eq!(resolved.input_dim, POSE_FEATURE_DIM);
+        }
+    }
+
+    #[test]
+    fn with_input_features_sets_dim_consistently() {
+        let base = RecognitionModelConfig::default();
+        for mode in [
+            InputFeatures::Raw,
+            InputFeatures::Handshape,
+            InputFeatures::HandshapeMean,
+        ] {
+            let changed = base.with_input_features(mode);
+            assert_eq!(changed.input_features, mode);
+            assert_eq!(changed.input_dim, mode.feature_dim());
+            // 寸法系は一切変わらない
+            assert_eq!(changed.d_model, base.d_model);
+            assert_eq!(changed.num_layers, base.num_layers);
+        }
+    }
+
+    #[test]
+    fn with_input_dim_changes_only_input_dim() {
+        let base = RecognitionModelConfig::default();
+        let changed = base.with_input_dim(66);
+        assert_eq!(changed.input_dim, 66);
+        assert_eq!(changed.d_model, base.d_model);
+        assert_eq!(changed.num_heads, base.num_heads);
+        assert_eq!(changed.d_head, base.d_head);
+        assert_eq!(changed.d_ff, base.d_ff);
+        assert_eq!(changed.num_layers, base.num_layers);
+    }
+
+    // [TEST向き] 後方互換: input_dim を持たない旧 model_config.json を読んでも 126 に戻ること
+    #[test]
+    fn deserialize_without_input_dim_falls_back_to_pose_dim() {
+        let legacy = r#"{"d_model":64,"num_heads":2,"d_head":32,"d_ff":256,"num_layers":4}"#;
+        let parsed: RecognitionModelConfig = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.input_dim, POSE_FEATURE_DIM);
+        assert_eq!(parsed.input_features, InputFeatures::Raw);
+        assert_eq!(parsed, RecognitionModelConfig::default());
+    }
+
+    // [TEST向き] input_dim を書き出したファイルは往復して同じ値に戻ること
+    #[test]
+    fn serialize_roundtrip_preserves_input_dim() {
+        let config = RecognitionModelConfig::preset("tiny")
+            .unwrap()
+            .with_input_features(InputFeatures::Handshape);
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: RecognitionModelConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, config);
     }
 }

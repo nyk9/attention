@@ -2938,6 +2938,131 @@ mod tests {
         eprintln!("sequence 全 {} タグ一致。新 dict: {}", n, new_dict_path.display());
     }
 
+    /// Palm 検出の ROI を変えて「手がどれだけ取れるか」を実データで測る計測ハーネス。
+    /// 学習も評価もせず、検出結果を TSV に落とすだけ。分析は python 側で行う。
+    ///
+    /// 環境変数:
+    ///   PALM_ROI_MODE   full(既定) | center | sign | tiles3
+    ///   PALM_ROI_STRIDE 何本おきに測るか(既定 5。1 なら全 153 本)
+    ///   PALM_ROI_OUT    出力先ディレクトリ(既定 /tmp/palm_roi_measure)
+    ///
+    /// ffmpeg + Palm/Hand ONNX + raw_jsl 実データに依存するため #[ignore]。
+    /// 手動実行: `PALM_ROI_MODE=full cargo test measure_palm_roi --release -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn measure_palm_roi() {
+        let data_dir = Path::new(RAW_JSL_DIR);
+        for p in [data_dir, Path::new(PALM_MODEL), Path::new(HAND_MODEL)] {
+            if !p.exists() {
+                eprintln!("skip: fixture not found: {}", p.display());
+                return;
+            }
+        }
+        let mode_name = std::env::var("PALM_ROI_MODE").unwrap_or_else(|_| "full".into());
+        let mode = match mode_name.as_str() {
+            "full" => PalmRoiMode::FullFrame,
+            "center" => PalmRoiMode::CenterSquare,
+            "sign" => SIGN_ROI,
+            "tiles3" => PalmRoiMode::Tiles { count: 3 },
+            other => panic!("unknown PALM_ROI_MODE: {}", other),
+        };
+        let stride: usize = std::env::var("PALM_ROI_STRIDE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5);
+        let out_dir = PathBuf::from(
+            std::env::var("PALM_ROI_OUT").unwrap_or_else(|_| "/tmp/palm_roi_measure".into()),
+        );
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        // ok テイクをフラット構成へ並べ直す(build-dict と同じ入力形)
+        let export_dir = out_dir.join("takes");
+        if !export_dir.exists() {
+            let n = progress::run_export(data_dir, &export_dir, None).unwrap();
+            eprintln!("exported {} takes to {}", n, export_dir.display());
+        }
+        let mut videos = list_videos(&export_dir);
+        videos.sort();
+        let total = videos.len();
+        let videos: Vec<PathBuf> = videos.into_iter().step_by(stride.max(1)).collect();
+        eprintln!(
+            "mode={} ({}) / {} of {} takes",
+            mode_name,
+            mode.label(),
+            videos.len(),
+            total
+        );
+
+        let palm_anchors = load_palm_anchors();
+        let mut palm = Session::builder().unwrap().commit_from_file(PALM_MODEL).unwrap();
+        let mut hand = Session::builder().unwrap().commit_from_file(HAND_MODEL).unwrap();
+
+        let mut hands_tsv = String::from(
+            "video\tframe\tpalm_score\tpalm_x1\tpalm_y1\tpalm_x2\tpalm_y2\t\
+             hand_conf\thandedness\tlm_minx\tlm_miny\tlm_maxx\tlm_maxy\n",
+        );
+        let mut frames_tsv =
+            String::from("video\tframe\tn_palms\tn_hands\tleft\tright\twidth\theight\n");
+
+        let t0 = std::time::Instant::now();
+        for (vi, video) in videos.iter().enumerate() {
+            let name = video.file_stem().unwrap().to_string_lossy().to_string();
+            let info = probe_video(video).unwrap();
+            let (fw, fh) = (info.width as f32, info.height as f32);
+            // build-dict と同じ 10 フレームを選ぶ
+            let indices = downsample_indices(info.frame_count as usize, 10);
+            let wanted: std::collections::BTreeSet<usize> = indices.iter().copied().collect();
+            extract_frames_filtered(
+                video,
+                info.width,
+                info.height,
+                |i| wanted.contains(&i),
+                |idx, frame| {
+                    let palms = run_palm_detection_mode(&mut palm, &frame, &palm_anchors, mode)?;
+                    let mut hands: Vec<Hand> = Vec::new();
+                    for p in &palms {
+                        if let Some(h) = run_hand_landmark(&mut hand, &frame, p)? {
+                            hands.push(h);
+                        }
+                    }
+                    for (p, h) in palms.iter().zip(hands.iter()) {
+                        let xs: Vec<f32> = h.landmarks.iter().map(|l| l.x).collect();
+                        let ys: Vec<f32> = h.landmarks.iter().map(|l| l.y).collect();
+                        let mn = |v: &[f32]| v.iter().cloned().fold(f32::INFINITY, f32::min);
+                        let mx = |v: &[f32]| v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                        hands_tsv.push_str(&format!(
+                            "{}\t{}\t{:.4}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.4}\t{:.4}\t\
+                             {:.1}\t{:.1}\t{:.1}\t{:.1}\n",
+                            name, idx, p.score, p.x1, p.y1, p.x2, p.y2, h.confidence,
+                            h.handedness, mn(&xs), mn(&ys), mx(&xs), mx(&ys)
+                        ));
+                    }
+                    let (_, l, r) = frame_hand_feature(&hands, fw, fh);
+                    frames_tsv.push_str(&format!(
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                        name, idx, palms.len(), hands.len(), l as u8, r as u8,
+                        info.width, info.height
+                    ));
+                    Ok(())
+                },
+            )
+            .unwrap();
+            if vi % 10 == 0 {
+                eprintln!("  [{}/{}] {} ({:?})", vi + 1, videos.len(), name, t0.elapsed());
+            }
+        }
+        let hands_path = out_dir.join(format!("hands_{}.tsv", mode_name));
+        let frames_path = out_dir.join(format!("frames_{}.tsv", mode_name));
+        std::fs::write(&hands_path, hands_tsv).unwrap();
+        std::fs::write(&frames_path, frames_tsv).unwrap();
+        eprintln!(
+            "wrote {} / {} ({:?} total)",
+            hands_path.display(),
+            frames_path.display(),
+            t0.elapsed()
+        );
+    }
+
     #[test]
     fn parse_frame_rate_cases() {
         assert!((parse_frame_rate("30/1").unwrap() - 30.0).abs() < 1e-9);

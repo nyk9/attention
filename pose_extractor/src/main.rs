@@ -29,6 +29,16 @@ const HAND_CROP_ENLARGE: f32 = 3.0;
 const HAND_CROP_SHIFT_Y: f32 = -0.4;
 const HAND_CONF_THRESHOLD: f32 = 0.5;
 
+/// 撮影データ(raw_jsl 153テイク・1620x1080 固定カメラ)の手の分布実測から決めた
+/// サイン領域。値の根拠は docs/experiments/palm-detection-roi.md を参照。
+/// 相対指定なので解像度が変わっても比率で追従する。
+const SIGN_ROI: PalmRoiMode = PalmRoiMode::Relative {
+    x: 0.0,
+    y: 0.0,
+    w: 1.0,
+    h: 1.0,
+};
+
 // build-dict: 1 フレームの特徴量 = 左手 21 点 + 右手 21 点、各 [x, y, z]
 const HAND_POINTS: usize = 21;
 const DICT_FEATURE_DIM: usize = HAND_POINTS * 3 * 2; // = 126
@@ -75,6 +85,8 @@ struct RunConfig {
     overlay_count: usize,
     /// オーバーレイを全フレームの mp4 動画として書き出すか(false なら従来の PNG 数枚)
     overlay_video: bool,
+    /// Palm 検出に渡す領域。既定 `FullFrame` は従来と同一結果
+    palm_roi: PalmRoiMode,
     max_frames: Option<usize>,
     output: Option<PathBuf>,
 }
@@ -176,6 +188,8 @@ struct PoseDictMeta {
     normalization: String,
     /// coverage の算出基準の説明(旧版は全フレーム基準、現在は選択フレーム基準)
     coverage_basis: String,
+    /// Palm 検出に渡した領域(既定 "full-frame" が従来の挙動)。旧 dict には無い
+    palm_roi: String,
     /// 辞書に含めたタグ数
     tag_count: usize,
 }
@@ -478,6 +492,28 @@ fn select_video(theme: &ColorfulTheme) -> Result<PathBuf> {
     }
 }
 
+/// Palm 検出に渡す領域を選ばせる。**先頭(既定)がフレーム全体 = 従来の挙動**。
+fn select_palm_roi(theme: &ColorfulTheme) -> Result<PalmRoiMode> {
+    let modes = [
+        PalmRoiMode::FullFrame,
+        PalmRoiMode::CenterSquare,
+        SIGN_ROI,
+        PalmRoiMode::Tiles { count: 3 },
+    ];
+    let items = [
+        "フレーム全体(従来・既定)",
+        "中央正方クロップ(改善案 A)",
+        "実測サイン領域(手の分布から決めた矩形)",
+        "正方タイル 3 枚(高再現率・低速)",
+    ];
+    let idx = Select::with_theme(theme)
+        .with_prompt("Palm 検出に渡す領域")
+        .items(&items)
+        .default(0)
+        .interact()?;
+    Ok(modes[idx])
+}
+
 /// 認識モデルのディレクトリ(model.bin を含む)を一覧から選ばせる(無ければパス直接入力)
 fn select_model_dir(theme: &ColorfulTheme) -> Result<PathBuf> {
     let dirs = list_model_dirs(Path::new(REC_MODEL_DIR));
@@ -654,7 +690,7 @@ fn run_extraction(cfg: RunConfig) -> Result<()> {
         let mut palm_frame_local: Option<PalmFrame> = None;
         let mut hand_frame_local: Option<HandFrame> = None;
         if let Some(palm_s) = palm_session.as_mut() {
-            let palms = run_palm_detection(palm_s, &frame, &palm_anchors)?;
+            let palms = run_palm_detection_mode(palm_s, &frame, &palm_anchors, cfg.palm_roi)?;
             let mut hands_this_frame: Vec<Hand> = Vec::new();
             if let Some(hand_s) = hand_session.as_mut() {
                 for palm in &palms {
@@ -801,6 +837,16 @@ fn run_extraction(cfg: RunConfig) -> Result<()> {
 /// 各動画のハンドランドマークを `frames` フレームにダウンサンプルして JSON に書き出す。
 // [評価/スモーク] ディレクトリ統合処理。中の純粋部品(downsample/frame_hand_feature)を個別にテストする方が筋が良い
 fn build_dict(input_dir: &Path, output: &Path, frames: usize) -> Result<()> {
+    build_dict_mode(input_dir, output, frames, PalmRoiMode::FullFrame)
+}
+
+/// `roi_mode` で Palm 検出に渡す領域を切り替えられる版。既定 (`FullFrame`) は従来と同一結果。
+fn build_dict_mode(
+    input_dir: &Path,
+    output: &Path,
+    frames: usize,
+    roi_mode: PalmRoiMode,
+) -> Result<()> {
     if frames == 0 {
         anyhow::bail!("--frames must be >= 1");
     }
@@ -832,12 +878,14 @@ fn build_dict(input_dir: &Path, output: &Path, frames: usize) -> Result<()> {
             .unwrap_or_else(|| "unknown".into());
         eprintln!("\n=== {} ({}) ===", tag, video.display());
 
-        let entry = extract_tag_features(
+        let entry = extract_tag_features_impl(
             video,
             &mut palm_session,
             &mut hand_session,
             &palm_anchors,
             frames,
+            false,
+            roi_mode,
         )?;
         eprintln!(
             "  left_hand_coverage={:.0}% right_hand_coverage={:.0}%",
@@ -858,6 +906,7 @@ fn build_dict(input_dir: &Path, output: &Path, frames: usize) -> Result<()> {
                 .into(),
             normalization: "x/=width, y/=height, z/=width (z is relative depth)".into(),
             coverage_basis: "selected frames only (the frames that became `sequence`)".into(),
+            palm_roi: roi_mode.label(),
             tag_count: tags.len(),
         },
         tags,
@@ -892,10 +941,19 @@ fn extract_tag_features(
     palm_anchors: &[[f32; 2]],
     target: usize,
 ) -> Result<TagEntry> {
-    extract_tag_features_impl(video, palm_session, hand_session, palm_anchors, target, false)
+    extract_tag_features_impl(
+        video,
+        palm_session,
+        hand_session,
+        palm_anchors,
+        target,
+        false,
+        PalmRoiMode::FullFrame,
+    )
 }
 
 /// `force_full_scan` は等価性テスト用: nb_frames が取れても全フレーム走査(従来経路)を強制する。
+/// `roi_mode` は Palm 検出に渡す領域(既定 `FullFrame` = 従来と同一)。
 fn extract_tag_features_impl(
     video: &PathBuf,
     palm_session: &mut Session,
@@ -903,6 +961,7 @@ fn extract_tag_features_impl(
     palm_anchors: &[[f32; 2]],
     target: usize,
     force_full_scan: bool,
+    roi_mode: PalmRoiMode,
 ) -> Result<TagEntry> {
     if target == 0 {
         anyhow::bail!("target frames must be >= 1");
@@ -935,6 +994,7 @@ fn extract_tag_features_impl(
                             palm_anchors,
                             width,
                             height,
+                            roi_mode,
                         )?,
                     );
                     Ok(())
@@ -964,6 +1024,7 @@ fn extract_tag_features_impl(
                     palm_anchors,
                     width,
                     height,
+                    roi_mode,
                 )?);
                 Ok(())
             })?;
@@ -1000,8 +1061,9 @@ fn infer_frame_feature(
     palm_anchors: &[[f32; 2]],
     width: f32,
     height: f32,
+    roi_mode: PalmRoiMode,
 ) -> Result<([f32; DICT_FEATURE_DIM], bool, bool)> {
-    let palms = run_palm_detection(palm_session, frame, palm_anchors)?;
+    let palms = run_palm_detection_mode(palm_session, frame, palm_anchors, roi_mode)?;
     let mut hands: Vec<Hand> = Vec::new();
     for palm in &palms {
         if let Some(h) = run_hand_landmark(hand_session, frame, palm)? {
@@ -1192,6 +1254,13 @@ fn run_wizard() -> Result<Vec<RunConfig>> {
     let want_limit = selected.contains(&2);
     let want_hands = selected.contains(&3);
 
+    // Palm 検出に渡す領域。既定(先頭)はフレーム全体で、選ばなければ従来と同じ結果になる。
+    let palm_roi = if want_hands {
+        select_palm_roi(&theme)?
+    } else {
+        PalmRoiMode::FullFrame
+    };
+
     let (overlay_root, overlay_count, overlay_video) = if want_overlay {
         let prompt = if batch_mode {
             "オーバーレイ保存先(動画ごとにサブディレクトリを作成)"
@@ -1297,6 +1366,7 @@ fn run_wizard() -> Result<Vec<RunConfig>> {
                 save_overlay,
                 overlay_count,
                 overlay_video,
+                palm_roi,
                 max_frames,
                 output,
             }
@@ -1370,26 +1440,177 @@ fn load_palm_anchors() -> Vec<[f32; 2]> {
         .collect()
 }
 
+/// Palm 検出に渡す画像領域(元フレーム座標のピクセル矩形)。
+/// 従来挙動はフレーム全体を 1 枚の ROI として渡すことに相当する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Roi {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+}
+
+impl Roi {
+    fn full(w: u32, h: u32) -> Self {
+        Roi { x: 0, y: 0, w, h }
+    }
+    fn is_full(&self, w: u32, h: u32) -> bool {
+        self.x == 0 && self.y == 0 && self.w == w && self.h == h
+    }
+}
+
+/// Palm 検出前に元フレームのどこを切り出すか。**既定は `FullFrame`(従来と同一結果)**。
+/// フレーム全体を 192x192 に押し込むと 1620x1080 では入力の 33% が黒帯になり、
+/// 原寸 200px の手が検出器側で約 24px にまで縮む。その影響を測るための切り替え軸。
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PalmRoiMode {
+    /// 従来どおりフレーム全体(既定)
+    FullFrame,
+    /// 中央正方クロップ(CLAUDE.md の改善案 A 相当)
+    CenterSquare,
+    /// 元フレームに対する相対矩形(いずれも 0..1)。実測から決めた領域を指定する
+    Relative { x: f32, y: f32, w: f32, h: f32 },
+    /// 長辺方向に重なりを持たせた正方タイル分割(高再現率。測定の基準用)
+    Tiles { count: usize },
+}
+
+impl PalmRoiMode {
+    fn label(&self) -> String {
+        match self {
+            PalmRoiMode::FullFrame => "full-frame".into(),
+            PalmRoiMode::CenterSquare => "center-square".into(),
+            PalmRoiMode::Relative { x, y, w, h } => {
+                format!("relative({:.3},{:.3},{:.3},{:.3})", x, y, w, h)
+            }
+            PalmRoiMode::Tiles { count } => format!("tiles({})", count),
+        }
+    }
+}
+
+/// ROI モードを実フレームサイズのピクセル矩形へ展開する。
+/// 返る矩形は必ずフレーム内に収まり、幅・高さは 1 以上。
+// [TEST向き] 純粋な幾何。FullFrame が全面と一致すること、タイルが全面を覆うこと、
+// 相対指定のクランプ(枠外・ゼロサイズ)を固定する
+fn palm_rois(mode: PalmRoiMode, w: u32, h: u32) -> Vec<Roi> {
+    let clamp = |x: i64, y: i64, rw: i64, rh: i64| -> Roi {
+        let x = x.clamp(0, (w as i64 - 1).max(0));
+        let y = y.clamp(0, (h as i64 - 1).max(0));
+        let rw = rw.clamp(1, w as i64 - x);
+        let rh = rh.clamp(1, h as i64 - y);
+        Roi {
+            x: x as u32,
+            y: y as u32,
+            w: rw as u32,
+            h: rh as u32,
+        }
+    };
+    match mode {
+        PalmRoiMode::FullFrame => vec![Roi::full(w, h)],
+        PalmRoiMode::CenterSquare => {
+            let (cx, cy, side) = crop_square_center(w, h);
+            vec![Roi {
+                x: cx,
+                y: cy,
+                w: side,
+                h: side,
+            }]
+        }
+        PalmRoiMode::Relative {
+            x,
+            y,
+            w: rw,
+            h: rh,
+        } => vec![clamp(
+            (x * w as f32).round() as i64,
+            (y * h as f32).round() as i64,
+            (rw * w as f32).round() as i64,
+            (rh * h as f32).round() as i64,
+        )],
+        PalmRoiMode::Tiles { count } => {
+            let count = count.max(1);
+            let side = w.min(h);
+            if count == 1 || w == h {
+                let (cx, cy, s) = crop_square_center(w, h);
+                return vec![Roi {
+                    x: cx,
+                    y: cy,
+                    w: s,
+                    h: s,
+                }];
+            }
+            // 長辺方向に等間隔で count 枚。両端がフレーム端に接するので必ず全面を覆う。
+            let mut out = Vec::with_capacity(count);
+            if w >= h {
+                let span = (w - side) as f32;
+                for i in 0..count {
+                    let t = i as f32 / (count - 1) as f32;
+                    out.push(clamp((span * t).round() as i64, 0, side as i64, side as i64));
+                }
+            } else {
+                let span = (h - side) as f32;
+                for i in 0..count {
+                    let t = i as f32 / (count - 1) as f32;
+                    out.push(clamp(0, (span * t).round() as i64, side as i64, side as i64));
+                }
+            }
+            out
+        }
+    }
+}
+
 struct PalmPreprocess {
     shape: Vec<usize>,
     data: Vec<f32>,
     pad_left_orig: f32,
     pad_top_orig: f32,
     scale: f32,
+    /// ROI の左上オフセット(元フレーム座標)。FullFrame なら (0, 0)。
+    offset_x: f32,
+    offset_y: f32,
+}
+
+/// Palm 検出出力の正規化座標([0,1] 相当、アンカー加算後)を元フレーム座標へ戻す。
+/// ROI クロップのスケールとオフセットの逆変換はここ 1 か所に閉じる。
+// [TEST向き] 純粋な逆変換。ROI の四隅・中心が元フレームの正しい位置へ戻るかで往復を固定
+#[inline]
+fn palm_norm_to_orig(nx: f32, ny: f32, pre: &PalmPreprocess) -> (f32, f32) {
+    (
+        nx * pre.scale - pre.pad_left_orig + pre.offset_x,
+        ny * pre.scale - pre.pad_top_orig + pre.offset_y,
+    )
 }
 
 // [TEST向き] 決定論的なレターボックス変換。出力shapeとscale/pad値を既知入力で固定
+#[cfg(test)]
 fn preprocess_for_palm(frame: &Array3<u8>) -> Result<PalmPreprocess> {
+    let h = frame.shape()[0] as u32;
+    let w = frame.shape()[1] as u32;
+    preprocess_for_palm_roi(frame, Roi::full(w, h))
+}
+
+/// ROI を切り出してから 192x192 へレターボックスする。
+/// `roi` がフレーム全体のときはクロップを行わず、従来の `preprocess_for_palm` と
+/// ビット単位で同じテンソルを返す(既定挙動の非変更を担保)。
+fn preprocess_for_palm_roi(frame: &Array3<u8>, roi: Roi) -> Result<PalmPreprocess> {
     let h = frame.shape()[0] as u32;
     let w = frame.shape()[1] as u32;
     let raw: Vec<u8> = frame.iter().copied().collect();
     let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_raw(w, h, raw)
         .context("failed to construct ImageBuffer for palm preprocess")?;
+    // ROI が全面ならクロップのコピーを省く(結果は同一)
+    let cropped;
+    let src: &ImageBuffer<Rgb<u8>, Vec<u8>> = if roi.is_full(w, h) {
+        &img
+    } else {
+        cropped = image::imageops::crop_imm(&img, roi.x, roi.y, roi.w, roi.h).to_image();
+        &cropped
+    };
+    let (w, h) = (src.width(), src.height());
     let size = PALM_INPUT_SIZE as f32;
     let ratio = (size / w as f32).min(size / h as f32);
     let new_w = ((w as f32) * ratio).round() as u32;
     let new_h = ((h as f32) * ratio).round() as u32;
-    let resized = image::imageops::resize(&img, new_w, new_h, FilterType::Triangle);
+    let resized = image::imageops::resize(src, new_w, new_h, FilterType::Triangle);
     let pad_w = PALM_INPUT_SIZE.saturating_sub(new_w);
     let pad_h = PALM_INPUT_SIZE.saturating_sub(new_h);
     let left = (pad_w / 2) as i64;
@@ -1418,6 +1639,8 @@ fn preprocess_for_palm(frame: &Array3<u8>) -> Result<PalmPreprocess> {
         pad_left_orig: left as f32 / ratio,
         pad_top_orig: top as f32 / ratio,
         scale: w.max(h) as f32,
+        offset_x: roi.x as f32,
+        offset_y: roi.y as f32,
     })
 }
 
@@ -1427,8 +1650,38 @@ fn run_palm_detection(
     frame: &Array3<u8>,
     anchors: &[[f32; 2]],
 ) -> Result<Vec<PalmBox>> {
-    let pre = preprocess_for_palm(frame)?;
-    let input_value = Value::from_array((pre.shape, pre.data))?;
+    run_palm_detection_mode(session, frame, anchors, PalmRoiMode::FullFrame)
+}
+
+/// ROI モードを指定して Palm 検出を行う。複数 ROI(タイル)の場合は各 ROI の候補を
+/// 元フレーム座標へ戻したうえで **まとめて 1 回だけ NMS** をかけるので、
+/// タイル境界にまたがる重複検出も 1 つに統合される。
+/// ROI が 1 枚(FullFrame / CenterSquare / Relative)なら従来と同じ処理順。
+fn run_palm_detection_mode(
+    session: &mut Session,
+    frame: &Array3<u8>,
+    anchors: &[[f32; 2]],
+    mode: PalmRoiMode,
+) -> Result<Vec<PalmBox>> {
+    let h = frame.shape()[0] as u32;
+    let w = frame.shape()[1] as u32;
+    let rois = palm_rois(mode, w, h);
+    let mut candidates: Vec<(f32, [f32; 4], Vec<[f32; 2]>)> = Vec::new();
+    for roi in rois {
+        candidates.extend(palm_candidates(session, frame, anchors, roi)?);
+    }
+    Ok(nms_palm_candidates(candidates))
+}
+
+/// 1 枚の ROI について、閾値を超えた候補を元フレーム座標で返す(NMS 前)。
+fn palm_candidates(
+    session: &mut Session,
+    frame: &Array3<u8>,
+    anchors: &[[f32; 2]],
+    roi: Roi,
+) -> Result<Vec<(f32, [f32; 4], Vec<[f32; 2]>)>> {
+    let pre = preprocess_for_palm_roi(frame, roi)?;
+    let input_value = Value::from_array((pre.shape.clone(), pre.data.clone()))?;
     let outputs = session.run(ort::inputs!["input_1" => input_value])?;
     let (_, box_data) = outputs["Identity"].try_extract_tensor::<f32>()?;
     let (_, score_data) = outputs["Identity_1"].try_extract_tensor::<f32>()?;
@@ -1457,22 +1710,23 @@ fn run_palm_detection(
         let cy_d = box_data[off + 1] / input_size;
         let w_d = box_data[off + 2] / input_size;
         let h_d = box_data[off + 3] / input_size;
-        let x1 = (cx_d - w_d / 2.0 + ax) * pre.scale - pre.pad_left_orig;
-        let y1 = (cy_d - h_d / 2.0 + ay) * pre.scale - pre.pad_top_orig;
-        let x2 = (cx_d + w_d / 2.0 + ax) * pre.scale - pre.pad_left_orig;
-        let y2 = (cy_d + h_d / 2.0 + ay) * pre.scale - pre.pad_top_orig;
+        let (x1, y1) = palm_norm_to_orig(cx_d - w_d / 2.0 + ax, cy_d - h_d / 2.0 + ay, &pre);
+        let (x2, y2) = palm_norm_to_orig(cx_d + w_d / 2.0 + ax, cy_d + h_d / 2.0 + ay, &pre);
         let mut kps: Vec<[f32; 2]> = Vec::with_capacity(7);
         for k in 0..7 {
             let kx = box_data[off + 4 + k * 2] / input_size;
             let ky = box_data[off + 4 + k * 2 + 1] / input_size;
-            kps.push([
-                (kx + ax) * pre.scale - pre.pad_left_orig,
-                (ky + ay) * pre.scale - pre.pad_top_orig,
-            ]);
+            let (px, py) = palm_norm_to_orig(kx + ax, ky + ay, &pre);
+            kps.push([px, py]);
         }
         candidates.push((s, [x1, y1, x2, y2], kps));
     }
 
+    Ok(candidates)
+}
+
+/// score 降順に並べて IoU で重複を落とす(従来の run_palm_detection 内と同じ規則)。
+fn nms_palm_candidates(mut candidates: Vec<(f32, [f32; 4], Vec<[f32; 2]>)>) -> Vec<PalmBox> {
     candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut keep_mask: Vec<bool> = vec![true; candidates.len()];
@@ -1504,7 +1758,7 @@ fn run_palm_detection(
         })
         .collect();
 
-    Ok(results)
+    results
 }
 
 // [TEST向き] 純粋な数式。完全重なり=1/非重なり=0/半分重なり を手計算で固定(定番のテスト対象)
@@ -2269,6 +2523,7 @@ mod tests {
             save_overlay: Some(dir.clone()),
             overlay_count: 0,
             overlay_video: true,
+            palm_roi: PalmRoiMode::FullFrame,
             max_frames: Some(8), // 速度のため先頭 8 フレームのみ
             output: Some(dir.join("out.tsv")),
         };
@@ -2282,6 +2537,147 @@ mod tests {
             "overlay.mp4 が空"
         );
         assert!(dir.join("frame_00000.png").exists(), "先頭フレーム PNG が無い");
+    }
+
+    // === Palm ROI(クロップ)の幾何とその逆変換 ===
+
+    #[test]
+    fn palm_rois_geometry() {
+        // FullFrame は必ずフレーム全体 1 枚
+        let r = palm_rois(PalmRoiMode::FullFrame, 1620, 1080);
+        assert_eq!(r, vec![Roi { x: 0, y: 0, w: 1620, h: 1080 }]);
+        assert!(r[0].is_full(1620, 1080));
+
+        // CenterSquare は短辺の正方が中央に来る(1620x1080 → 270,0,1080,1080)
+        let r = palm_rois(PalmRoiMode::CenterSquare, 1620, 1080);
+        assert_eq!(r, vec![Roi { x: 270, y: 0, w: 1080, h: 1080 }]);
+
+        // タイルは両端がフレーム端に接し、隙間なく全面を覆う
+        let r = palm_rois(PalmRoiMode::Tiles { count: 3 }, 1620, 1080);
+        assert_eq!(r.len(), 3);
+        assert_eq!(r[0].x, 0);
+        assert_eq!(r[2].x + r[2].w, 1620);
+        for pair in r.windows(2) {
+            assert!(
+                pair[1].x <= pair[0].x + pair[0].w,
+                "タイル間に隙間: {:?}",
+                pair
+            );
+        }
+        // 縦長フレームでは縦方向に並ぶ
+        let r = palm_rois(PalmRoiMode::Tiles { count: 3 }, 1080, 1620);
+        assert_eq!(r[0].y, 0);
+        assert_eq!(r[2].y + r[2].h, 1620);
+
+        // 相対指定はフレーム内にクランプされ、幅・高さは 1 以上を保つ
+        let r = palm_rois(
+            PalmRoiMode::Relative { x: 0.5, y: 0.5, w: 5.0, h: 5.0 },
+            1620,
+            1080,
+        );
+        assert_eq!(r, vec![Roi { x: 810, y: 540, w: 810, h: 540 }]);
+        let r = palm_rois(
+            PalmRoiMode::Relative { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
+            1620,
+            1080,
+        );
+        assert_eq!(r[0].w, 1);
+        assert_eq!(r[0].h, 1);
+    }
+
+    #[test]
+    fn palm_full_frame_preprocess_is_unchanged() {
+        // 既定(FullFrame)の scale / pad / offset が従来式のままであること。
+        // 1620x1080 では ratio = 192/1620、上下に (192-128)/2 = 32px の黒帯が入る。
+        let frame = Array3::<u8>::zeros((1080, 1620, 3));
+        let pre = preprocess_for_palm(&frame).unwrap();
+        assert_eq!(pre.shape, vec![1, 192, 192, 3]);
+        assert_eq!(pre.offset_x, 0.0);
+        assert_eq!(pre.offset_y, 0.0);
+        assert_eq!(pre.scale, 1620.0);
+        assert_eq!(pre.pad_left_orig, 0.0);
+        let ratio = 192.0f32 / 1620.0;
+        assert!((pre.pad_top_orig - 32.0 / ratio).abs() < 1e-3);
+        // 全面 ROI 指定は引数なし版と完全一致(クロップのコピー有無で結果が変わらない)
+        let via_roi = preprocess_for_palm_roi(&frame, Roi::full(1620, 1080)).unwrap();
+        assert_eq!(pre.data, via_roi.data);
+        assert_eq!(pre.scale, via_roi.scale);
+    }
+
+    #[test]
+    fn palm_norm_to_orig_maps_roi_corners_back() {
+        // ROI の四隅・中心が元フレームの正しい位置へ戻ること。
+        // 検出座標は「レターボックス後 192x192 を [0,1] に正規化した値」なので、
+        // ROI 内容が占める区間だけを逆算に使う。
+        let frame = Array3::<u8>::zeros((1080, 1620, 3));
+        let roi = Roi { x: 400, y: 200, w: 600, h: 400 };
+        let pre = preprocess_for_palm_roi(&frame, roi).unwrap();
+        // 横長 ROI なので幅いっぱい(nx: 0→1)が ROI の左右端に対応
+        let (x, y) = palm_norm_to_orig(0.0, 0.0, &pre);
+        assert!((x - roi.x as f32).abs() < 1.0, "左端 x={}", x);
+        // 上端は黒帯の分だけ内側 → ny = pad_top / 192
+        let ratio = 192.0f32 / roi.w as f32;
+        let pad_top_px = (192.0 - (roi.h as f32 * ratio).round()) / 2.0;
+        let (_, y_top) = palm_norm_to_orig(0.0, pad_top_px / 192.0, &pre);
+        assert!((y_top - roi.y as f32).abs() < 1.5, "上端 y={}", y_top);
+        let (x_r, _) = palm_norm_to_orig(1.0, 0.0, &pre);
+        assert!(
+            (x_r - (roi.x + roi.w) as f32).abs() < 1.0,
+            "右端 x={}",
+            x_r
+        );
+        let _ = y;
+        // 中心
+        let (cx, cy) = palm_norm_to_orig(0.5, 0.5, &pre);
+        assert!((cx - (roi.x as f32 + roi.w as f32 / 2.0)).abs() < 1.0, "cx={}", cx);
+        assert!((cy - (roi.y as f32 + roi.h as f32 / 2.0)).abs() < 1.5, "cy={}", cy);
+    }
+
+    #[test]
+    fn palm_roi_crop_and_inverse_round_trip() {
+        // クロップとその逆変換の整合を「実際に画素を切り出して」確認する。
+        // 座標式だけ合っていて切り出し位置がずれている、という失敗を検知するのが狙い。
+        let (w, h) = (400usize, 200usize);
+        let mut frame = Array3::<u8>::zeros((h, w, 3));
+        // 元フレームの (300..320, 140..160) に白い正方形を置く(中心 = (310, 150))
+        for y in 140..160 {
+            for x in 300..320 {
+                for c in 0..3 {
+                    frame[[y, x, c]] = 255;
+                }
+            }
+        }
+        let roi = Roi { x: 200, y: 100, w: 200, h: 100 };
+        let pre = preprocess_for_palm_roi(&frame, roi).unwrap();
+
+        // 前処理テンソルの中で明るい画素の重心を求める
+        let size = PALM_INPUT_SIZE as usize;
+        let (mut sx, mut sy, mut wsum) = (0.0f64, 0.0f64, 0.0f64);
+        for py in 0..size {
+            for px in 0..size {
+                let v = pre.data[(py * size + px) * 3] as f64;
+                if v > 0.5 {
+                    sx += px as f64 * v;
+                    sy += py as f64 * v;
+                    wsum += v;
+                }
+            }
+        }
+        assert!(wsum > 0.0, "クロップ後に白い領域が見つからない");
+        let (cx_px, cy_px) = (sx / wsum, sy / wsum);
+
+        // 画素中心を [0,1] へ戻し、逆変換で元フレーム座標へ
+        let (ox, oy) = palm_norm_to_orig(
+            ((cx_px + 0.5) / size as f64) as f32,
+            ((cy_px + 0.5) / size as f64) as f32,
+            &pre,
+        );
+        assert!(
+            (ox - 310.0).abs() < 2.0 && (oy - 150.0).abs() < 2.0,
+            "往復がずれた: got ({:.2}, {:.2}), want (310, 150)",
+            ox,
+            oy
+        );
     }
 
     #[test]
@@ -2461,12 +2857,18 @@ mod tests {
 
         let t = std::time::Instant::now();
         let fast =
-            extract_tag_features_impl(&video, &mut palm, &mut hand, &palm_anchors, 10, false)
+            extract_tag_features_impl(
+                &video, &mut palm, &mut hand, &palm_anchors, 10, false,
+                PalmRoiMode::FullFrame,
+            )
                 .unwrap();
         let fast_elapsed = t.elapsed();
         let t = std::time::Instant::now();
         let full =
-            extract_tag_features_impl(&video, &mut palm, &mut hand, &palm_anchors, 10, true)
+            extract_tag_features_impl(
+                &video, &mut palm, &mut hand, &palm_anchors, 10, true,
+                PalmRoiMode::FullFrame,
+            )
                 .unwrap();
         let full_elapsed = t.elapsed();
         eprintln!(

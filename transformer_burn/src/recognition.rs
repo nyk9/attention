@@ -10,7 +10,7 @@
 //!   覗く「カンニング」を防ぐ。足場の Decoder は None を渡していて
 //!   この防御がない)
 
-use crate::config::{D_HEAD, D_MODEL, NUM_HEADS, NUM_LAYERS, POSE_FEATURE_DIM};
+use crate::config::{RecognitionModelConfig, D_HEAD, D_MODEL, NUM_HEADS, POSE_FEATURE_DIM};
 use crate::model::{CustomCrossAttention, FeedForward, TransformerBlock};
 use crate::tag_vocabulary::TagVocabulary;
 use burn::nn::{Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig};
@@ -61,15 +61,20 @@ pub struct CausalSelfAttention<B: Backend> {
 
 impl<B: Backend> CausalSelfAttention<B> {
     pub fn new(device: &B::Device) -> Self {
+        Self::new_with_dims(D_MODEL, NUM_HEADS, D_HEAD, device)
+    }
+
+    /// 寸法を指定して構築する版。認識モデルのサイズ縮小向けの口
+    pub fn new_with_dims(d_model: usize, num_heads: usize, d_head: usize, device: &B::Device) -> Self {
         let mut w_q = Vec::new();
         let mut w_k = Vec::new();
         let mut w_v = Vec::new();
-        for _ in 0..NUM_HEADS {
-            w_q.push(LinearConfig::new(D_MODEL, D_HEAD).init(device));
-            w_k.push(LinearConfig::new(D_MODEL, D_HEAD).init(device));
-            w_v.push(LinearConfig::new(D_MODEL, D_HEAD).init(device));
+        for _ in 0..num_heads {
+            w_q.push(LinearConfig::new(d_model, d_head).init(device));
+            w_k.push(LinearConfig::new(d_model, d_head).init(device));
+            w_v.push(LinearConfig::new(d_model, d_head).init(device));
         }
-        let w_o = LinearConfig::new(D_MODEL, D_MODEL).init(device);
+        let w_o = LinearConfig::new(d_model, d_model).init(device);
         Self { w_q, w_k, w_v, w_o }
     }
 
@@ -89,12 +94,16 @@ impl<B: Backend> CausalSelfAttention<B> {
             .unsqueeze::<3>(); // [1, seq, seq] バッチ次元へ broadcast
 
         let mut head_outputs = Vec::new();
-        for head_idx in 0..NUM_HEADS {
+        // ヘッド数はフィールド長から。寸法可変化に伴い定数参照をやめた
+        for head_idx in 0..self.w_q.len() {
             let q = self.w_q[head_idx].forward(x.clone());
             let k = self.w_k[head_idx].forward(x.clone());
             let v = self.w_v[head_idx].forward(x.clone());
 
-            let scores = q.matmul(k.transpose()) / (D_HEAD as f32).sqrt();
+            // d_head はテンソルの最後の次元(q.dims()[2])から取る。定数参照だと寸法可変化に耐えないため。
+            // q は matmul に値渡しで消費されるので、先に dims() を読んでおく
+            let d_head = q.dims()[2];
+            let scores = q.matmul(k.transpose()) / (d_head as f32).sqrt();
 
             // 未来(マスクが0)の位置に大きな負の値 → softmax 後ほぼ 0
             let neg = Tensor::ones_like(&scores) * (-1e9);
@@ -122,11 +131,18 @@ pub struct PoseEncoder<B: Backend> {
 }
 
 impl<B: Backend> PoseEncoder<B> {
-    pub fn new(device: &B::Device) -> Self {
-        let input_projection = LinearConfig::new(POSE_FEATURE_DIM, D_MODEL).init(device);
+    /// 設定駆動の構築。認識モデルのサイズ縮小はここで寸法を渡すことで実現する
+    pub fn new(config: &RecognitionModelConfig, device: &B::Device) -> Self {
+        let input_projection = LinearConfig::new(POSE_FEATURE_DIM, config.d_model).init(device);
         let mut encoder_blocks = Vec::new();
-        for _ in 0..NUM_LAYERS {
-            encoder_blocks.push(TransformerBlock::new(device));
+        for _ in 0..config.num_layers {
+            encoder_blocks.push(TransformerBlock::new_with_dims(
+                config.d_model,
+                config.num_heads,
+                config.d_head,
+                config.d_ff,
+                device,
+            ));
         }
         Self {
             input_projection,
@@ -163,23 +179,34 @@ pub struct RecognitionDecoder<B: Backend> {
 }
 
 impl<B: Backend> RecognitionDecoder<B> {
-    pub fn new(vocab_size: usize, device: &B::Device) -> Self {
-        let embedding = EmbeddingConfig::new(vocab_size, D_MODEL).init(device);
+    /// 設定駆動の構築。認識モデルのサイズ縮小はここで寸法を渡すことで実現する
+    pub fn new(vocab_size: usize, config: &RecognitionModelConfig, device: &B::Device) -> Self {
+        let embedding = EmbeddingConfig::new(vocab_size, config.d_model).init(device);
         let mut self_attentions = Vec::new();
         let mut cross_attentions = Vec::new();
         let mut feed_forwards = Vec::new();
         let mut norms1 = Vec::new();
         let mut norms2 = Vec::new();
         let mut norms3 = Vec::new();
-        for _ in 0..NUM_LAYERS {
-            self_attentions.push(CausalSelfAttention::new(device));
-            cross_attentions.push(CustomCrossAttention::new(device));
-            feed_forwards.push(FeedForward::new(device));
-            norms1.push(LayerNormConfig::new(D_MODEL).init(device));
-            norms2.push(LayerNormConfig::new(D_MODEL).init(device));
-            norms3.push(LayerNormConfig::new(D_MODEL).init(device));
+        for _ in 0..config.num_layers {
+            self_attentions.push(CausalSelfAttention::new_with_dims(
+                config.d_model,
+                config.num_heads,
+                config.d_head,
+                device,
+            ));
+            cross_attentions.push(CustomCrossAttention::new_with_dims(
+                config.d_model,
+                config.num_heads,
+                config.d_head,
+                device,
+            ));
+            feed_forwards.push(FeedForward::new_with_dims(config.d_model, config.d_ff, device));
+            norms1.push(LayerNormConfig::new(config.d_model).init(device));
+            norms2.push(LayerNormConfig::new(config.d_model).init(device));
+            norms3.push(LayerNormConfig::new(config.d_model).init(device));
         }
-        let output_projection = LinearConfig::new(D_MODEL, vocab_size).init(device);
+        let output_projection = LinearConfig::new(config.d_model, vocab_size).init(device);
         Self {
             embedding,
             self_attentions,
@@ -201,8 +228,9 @@ impl<B: Backend> RecognitionDecoder<B> {
         let embedded = self.embedding.forward(tgt_tokens);
         let mut x = add_positional_encoding(embedded);
 
-        // Pre-LN: LayerNorm → Attention/FF → 残差接続(DecoderBlock と同じ構成)
-        for i in 0..NUM_LAYERS {
+        // Pre-LN: LayerNorm → Attention/FF → 残差接続(DecoderBlock と同じ構成)。
+        // 層数はフィールド長から。寸法可変化に伴い定数参照をやめた
+        for i in 0..self.self_attentions.len() {
             // 1. 因果マスク付き Self-Attention
             let normalized1 = self.norms1[i].forward(x.clone());
             let self_attn = self.self_attentions[i].forward(normalized1);
@@ -233,10 +261,22 @@ pub struct RecognitionModel<B: Backend> {
 }
 
 impl<B: Backend> RecognitionModel<B> {
+    /// 既定サイズ(現行 const 相当)で構築する薄いラッパ。
+    /// サイズ系 CLI フラグを一切指定しない既存の呼び出し元(pose_extractor 経由の推論など)の
+    /// 挙動を変えないために残している
     pub fn new(vocab_size: usize, device: &B::Device) -> Self {
+        Self::new_with_config(vocab_size, &RecognitionModelConfig::default(), device)
+    }
+
+    /// 設定駆動の構築。認識モデルのサイズ縮小はここが入口になる
+    pub fn new_with_config(
+        vocab_size: usize,
+        config: &RecognitionModelConfig,
+        device: &B::Device,
+    ) -> Self {
         Self {
-            encoder: PoseEncoder::new(device),
-            decoder: RecognitionDecoder::new(vocab_size, device),
+            encoder: PoseEncoder::new(config, device),
+            decoder: RecognitionDecoder::new(vocab_size, config, device),
         }
     }
 
@@ -301,10 +341,13 @@ impl<B: Backend> RecognitionModel<B> {
 // ===== 保存 / 読み込み =====
 
 /// 認識モデルと語彙をセットで保存する。
-/// 語彙はタグ集合で ID が変わるため、必ずモデルと一緒に保存する
+/// 語彙はタグ集合で ID が変わるため、必ずモデルと一緒に保存する。
+/// あわせて `model_config.json` にモデルの寸法設定を書き出す。これが無いと、
+/// 縮小して保存したモデルを読み込むときに元の構造(層数・d_model など)が分からなくなるため
 pub fn save_recognition_model<B: Backend>(
     model: &RecognitionModel<B>,
     vocab: &TagVocabulary,
+    config: &RecognitionModelConfig,
     save_dir: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(save_dir)?;
@@ -314,21 +357,55 @@ pub fn save_recognition_model<B: Backend>(
         .save_file(save_dir.join("model"), &recorder)
         .map_err(|e| format!("認識モデル保存エラー: {:?}", e))?;
     vocab.save(save_dir)?;
+
+    let config_path = save_dir.join("model_config.json");
+    let config_file = std::fs::File::create(&config_path)?;
+    serde_json::to_writer_pretty(config_file, config)?;
+
     println!("認識モデルを保存: {}", save_dir.display());
     Ok(())
 }
 
 /// 保存済みの認識モデルと語彙を読み込む。
-/// 語彙を先に読まないとモデルの出力次元(vocab_size)が決まらない点に注意
+/// 語彙を先に読まないとモデルの出力次元(vocab_size)が決まらない点に注意。
+///
+/// `model_config.json` があればそれで構造を復元し、無ければ `Default`(現行 const 相当)に
+/// フォールバックする。これにより `model_config.json` を持たない既存モデル
+/// (`models/rec_full` 等)もそのまま読める(後方互換)
 pub fn load_recognition_model<B: Backend>(
     load_dir: &Path,
     device: &B::Device,
 ) -> Result<(RecognitionModel<B>, TagVocabulary), Box<dyn std::error::Error>> {
     let vocab = TagVocabulary::load(load_dir)?;
+
+    let config_path = load_dir.join("model_config.json");
+    let config = if config_path.exists() {
+        let content = std::fs::read_to_string(&config_path)?;
+        serde_json::from_str::<RecognitionModelConfig>(&content)?
+    } else {
+        println!(
+            "model_config.json が見つからないため既定サイズにフォールバックします: {}",
+            load_dir.display()
+        );
+        RecognitionModelConfig::default()
+    };
+    // 実際に器を組むのに使う構成を必ず表示する。CLI 側で表示している構成は
+    // 学習経路のものなので、読み込み時はこちらが真実
+    println!(
+        "モデル構成: d_model={} / num_heads={} / d_head={} / d_ff={} / num_layers={}",
+        config.d_model, config.num_heads, config.d_head, config.d_ff, config.num_layers
+    );
+
     let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-    let model = RecognitionModel::<B>::new(vocab.vocab_size(), device)
+    let model = RecognitionModel::<B>::new_with_config(vocab.vocab_size(), &config, device)
         .load_file(load_dir.join("model"), &recorder, device)
-        .map_err(|e| format!("認識モデル読み込みエラー: {:?}", e))?;
+        .map_err(|e| {
+            format!(
+                "認識モデル読み込みエラー(保存時の構造と一致しません。model_config.json の内容と \
+                 --model-size 系フラグの指定を確認してください): {:?}",
+                e
+            )
+        })?;
     println!("認識モデルを読み込み: {}", load_dir.display());
     Ok((model, vocab))
 }
@@ -356,4 +433,87 @@ pub fn predict_from_features(
     let device = <InferenceBackend as Backend>::Device::default();
     let (model, vocab) = load_recognition_model::<InferenceBackend>(load_dir, &device)?;
     Ok(model.predict_topk(features, frames, &vocab, k, &device))
+}
+
+// ===== テスト =====
+//
+// 学習経路の Autodiff<NdArray> は burn-ndarray 0.18.0 の mask_where が現モデル形状で
+// パニックする既知バグがあるため使わない(CLAUDE.md 参照)。ここでは NdArray バックエンドで
+// forward のみを検証し、「サイズ縮小しても save/load 往復で同じ構造が復元されること」と
+// 「model_config.json が無い既存モデルでも Default にフォールバックして読めること」(後方互換)
+// を確認する
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    type TestBackend = InferenceBackend;
+
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = PathBuf::from(format!("tests/temp_recognition_{}", name));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).ok();
+        }
+        dir
+    }
+
+    fn cleanup(dir: &PathBuf) {
+        if dir.exists() {
+            std::fs::remove_dir_all(dir).ok();
+        }
+    }
+
+    #[test]
+    fn tiny_config_save_load_roundtrip_predicts() {
+        let device = <TestBackend as Backend>::Device::default();
+        let dir = test_dir("tiny_roundtrip");
+
+        let vocab = TagVocabulary::from_labels(vec!["a".to_string(), "b".to_string()]);
+        let config = RecognitionModelConfig::preset("tiny").unwrap();
+        let model =
+            RecognitionModel::<TestBackend>::new_with_config(vocab.vocab_size(), &config, &device);
+
+        save_recognition_model(&model, &vocab, &config, &dir).expect("保存に失敗");
+        assert!(
+            dir.join("model_config.json").exists(),
+            "model_config.json が書き出されていません"
+        );
+
+        let (loaded_model, loaded_vocab) =
+            load_recognition_model::<TestBackend>(&dir, &device).expect("読み込みに失敗");
+        assert_eq!(loaded_vocab.tags, vocab.tags);
+
+        // tiny 構成(d_model=16 など)で復元された器に対して forward が通ることを確認
+        let frames = 10;
+        let features = vec![0.0f32; frames * POSE_FEATURE_DIM];
+        let preds = loaded_model.predict_topk(&features, frames, &loaded_vocab, 2, &device);
+        assert_eq!(preds.len(), 2);
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn missing_model_config_falls_back_to_default() {
+        let device = <TestBackend as Backend>::Device::default();
+        let dir = test_dir("fallback_default");
+
+        // Default(= 現行 const 相当)で保存したあと model_config.json を意図的に消し、
+        // 「構造情報を持たない既存モデル」(models/rec_full 等)を模擬する
+        let vocab = TagVocabulary::from_labels(vec!["x".to_string()]);
+        let config = RecognitionModelConfig::default();
+        let model =
+            RecognitionModel::<TestBackend>::new_with_config(vocab.vocab_size(), &config, &device);
+        save_recognition_model(&model, &vocab, &config, &dir).expect("保存に失敗");
+        std::fs::remove_file(dir.join("model_config.json")).expect("model_config.json の削除に失敗");
+
+        let (loaded_model, loaded_vocab) =
+            load_recognition_model::<TestBackend>(&dir, &device).expect("読み込みに失敗");
+
+        let frames = 10;
+        let features = vec![0.0f32; frames * POSE_FEATURE_DIM];
+        let preds = loaded_model.predict_topk(&features, frames, &loaded_vocab, 1, &device);
+        assert_eq!(preds.len(), 1);
+
+        cleanup(&dir);
+    }
 }

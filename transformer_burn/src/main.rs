@@ -18,7 +18,7 @@ use metrics::save_metrics;
 use training::train_jsl;
 
 use burn::backend::wgpu::WgpuDevice;
-use burn::prelude::Backend;
+use burn::prelude::{Backend, Module};
 use clap::Parser;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -85,6 +85,28 @@ struct Args {
     /// 揺れの発生源は重み初期化のみ
     #[arg(long, default_value_t = 42)]
     seed: u64,
+
+    /// 認識モデルのサイズプリセット(base/small/tiny/micro)。未指定なら base(= 現状の設定)。
+    /// --d-model 等の個別フラグはこのプリセットを上書きする
+    #[arg(long)]
+    model_size: Option<String>,
+
+    /// 認識モデルの埋め込み次元 d_model を個別指定(未指定ならプリセット値)
+    #[arg(long)]
+    d_model: Option<usize>,
+
+    /// 認識モデルの Multi-head Attention のヘッド数を個別指定(未指定ならプリセット値)
+    #[arg(long)]
+    num_heads: Option<usize>,
+
+    /// 認識モデルの Feed-forward 中間層の次元数を個別指定
+    /// (未指定時: --d-model のみ指定していれば d_model*4 を自動導出、それ以外はプリセット値)
+    #[arg(long)]
+    d_ff: Option<usize>,
+
+    /// 認識モデルの Transformer 層数を個別指定(未指定ならプリセット値)
+    #[arg(long)]
+    num_layers: Option<usize>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -185,6 +207,46 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     TrainingBackend::seed(args.seed);
     println!("seed: {}", args.seed);
 
+    // 認識モデルのサイズ設定を解決する(サイズ系フラグ未指定なら base = 現行 const と同じ値)。
+    // 学習を始める前に検証エラーで落としたいので、モデルを組む前・分岐の外側で一度だけ呼ぶ
+    let model_config = config::RecognitionModelConfig::resolve(
+        args.model_size.as_deref(),
+        args.d_model,
+        args.num_heads,
+        args.d_ff,
+        args.num_layers,
+    )?;
+
+    // --predict-pose(--load 経由の推論)ではモデル構造は保存済みモデル側が真実。
+    // サイズ系フラグを黙って無視すると誤用に気づけないため、何かを始める前にエラーで止める
+    // (--eval-holdout × --load のエラー処理と同じ流儀)
+    let size_flag_given = args.model_size.is_some()
+        || args.d_model.is_some()
+        || args.num_heads.is_some()
+        || args.d_ff.is_some()
+        || args.num_layers.is_some();
+    if args.predict_pose.is_some() && size_flag_given {
+        return Err(
+            "--predict-pose(--load 経由の推論)ではモデル構造は保存済みモデル側が真実のため、\
+             サイズ系フラグ(--model-size/--d-model/--num-heads/--d-ff/--num-layers)は指定できません"
+                .into(),
+        );
+    }
+
+    // ここで解決した構成でモデルを組むのは学習経路だけ。推論経路では保存済みモデル側の
+    // 構成が使われるため、ここで表示すると実際に読み込まれる構造と食い違って誤解を招く
+    // (推論時の構成表示は load_recognition_model 側が行う)
+    if args.predict_pose.is_none() {
+        println!(
+            "モデル構成: d_model={} / num_heads={} / d_head={} / d_ff={} / num_layers={}",
+            model_config.d_model,
+            model_config.num_heads,
+            model_config.d_head,
+            model_config.d_ff,
+            model_config.num_layers
+        );
+    }
+
     // --- 未見テイク評価モード(Phase 0a の合否判定) ---
     if let Some(dict_path) = &args.eval_holdout {
         // train から新規学習するモードなので、--load(既存モデル読み込み)は意味を持たない。
@@ -230,8 +292,12 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
         // 語彙は学習データ(train)から構築。held-out のラベルは train の部分集合なので必ず含まれる
         let vocab = train_data.build_vocabulary();
-        let model =
-            recognition::RecognitionModel::<TrainingBackend>::new(vocab.vocab_size(), &device);
+        let model = recognition::RecognitionModel::<TrainingBackend>::new_with_config(
+            vocab.vocab_size(),
+            &model_config,
+            &device,
+        );
+        println!("パラメータ数: {}", model.num_params());
         let (model, loss_history) = recognition_training::train_recognition(
             model,
             &train_data,
@@ -249,7 +315,7 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         recognition_training::evaluate_topk(&model, &split.test, &vocab, &device);
 
         if let Some(save_dir) = &args.save {
-            recognition::save_recognition_model(&model, &vocab, save_dir)?;
+            recognition::save_recognition_model(&model, &vocab, &model_config, save_dir)?;
         }
         return Ok(());
     }
@@ -278,8 +344,12 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             vocab.tags
         );
 
-        let model =
-            recognition::RecognitionModel::<TrainingBackend>::new(vocab.vocab_size(), &device);
+        let model = recognition::RecognitionModel::<TrainingBackend>::new_with_config(
+            vocab.vocab_size(),
+            &model_config,
+            &device,
+        );
+        println!("パラメータ数: {}", model.num_params());
         let (model, loss_history) =
             recognition_training::train_recognition(model, &data, &vocab, &device, args.epochs);
 
@@ -293,13 +363,14 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         recognition_training::evaluate_topk(&model, &data, &vocab, &device);
 
         if let Some(save_dir) = &args.save {
-            recognition::save_recognition_model(&model, &vocab, save_dir)?;
+            recognition::save_recognition_model(&model, &vocab, &model_config, save_dir)?;
         }
         return Ok(());
     }
 
     // --- 推論モード ---
     if let Some(dict_path) = &args.predict_pose {
+        // サイズ系フラグとの併用チェックは run_recognition 冒頭で済ませている
         println!("\n===== 認識モデル推論(手ポーズ列→タグ) =====");
         let load_dir = args
             .load

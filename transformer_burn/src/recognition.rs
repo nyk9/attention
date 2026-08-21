@@ -459,8 +459,12 @@ pub type InferenceBackend = burn::backend::NdArray<f32>;
 /// 保存済み認識モデルを CPU(NdArray)で読み込み、手ポーズ列(フラット)から
 /// 上位 k タグを返す。`動画→タグ直結パス`(pose_extractor 側)の推論入口。
 ///
+/// 保存済みモデルが手形記述子で学習されていれば `handshape_sequence` を、
+/// `feature_stats.json` があれば標準化を、この関数の中で自動的に適用する。
+/// 呼び出し側は常に「生の 126 次元ポーズ列」を渡せばよい(従来と同じ)。
+///
 /// - `load_dir`: model.bin + tag_vocab.json を含むディレクトリ
-/// - `features`: [frames * POSE_FEATURE_DIM] のフラット列
+/// - `features`: [frames * POSE_FEATURE_DIM] のフラット列(生ポーズ)
 /// - `frames`: ダウンサンプル後のフレーム数(学習時の SEQ_LEN と揃えること)
 /// - `k`: 返す上位件数
 pub fn predict_from_features(
@@ -470,8 +474,19 @@ pub fn predict_from_features(
     k: usize,
 ) -> Result<Vec<(String, f32)>, Box<dyn std::error::Error>> {
     let device = <InferenceBackend as Backend>::Device::default();
+    // 学習時と同じ前処理を必ず通す。順番は「生ポーズ → 入力表現の変換 → 標準化」
+    let config = load_recognition_config(load_dir)?;
+    let features = if config.input_features.is_raw() {
+        features.to_vec()
+    } else {
+        crate::handshape_features::handshape_sequence(features, frames, config.input_features)
+    };
+    let features = match crate::feature_stats::FeatureStats::load(load_dir)? {
+        Some(stats) => stats.apply(&features),
+        None => features,
+    };
     let (model, vocab) = load_recognition_model::<InferenceBackend>(load_dir, &device)?;
-    Ok(model.predict_topk(features, frames, &vocab, k, &device))
+    Ok(model.predict_topk(&features, frames, &vocab, k, &device))
 }
 
 // ===== テスト =====

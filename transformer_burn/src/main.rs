@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 mod checkpoint;
 mod config;
+mod feature_stats;
 mod handshape_features;
 mod inference;
 mod jsl_data;
@@ -115,6 +116,15 @@ struct Args {
     /// handshape-mean = テイク平均の手形記述子を全フレームに複製したもの
     #[arg(long, default_value = "raw")]
     input_features: String,
+
+    /// 入力特徴量を z-score 標準化する(平均・標準偏差は train 分割からのみ算出)。
+    /// 統計量は --save 時に feature_stats.json として保存され、推論時にも同じ変換がかかる
+    #[arg(long)]
+    standardize: bool,
+
+    /// 認識モデルの学習率(未指定なら config::POSE_LEARNING_RATE)
+    #[arg(long)]
+    pose_lr: Option<f64>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -217,6 +227,10 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // 認識モデルのサイズ設定を解決する(サイズ系フラグ未指定なら base = 現行 const と同じ値)。
     // 学習を始める前に検証エラーで落としたいので、モデルを組む前・分岐の外側で一度だけ呼ぶ
+    let learning_rate = args.pose_lr.unwrap_or(config::POSE_LEARNING_RATE);
+    if learning_rate <= 0.0 {
+        return Err("--pose-lr には 0 より大きい値を指定してください".into());
+    }
     // 入力特徴量の種類も、学習を始める前に解決しておく(未知の値なら理由付きで落とす)
     let input_features = handshape_features::InputFeatures::parse(&args.input_features)?;
     let model_config = config::RecognitionModelConfig::resolve(
@@ -236,6 +250,13 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         || args.num_heads.is_some()
         || args.d_ff.is_some()
         || args.num_layers.is_some();
+    if args.predict_pose.is_some() && args.standardize {
+        return Err(
+            "--predict-pose(--load 経由の推論)では標準化の有無も保存済みモデル側が真実のため、\
+             --standardize は指定できません(feature_stats.json の有無から自動で決まります)"
+                .into(),
+        );
+    }
     if args.predict_pose.is_some() && !input_features.is_raw() {
         return Err(
             "--predict-pose(--load 経由の推論)では入力表現も保存済みモデル側が真実のため、\
@@ -256,10 +277,12 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     // (推論時の構成表示は load_recognition_model 側が行う)
     if args.predict_pose.is_none() {
         println!(
-            "入力特徴量: {} ({}次元/フレーム)",
+            "入力特徴量: {} ({}次元/フレーム) 標準化={}",
             input_features.name(),
-            model_config.input_dim
+            model_config.input_dim,
+            if args.standardize { "あり" } else { "なし" }
         );
+        println!("エポック数: {} / 学習率: {}", args.epochs, learning_rate);
         println!(
             "モデル構成: d_model={} / num_heads={} / d_head={} / d_ff={} / num_layers={}",
             model_config.d_model,
@@ -329,6 +352,20 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         let train_data = train_data.to_input_features(input_features);
         let test_data = split.test.to_input_features(input_features);
 
+        // 標準化の統計量は train からのみ算出する。held-out を混ぜて計算すると
+        // 未見テイクの情報が前処理に漏れ、評価が甘くなる(転導的な情報漏洩)
+        let stats = if args.standardize {
+            let stats = train_data.fit_standardizer();
+            println!("標準化を適用(統計量は train {} 件から算出)", train_data.len());
+            Some(stats)
+        } else {
+            None
+        };
+        let (train_data, test_data) = match &stats {
+            Some(s) => (train_data.standardized(s), test_data.standardized(s)),
+            None => (train_data, test_data),
+        };
+
         // 語彙は学習データ(train)から構築。held-out のラベルは train の部分集合なので必ず含まれる
         let vocab = train_data.build_vocabulary();
         let model = recognition::RecognitionModel::<TrainingBackend>::new_with_config(
@@ -343,6 +380,7 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             &vocab,
             &device,
             args.epochs,
+            learning_rate,
         );
         println!(
             "訓練完了: Loss {:.6} → {:.6}",
@@ -355,6 +393,9 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
         if let Some(save_dir) = &args.save {
             recognition::save_recognition_model(&model, &vocab, &model_config, save_dir)?;
+            if let Some(stats) = &stats {
+                stats.save(save_dir)?;
+            }
         }
         return Ok(());
     }
@@ -386,6 +427,18 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         }
         // 生ポーズ → 手形記述子への変換(raw ならクローンのみで内容は不変)
         let data = data.to_input_features(input_features);
+        // ここでは学習データ全体が train なので、そこから統計量を取るのが正しい
+        let stats = if args.standardize {
+            let stats = data.fit_standardizer();
+            println!("標準化を適用(統計量は学習データ {} 件から算出)", data.len());
+            Some(stats)
+        } else {
+            None
+        };
+        let data = match &stats {
+            Some(s) => data.standardized(s),
+            None => data,
+        };
         let vocab = data.build_vocabulary();
         println!(
             "サンプル数: {} / タグ数: {} ({:?})",
@@ -401,7 +454,14 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         );
         println!("パラメータ数: {}", model.num_params());
         let (model, loss_history) =
-            recognition_training::train_recognition(model, &data, &vocab, &device, args.epochs);
+            recognition_training::train_recognition(
+                model,
+                &data,
+                &vocab,
+                &device,
+                args.epochs,
+                learning_rate,
+            );
 
         println!(
             "訓練完了: Loss {:.6} → {:.6}",
@@ -414,6 +474,9 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
         if let Some(save_dir) = &args.save {
             recognition::save_recognition_model(&model, &vocab, &model_config, save_dir)?;
+            if let Some(stats) = &stats {
+                stats.save(save_dir)?;
+            }
         }
         return Ok(());
     }
@@ -439,6 +502,14 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 saved_config.input_features.name()
             );
         }
+        // 学習時に標準化していたモデルには、保存された統計量で同じ変換を掛ける
+        let data = match feature_stats::FeatureStats::load(load_dir)? {
+            Some(stats) => {
+                println!("保存済みの feature_stats.json で標準化を適用しました");
+                data.standardized(&stats)
+            }
+            None => data,
+        };
         recognition_training::evaluate_topk(&model, &data, &vocab, &device);
     }
 

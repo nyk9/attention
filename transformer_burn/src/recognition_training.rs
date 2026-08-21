@@ -1,6 +1,6 @@
 //! 認識モデル(手ポーズ列→タグ)の学習ループと評価
 
-use crate::config::{BATCH_SIZE, POSE_LEARNING_RATE};
+use crate::config::BATCH_SIZE;
 use crate::pose_data::PoseTrainingData;
 use crate::recognition::RecognitionModel;
 use crate::tag_vocabulary::TagVocabulary;
@@ -18,6 +18,7 @@ pub fn train_recognition<B: AutodiffBackend>(
     vocab: &TagVocabulary,
     device: &B::Device,
     epochs: usize,
+    learning_rate: f64,
 ) -> (RecognitionModel<B>, Vec<f32>) {
     let mut optimizer = AdamConfig::new()
         .with_beta_1(0.9)
@@ -33,7 +34,7 @@ pub fn train_recognition<B: AutodiffBackend>(
         epochs,
         data.len(),
         vocab.tags.len(),
-        POSE_LEARNING_RATE
+        learning_rate
     );
 
     for epoch in 0..epochs {
@@ -70,7 +71,7 @@ pub fn train_recognition<B: AutodiffBackend>(
             );
 
             let grads = GradientsParams::from_grads(loss.backward(), &model);
-            model = optimizer.step(POSE_LEARNING_RATE, model, grads);
+            model = optimizer.step(learning_rate, model, grads);
 
             total_loss += loss.into_scalar().elem::<f32>();
             batch_count += 1;

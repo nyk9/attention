@@ -1,4 +1,5 @@
 use crate::config::POSE_FEATURE_DIM;
+use crate::feature_stats::FeatureStats;
 use crate::handshape_features::{handshape_sequence, InputFeatures};
 use crate::tag_vocabulary::TagVocabulary;
 use serde::Deserialize;
@@ -443,6 +444,38 @@ impl PoseTrainingData {
             samples,
             frames: self.frames,
             feature_dim: mode.feature_dim(),
+        }
+    }
+
+    /// このデータから標準化の統計量を求める。
+    /// **train 分割に対してのみ呼ぶこと**(held-out に対して呼ぶと評価が汚染される)
+    pub fn fit_standardizer(&self) -> FeatureStats {
+        FeatureStats::fit(
+            self.samples.iter().map(|s| s.features.as_slice()),
+            self.feature_dim,
+        )
+    }
+
+    /// 与えられた統計量で標準化したデータを返す。統計量は train 由来のものを使う
+    pub fn standardized(&self, stats: &FeatureStats) -> PoseTrainingData {
+        assert_eq!(
+            stats.feature_dim(),
+            self.feature_dim,
+            "標準化の統計量の次元({})がデータの次元({})と一致しません",
+            stats.feature_dim(),
+            self.feature_dim
+        );
+        PoseTrainingData {
+            samples: self
+                .samples
+                .iter()
+                .map(|s| PoseSample {
+                    features: stats.apply(&s.features),
+                    label: s.label.clone(),
+                })
+                .collect(),
+            frames: self.frames,
+            feature_dim: self.feature_dim,
         }
     }
 

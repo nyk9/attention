@@ -24,6 +24,17 @@ const PALM_SCORE_THRESHOLD: f32 = 0.5;
 const PALM_NMS_THRESHOLD: f32 = 0.3;
 const PALM_ANCHORS_BYTES: &[u8] = include_bytes!("../assets/palm_anchors.bin");
 
+// === 実験5: 人物検出(BlazePose Detection)を Palm 検出の前段に入れるための定数 ===
+// OpenCV Zoo `person_detection_mediapipe`(Apache-2.0)。MediaPipe pose_detection の
+// TFLite を ONNX 化したもの。入力 NCHW (1,3,224,224) / [-1,1]、出力は
+// (1,2254,12)=[cx,cy,w,h, kp0..kp3 の xy] と (1,2254,1)=score logit。
+// アンカーは palm と同じく SSD anchors を事前生成して埋め込む(2254 個)。
+const PERSON_MODEL: &str = "models/person_detection_mediapipe_2023mar.onnx";
+const PERSON_INPUT_SIZE: u32 = 224;
+const PERSON_SCORE_THRESHOLD: f32 = 0.5;
+const PERSON_NMS_THRESHOLD: f32 = 0.3;
+const PERSON_ANCHORS_BYTES: &[u8] = include_bytes!("../assets/person_anchors.bin");
+
 const HAND_INPUT_SIZE: u32 = 224;
 const HAND_CROP_ENLARGE: f32 = 3.0;
 const HAND_CROP_SHIFT_Y: f32 = -0.4;
@@ -42,6 +53,14 @@ const SIGN_ROI: PalmRoiMode = PalmRoiMode::Relative {
     y: 0.20,
     w: 0.91,
     h: 0.80,
+};
+
+/// 実験5: 人物 ROI の既定倍率。MediaPipe の pose_detection_to_roi と同じ 1.25。
+const PERSON_ROI_SCALE: f32 = 1.25;
+/// 実験5: 人物検出を前段に入れる ROI モードの既定形(全身 ROI)。
+const PERSON_ROI: PalmRoiMode = PalmRoiMode::Person {
+    region: PersonRegion::FullBody,
+    scale: PERSON_ROI_SCALE,
 };
 
 // build-dict: 1 フレームの特徴量 = 左手 21 点 + 右手 21 点、各 [x, y, z]
@@ -504,12 +523,14 @@ fn select_palm_roi(theme: &ColorfulTheme) -> Result<PalmRoiMode> {
         PalmRoiMode::CenterSquare,
         SIGN_ROI,
         PalmRoiMode::Tiles { count: 3 },
+        PERSON_ROI,
     ];
     let items = [
         "フレーム全体(従来・既定)",
         "中央正方クロップ(改善案 A)",
         "実測サイン領域(手の分布から決めた矩形)",
         "正方タイル 3 枚(高再現率・低速)",
+        "人物検出で切り出す(実験5・要 person_detection モデル)",
     ];
     let idx = Select::with_theme(theme)
         .with_prompt("Palm 検出に渡す領域")
@@ -656,6 +677,16 @@ fn run_extraction(cfg: RunConfig) -> Result<()> {
         hand_session = Some(s);
     }
 
+    // 人物 ROI モードのときだけ人物検出モデルを追加でロードする(既定経路は不変)
+    let mut person_detector: Option<PersonDetector> =
+        if matches!(cfg.palm_roi, PalmRoiMode::Person { .. }) {
+            let d = PersonDetector::load(PERSON_MODEL)?;
+            eprintln!("loaded person detection model: {}", PERSON_MODEL);
+            Some(d)
+        } else {
+            None
+        };
+
     let overlay_targets = overlay_target_indices(
         cfg.save_overlay.as_ref(),
         info.frame_count as usize,
@@ -695,7 +726,13 @@ fn run_extraction(cfg: RunConfig) -> Result<()> {
         let mut palm_frame_local: Option<PalmFrame> = None;
         let mut hand_frame_local: Option<HandFrame> = None;
         if let Some(palm_s) = palm_session.as_mut() {
-            let palms = run_palm_detection_mode(palm_s, &frame, &palm_anchors, cfg.palm_roi)?;
+            let palms = run_palm_detection_mode(
+                palm_s,
+                &frame,
+                &palm_anchors,
+                cfg.palm_roi,
+                person_detector.as_mut(),
+            )?;
             let mut hands_this_frame: Vec<Hand> = Vec::new();
             if let Some(hand_s) = hand_session.as_mut() {
                 for palm in &palms {
@@ -878,6 +915,14 @@ fn build_dict_mode(
         .commit_from_file(HAND_MODEL)
         .with_context(|| format!("failed to load hand model: {}", HAND_MODEL))?;
     eprintln!("loaded palm + hand models");
+    // 人物 ROI モードのときだけ人物検出モデルを追加でロードする(既定経路は不変)
+    let mut person: Option<PersonDetector> = if matches!(roi_mode, PalmRoiMode::Person { .. }) {
+        let d = PersonDetector::load(PERSON_MODEL)?;
+        eprintln!("loaded person detection model: {}", PERSON_MODEL);
+        Some(d)
+    } else {
+        None
+    };
 
     let mut tags: BTreeMap<String, TagEntry> = BTreeMap::new();
     for video in &videos {
@@ -895,6 +940,7 @@ fn build_dict_mode(
             frames,
             false,
             roi_mode,
+            person.as_mut(),
         )?;
         eprintln!(
             "  left_hand_coverage={:.0}% right_hand_coverage={:.0}%",
@@ -937,6 +983,16 @@ fn build_dict_mode(
         frames,
         DICT_FEATURE_DIM
     );
+    if let Some(d) = &person {
+        let total = d.hits + d.misses;
+        eprintln!(
+            "person detection: {}/{} frames ({:.1}%), fallback to full frame: {}",
+            d.hits,
+            total,
+            if total > 0 { d.hits as f32 * 100.0 / total as f32 } else { 0.0 },
+            d.misses
+        );
+    }
 
     Ok(())
 }
@@ -958,6 +1014,7 @@ fn extract_tag_features(
         target,
         false,
         PalmRoiMode::FullFrame,
+        None,
     )
 }
 
@@ -971,6 +1028,7 @@ fn extract_tag_features_impl(
     target: usize,
     force_full_scan: bool,
     roi_mode: PalmRoiMode,
+    mut person: Option<&mut PersonDetector>,
 ) -> Result<TagEntry> {
     if target == 0 {
         anyhow::bail!("target frames must be >= 1");
@@ -1004,6 +1062,7 @@ fn extract_tag_features_impl(
                             width,
                             height,
                             roi_mode,
+                            person.as_deref_mut(),
                         )?,
                     );
                     Ok(())
@@ -1034,6 +1093,7 @@ fn extract_tag_features_impl(
                     width,
                     height,
                     roi_mode,
+                    person.as_deref_mut(),
                 )?);
                 Ok(())
             })?;
@@ -1071,8 +1131,9 @@ fn infer_frame_feature(
     width: f32,
     height: f32,
     roi_mode: PalmRoiMode,
+    person: Option<&mut PersonDetector>,
 ) -> Result<([f32; DICT_FEATURE_DIM], bool, bool)> {
-    let palms = run_palm_detection_mode(palm_session, frame, palm_anchors, roi_mode)?;
+    let palms = run_palm_detection_mode(palm_session, frame, palm_anchors, roi_mode, person)?;
     let mut hands: Vec<Hand> = Vec::new();
     for palm in &palms {
         if let Some(h) = run_hand_landmark(hand_session, frame, palm)? {
@@ -1530,6 +1591,11 @@ enum PalmRoiMode {
     Relative { x: f32, y: f32, w: f32, h: f32 },
     /// 長辺方向に重なりを持たせた正方タイル分割(高再現率。測定の基準用)
     Tiles { count: usize },
+    /// **実験5**: 人物検出(BlazePose Detection)で人物を切り出してから Palm に渡す。
+    /// ROI はフレームごとに変わるので `palm_rois` だけでは決まらず、
+    /// `run_palm_detection_mode` に `PersonDetector` を渡す必要がある。
+    /// 検出器を渡さない/人物が取れない場合はフレーム全体にフォールバックする。
+    Person { region: PersonRegion, scale: f32 },
 }
 
 impl PalmRoiMode {
@@ -1549,6 +1615,9 @@ impl PalmRoiMode {
                 format!("relative({:.3},{:.3},{:.3},{:.3})", x, y, w, h)
             }
             PalmRoiMode::Tiles { count } => format!("tiles({})", count),
+            PalmRoiMode::Person { region, scale } => {
+                format!("person({},{:.2})", region.label(), scale)
+            }
         }
     }
 }
@@ -1592,6 +1661,9 @@ fn palm_rois(mode: PalmRoiMode, w: u32, h: u32) -> Vec<Roi> {
             (rw * w as f32).round() as i64,
             (rh * h as f32).round() as i64,
         )],
+        // 人物 ROI はフレーム内容に依存するのでここでは決まらない。
+        // 検出器なしで呼ばれた場合の安全側フォールバックとして全面を返す。
+        PalmRoiMode::Person { .. } => vec![Roi::full(w, h)],
         PalmRoiMode::Tiles { count } => {
             let count = count.max(1);
             let side = w.min(h);
@@ -1716,7 +1788,7 @@ fn run_palm_detection(
     frame: &Array3<u8>,
     anchors: &[[f32; 2]],
 ) -> Result<Vec<PalmBox>> {
-    run_palm_detection_mode(session, frame, anchors, PalmRoiMode::FullFrame)
+    run_palm_detection_mode(session, frame, anchors, PalmRoiMode::FullFrame, None)
 }
 
 /// ROI モードを指定して Palm 検出を行う。複数 ROI(タイル)の場合は各 ROI の候補を
@@ -1728,10 +1800,14 @@ fn run_palm_detection_mode(
     frame: &Array3<u8>,
     anchors: &[[f32; 2]],
     mode: PalmRoiMode,
+    person: Option<&mut PersonDetector>,
 ) -> Result<Vec<PalmBox>> {
     let h = frame.shape()[0] as u32;
     let w = frame.shape()[1] as u32;
-    let rois = palm_rois(mode, w, h);
+    let rois = match (mode, person) {
+        (PalmRoiMode::Person { region, scale }, Some(det)) => vec![det.roi(frame, region, scale)?],
+        _ => palm_rois(mode, w, h),
+    };
     let mut candidates: Vec<(f32, [f32; 4], Vec<[f32; 2]>)> = Vec::new();
     for roi in rois {
         candidates.extend(palm_candidates(session, frame, anchors, roi)?);
@@ -1825,6 +1901,295 @@ fn nms_palm_candidates(mut candidates: Vec<(f32, [f32; 4], Vec<[f32; 2]>)>) -> V
         .collect();
 
     results
+}
+
+// === 実験5: 人物検出(BlazePose Detection = MediaPipe 2段パイプラインの前半) ===
+//
+// 既存の Palm 検出はフレーム全体を 192x192 にレターボックスするため、1620x1080 では
+// 入力の 33% が黒帯になり手が約 26px まで縮む(docs/experiments/palm-detection-roi.md)。
+// 人物を先に検出して人物領域だけを Palm に渡せば、同じ 192x192 が「フレーム」ではなく
+// 「人物」を覆うので手の見かけが大きくなる、というのが本実験の仮説。
+//
+// 出力の意味は MediaPipe 準拠:
+//   bbox        : 検出矩形(BlazePose Detection では頭部付近を指す)
+//   keypoints[0]: 腰の中心   keypoints[1]: 全身スケール点
+//   keypoints[2]: 肩の中心   keypoints[3]: 上半身スケール点
+
+/// 人物検出 1 件。座標はすべて**元フレームのピクセル座標**。
+#[derive(Debug, Clone)]
+struct PersonDet {
+    score: f32,
+    bbox: [f32; 4],
+    keypoints: [[f32; 2]; 4],
+}
+
+/// 人物 ROI の作り方。MediaPipe の pose_detection_to_roi は FullBody(kp0→kp1)を使う。
+// [TEST向き] どの領域も「中心 + 一辺」の純粋計算に落ちる
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersonRegion {
+    /// 検出 bbox をそのまま正方化(BlazePose では頭部付近なので非常に小さい)
+    Bbox,
+    /// kp0(腰中心)を中心に、kp0→kp1(全身点)の距離 x2 を一辺にする(MediaPipe 標準)
+    FullBody,
+    /// kp2(肩中心)を中心に、kp2→kp3(上半身点)の距離 x2 を一辺にする
+    UpperBody,
+}
+
+impl PersonRegion {
+    fn label(&self) -> &'static str {
+        match self {
+            PersonRegion::Bbox => "bbox",
+            PersonRegion::FullBody => "fullbody",
+            PersonRegion::UpperBody => "upperbody",
+        }
+    }
+}
+
+// [TEST向き] 不変条件チェック向き。anchors数=2254 を assert するだけで埋め込み崩れを検知
+fn load_person_anchors() -> Vec<[f32; 2]> {
+    PERSON_ANCHORS_BYTES
+        .chunks_exact(8)
+        .map(|c| {
+            [
+                f32::from_le_bytes([c[0], c[1], c[2], c[3]]),
+                f32::from_le_bytes([c[4], c[5], c[6], c[7]]),
+            ]
+        })
+        .collect()
+}
+
+struct PersonPreprocess {
+    shape: Vec<usize>,
+    data: Vec<f32>,
+    pad_left_orig: f32,
+    pad_top_orig: f32,
+    scale: f32,
+}
+
+/// 人物検出出力の正規化座標(アンカー加算後)を元フレーム座標へ戻す。
+/// Palm 側と同じ形の逆変換だが、こちらは ROI クロップをしないのでオフセットは無い。
+// [TEST向き] 純粋な逆変換。四隅・中心が元フレームの正しい位置へ戻るかで往復を固定
+#[inline]
+fn person_norm_to_orig(nx: f32, ny: f32, pre: &PersonPreprocess) -> (f32, f32) {
+    (
+        nx * pre.scale - pre.pad_left_orig,
+        ny * pre.scale - pre.pad_top_orig,
+    )
+}
+
+/// フレーム全体を 224x224 へレターボックスし、NCHW / [-1,1] のテンソルにする。
+/// Palm 前処理(NHWC / [0,1])とはレイアウトも正規化も違うので流用できない。
+// [TEST向き] 決定論的な前処理。shape(=1,3,224,224)と値域[-1,1]、scale/pad を既知入力で固定
+fn preprocess_for_person(frame: &Array3<u8>) -> Result<PersonPreprocess> {
+    let h = frame.shape()[0] as u32;
+    let w = frame.shape()[1] as u32;
+    let raw: Vec<u8> = frame.iter().copied().collect();
+    let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_raw(w, h, raw)
+        .context("failed to construct ImageBuffer for person preprocess")?;
+    let size = PERSON_INPUT_SIZE as f32;
+    let ratio = (size / w as f32).min(size / h as f32);
+    let new_w = ((w as f32) * ratio).round() as u32;
+    let new_h = ((h as f32) * ratio).round() as u32;
+    let resized = image::imageops::resize(&img, new_w, new_h, FilterType::Triangle);
+    let left = (PERSON_INPUT_SIZE.saturating_sub(new_w) / 2) as i64;
+    let top = (PERSON_INPUT_SIZE.saturating_sub(new_h) / 2) as i64;
+    let mut canvas: ImageBuffer<Rgb<u8>, Vec<u8>> =
+        ImageBuffer::from_pixel(PERSON_INPUT_SIZE, PERSON_INPUT_SIZE, Rgb([0u8, 0, 0]));
+    image::imageops::overlay(&mut canvas, &resized, left, top);
+
+    // NCHW: チャンネルごとに平面を並べる
+    let n = (PERSON_INPUT_SIZE * PERSON_INPUT_SIZE) as usize;
+    let mut data = vec![0f32; n * 3];
+    for (i, px) in canvas.pixels().enumerate() {
+        for c in 0..3 {
+            data[c * n + i] = (px[c] as f32 / 255.0 - 0.5) * 2.0;
+        }
+    }
+    Ok(PersonPreprocess {
+        shape: vec![
+            1usize,
+            3,
+            PERSON_INPUT_SIZE as usize,
+            PERSON_INPUT_SIZE as usize,
+        ],
+        data,
+        pad_left_orig: left as f32 / ratio,
+        pad_top_orig: top as f32 / ratio,
+        scale: w.max(h) as f32,
+    })
+}
+
+// [評価] ONNX推論。前処理(preprocess_for_person)と逆変換(person_norm_to_orig)を切り出してテスト
+fn run_person_detection(
+    session: &mut Session,
+    anchors: &[[f32; 2]],
+    frame: &Array3<u8>,
+) -> Result<Vec<PersonDet>> {
+    let pre = preprocess_for_person(frame)?;
+    let input_value = Value::from_array((pre.shape.clone(), pre.data.clone()))?;
+    // 入出力名は palm/hand モデル(input_1 / Identity)と違い `:0` が付く。
+    // 実物を `inspect_person_model` で確認済み。
+    let outputs = session.run(ort::inputs!["input_1:0" => input_value])?;
+    let (box_shape, box_data) = outputs["Identity:0"].try_extract_tensor::<f32>()?;
+    let (_, score_data) = outputs["Identity_1:0"].try_extract_tensor::<f32>()?;
+
+    if score_data.len() != anchors.len() {
+        anyhow::bail!(
+            "person anchor mismatch: model output {} scores, anchors file has {}",
+            score_data.len(),
+            anchors.len()
+        );
+    }
+    let stride = box_data.len() / anchors.len();
+    if stride < 12 {
+        anyhow::bail!(
+            "person box output stride unexpected: {} (shape {:?})",
+            stride,
+            box_shape
+        );
+    }
+
+    let input_size = PERSON_INPUT_SIZE as f32;
+    let mut candidates: Vec<(f32, [f32; 4], [[f32; 2]; 4])> = Vec::new();
+    for i in 0..anchors.len() {
+        let raw = (score_data[i] as f64).clamp(-100.0, 100.0);
+        let s = (1.0 / (1.0 + (-raw).exp())) as f32;
+        if s < PERSON_SCORE_THRESHOLD {
+            continue;
+        }
+        let off = i * stride;
+        let (ax, ay) = (anchors[i][0], anchors[i][1]);
+        let cx_d = box_data[off] / input_size;
+        let cy_d = box_data[off + 1] / input_size;
+        let w_d = box_data[off + 2] / input_size;
+        let h_d = box_data[off + 3] / input_size;
+        let (x1, y1) = person_norm_to_orig(cx_d - w_d / 2.0 + ax, cy_d - h_d / 2.0 + ay, &pre);
+        let (x2, y2) = person_norm_to_orig(cx_d + w_d / 2.0 + ax, cy_d + h_d / 2.0 + ay, &pre);
+        let mut kps = [[0f32; 2]; 4];
+        for (k, kp) in kps.iter_mut().enumerate() {
+            let kx = box_data[off + 4 + k * 2] / input_size;
+            let ky = box_data[off + 4 + k * 2 + 1] / input_size;
+            let (px, py) = person_norm_to_orig(kx + ax, ky + ay, &pre);
+            *kp = [px, py];
+        }
+        candidates.push((s, [x1, y1, x2, y2], kps));
+    }
+
+    // Palm と同じ規則の NMS(score 降順 + IoU 閾値)
+    candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut keep = vec![true; candidates.len()];
+    for i in 0..candidates.len() {
+        if !keep[i] {
+            continue;
+        }
+        for j in (i + 1)..candidates.len() {
+            if keep[j] && iou_xyxy(&candidates[i].1, &candidates[j].1) > PERSON_NMS_THRESHOLD {
+                keep[j] = false;
+            }
+        }
+    }
+    Ok(candidates
+        .into_iter()
+        .zip(keep)
+        .filter(|(_, k)| *k)
+        .map(|((score, bbox, keypoints), _)| PersonDet {
+            score,
+            bbox,
+            keypoints,
+        })
+        .collect())
+}
+
+/// 人物検出 1 件から「中心 + 一辺」の正方領域を求める(クランプ前)。
+/// MediaPipe の AlignmentPointsRectsCalculator + RectTransformationCalculator
+/// (square_long, scale_x=scale_y=`scale`)と同じ式。
+// [TEST向き] 純粋な幾何。既知の keypoint 配置で中心と一辺を手計算オラクルに固定
+fn person_region_square(det: &PersonDet, region: PersonRegion, scale: f32) -> (f32, f32, f32) {
+    let (cx, cy, size) = match region {
+        PersonRegion::Bbox => {
+            let [x1, y1, x2, y2] = det.bbox;
+            (
+                (x1 + x2) / 2.0,
+                (y1 + y2) / 2.0,
+                (x2 - x1).abs().max((y2 - y1).abs()),
+            )
+        }
+        PersonRegion::FullBody | PersonRegion::UpperBody => {
+            let (si, ei) = if region == PersonRegion::FullBody {
+                (0, 1)
+            } else {
+                (2, 3)
+            };
+            let start = det.keypoints[si];
+            let end = det.keypoints[ei];
+            let dx = end[0] - start[0];
+            let dy = end[1] - start[1];
+            (start[0], start[1], 2.0 * (dx * dx + dy * dy).sqrt())
+        }
+    };
+    (cx, cy, size * scale)
+}
+
+/// 正方領域を元フレーム内のピクセル矩形へクランプする。
+/// **クランプは中心を保ったまま辺を詰めるのではなく、はみ出した分だけ平行移動 →
+/// それでも入らなければ辺を切り詰める**(端の人物でも領域が痩せないように)。
+// [TEST向き] 純粋な幾何。枠外・枠より大きい正方・通常の3ケースを固定
+fn square_to_roi(cx: f32, cy: f32, side: f32, w: u32, h: u32) -> Roi {
+    let side = side.max(1.0).min(w.min(h) as f32);
+    let mut x = cx - side / 2.0;
+    let mut y = cy - side / 2.0;
+    x = x.clamp(0.0, (w as f32 - side).max(0.0));
+    y = y.clamp(0.0, (h as f32 - side).max(0.0));
+    let rw = (side.round() as u32).clamp(1, w);
+    let rh = (side.round() as u32).clamp(1, h);
+    Roi {
+        x: (x.round() as u32).min(w - rw),
+        y: (y.round() as u32).min(h - rh),
+        w: rw,
+        h: rh,
+    }
+}
+
+/// 人物検出モデルを保持して「フレーム → Palm に渡す ROI」を返す。
+/// 検出できなかったフレームはフレーム全体にフォールバックする(= 従来挙動)。
+struct PersonDetector {
+    session: Session,
+    anchors: Vec<[f32; 2]>,
+    /// 検出できた/できなかったフレーム数(計測用)
+    hits: usize,
+    misses: usize,
+}
+
+impl PersonDetector {
+    fn load(model: &str) -> Result<Self> {
+        let session = Session::builder()?
+            .commit_from_file(model)
+            .with_context(|| format!("failed to load person model: {}", model))?;
+        Ok(PersonDetector {
+            session,
+            anchors: load_person_anchors(),
+            hits: 0,
+            misses: 0,
+        })
+    }
+
+    /// 最も確信度の高い人物 1 件から ROI を作る。
+    fn roi(&mut self, frame: &Array3<u8>, region: PersonRegion, scale: f32) -> Result<Roi> {
+        let h = frame.shape()[0] as u32;
+        let w = frame.shape()[1] as u32;
+        let dets = run_person_detection(&mut self.session, &self.anchors, frame)?;
+        match dets.first() {
+            Some(d) => {
+                self.hits += 1;
+                let (cx, cy, side) = person_region_square(d, region, scale);
+                Ok(square_to_roi(cx, cy, side, w, h))
+            }
+            None => {
+                self.misses += 1;
+                Ok(Roi::full(w, h))
+            }
+        }
+    }
 }
 
 // [TEST向き] 純粋な数式。完全重なり=1/非重なり=0/半分重なり を手計算で固定(定番のテスト対象)
@@ -2549,6 +2914,27 @@ fn encode_overlay_video(dir: &Path, out: &Path, fps: f64) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// 計測用テストが環境変数から ROI モードを選ぶための共通パーサ。
+    fn parse_roi_mode(name: &str) -> PalmRoiMode {
+        match name {
+            "full" => PalmRoiMode::FullFrame,
+            "center" => PalmRoiMode::CenterSquare,
+            "sign" => SIGN_ROI,
+            "tiles3" => PalmRoiMode::Tiles { count: 3 },
+            "person" => PERSON_ROI,
+            "person-upper" => PalmRoiMode::Person {
+                region: PersonRegion::UpperBody,
+                scale: PERSON_ROI_SCALE,
+            },
+            "person-bbox" => PalmRoiMode::Person {
+                region: PersonRegion::Bbox,
+                scale: PERSON_ROI_SCALE,
+            },
+            other => panic!("unknown ROI mode: {}", other),
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -2966,7 +3352,7 @@ mod tests {
         let fast =
             extract_tag_features_impl(
                 &video, &mut palm, &mut hand, &palm_anchors, 10, false,
-                PalmRoiMode::FullFrame,
+                PalmRoiMode::FullFrame, None,
             )
                 .unwrap();
         let fast_elapsed = t.elapsed();
@@ -2974,7 +3360,7 @@ mod tests {
         let full =
             extract_tag_features_impl(
                 &video, &mut palm, &mut hand, &palm_anchors, 10, true,
-                PalmRoiMode::FullFrame,
+                PalmRoiMode::FullFrame, None,
             )
                 .unwrap();
         let full_elapsed = t.elapsed();
@@ -3066,13 +3452,7 @@ mod tests {
             }
         }
         let mode_name = std::env::var("PALM_ROI_MODE").unwrap_or_else(|_| "full".into());
-        let mode = match mode_name.as_str() {
-            "full" => PalmRoiMode::FullFrame,
-            "center" => PalmRoiMode::CenterSquare,
-            "sign" => SIGN_ROI,
-            "tiles3" => PalmRoiMode::Tiles { count: 3 },
-            other => panic!("unknown PALM_ROI_MODE: {}", other),
-        };
+        let mode = parse_roi_mode(&mode_name);
         let stride: usize = std::env::var("PALM_ROI_STRIDE")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -3103,6 +3483,11 @@ mod tests {
         let palm_anchors = load_palm_anchors();
         let mut palm = Session::builder().unwrap().commit_from_file(PALM_MODEL).unwrap();
         let mut hand = Session::builder().unwrap().commit_from_file(HAND_MODEL).unwrap();
+        let mut person: Option<PersonDetector> = if matches!(mode, PalmRoiMode::Person { .. }) {
+            Some(PersonDetector::load(PERSON_MODEL).unwrap())
+        } else {
+            None
+        };
 
         let mut hands_tsv = String::from(
             "video\tframe\tpalm_score\tpalm_x1\tpalm_y1\tpalm_x2\tpalm_y2\t\
@@ -3125,7 +3510,13 @@ mod tests {
                 info.height,
                 |i| wanted.contains(&i),
                 |idx, frame| {
-                    let palms = run_palm_detection_mode(&mut palm, &frame, &palm_anchors, mode)?;
+                    let palms = run_palm_detection_mode(
+                        &mut palm,
+                        &frame,
+                        &palm_anchors,
+                        mode,
+                        person.as_mut(),
+                    )?;
                     let mut hands: Vec<Hand> = Vec::new();
                     for p in &palms {
                         if let Some(h) = run_hand_landmark(&mut hand, &frame, p)? {
@@ -3173,6 +3564,510 @@ mod tests {
             frames_path.display(),
             t0.elapsed()
         );
+        if let Some(d) = &person {
+            eprintln!(
+                "person detection hits={} misses(full-frame fallback)={}",
+                d.hits, d.misses
+            );
+        }
+    }
+
+    // === 実験5: 人物検出 ROI の幾何と座標の往復 ===
+
+    #[test]
+    fn person_anchors_are_intact() {
+        let a = load_person_anchors();
+        assert_eq!(a.len(), 2254, "person anchors の個数が違う(埋め込み崩れ)");
+        assert!(a.iter().all(|p| (0.0..=1.0).contains(&p[0]) && (0.0..=1.0).contains(&p[1])));
+    }
+
+    #[test]
+    fn preprocess_for_person_layout_and_range() {
+        // 1620x1080 → ratio=224/1620、上下に黒帯。NCHW / [-1,1] で出ること
+        let frame = Array3::<u8>::from_elem((1080, 1620, 3), 255);
+        let pre = preprocess_for_person(&frame).unwrap();
+        assert_eq!(pre.shape, vec![1, 3, 224, 224]);
+        assert_eq!(pre.data.len(), 3 * 224 * 224);
+        assert!(pre.data.iter().all(|v| (-1.0..=1.0).contains(v)));
+        // scale は長辺
+        assert!((pre.scale - 1620.0).abs() < 1e-3);
+        // 黒帯は上下(pad_left=0)
+        assert!(pre.pad_left_orig.abs() < 1e-3);
+        assert!(pre.pad_top_orig > 0.0);
+        // 白一色を入れたので中央は +1.0(=(1.0-0.5)*2)、上下の黒帯は -1.0 になる。
+        // NCHW なので data[c*n + row*224 + col]。1620x1080 は上下に 37px の黒帯。
+        let n = 224 * 224;
+        for c in 0..3 {
+            assert!(
+                (pre.data[c * n + 112 * 224 + 112] - 1.0).abs() < 1e-3,
+                "中央が白でない: {}",
+                pre.data[c * n + 112 * 224 + 112]
+            );
+            assert!(
+                (pre.data[c * n] + 1.0).abs() < 1e-3,
+                "上端の黒帯が -1.0 でない: {}",
+                pre.data[c * n]
+            );
+        }
+    }
+
+    #[test]
+    fn person_norm_to_orig_maps_corners_back() {
+        // 1620x1080: ratio=224/1620=0.13827、new_h=149、pad_top=(224-149)/2=37
+        let frame = Array3::<u8>::zeros((1080, 1620, 3));
+        let pre = preprocess_for_person(&frame).unwrap();
+        // 正規化 x=0 → 元 x=0
+        let (x0, _) = person_norm_to_orig(0.0, 0.0, &pre);
+        assert!(x0.abs() < 1e-3, "x0={}", x0);
+        // 正規化 x=1 → 元 x=1620(scale=長辺)
+        let (x1, _) = person_norm_to_orig(1.0, 0.0, &pre);
+        assert!((x1 - 1620.0).abs() < 1e-3, "x1={}", x1);
+        // 黒帯のちょうど下端(=元画像の y=0)へ戻ること
+        let (_, ytop) = person_norm_to_orig(0.0, pre.pad_top_orig / pre.scale, &pre);
+        assert!(ytop.abs() < 1e-3, "ytop={}", ytop);
+    }
+
+    #[test]
+    fn person_region_square_matches_mediapipe_formula() {
+        // kp0=(100,200) kp1=(100,120) → dist=80、一辺=2*80*scale
+        let det = PersonDet {
+            score: 0.9,
+            bbox: [10.0, 20.0, 50.0, 80.0],
+            keypoints: [[100.0, 200.0], [100.0, 120.0], [90.0, 150.0], [90.0, 110.0]],
+        };
+        let (cx, cy, side) = person_region_square(&det, PersonRegion::FullBody, 1.25);
+        assert!((cx - 100.0).abs() < 1e-3 && (cy - 200.0).abs() < 1e-3);
+        assert!((side - 2.0 * 80.0 * 1.25).abs() < 1e-3, "side={}", side);
+        // UpperBody は kp2 中心・kp2→kp3 距離(=40)
+        let (ux, uy, uside) = person_region_square(&det, PersonRegion::UpperBody, 1.25);
+        assert!((ux - 90.0).abs() < 1e-3 && (uy - 150.0).abs() < 1e-3);
+        assert!((uside - 2.0 * 40.0 * 1.25).abs() < 1e-3, "uside={}", uside);
+        // Bbox は矩形の中心・長辺(=60)
+        let (bx, by, bside) = person_region_square(&det, PersonRegion::Bbox, 1.0);
+        assert!((bx - 30.0).abs() < 1e-3 && (by - 50.0).abs() < 1e-3);
+        assert!((bside - 60.0).abs() < 1e-3, "bside={}", bside);
+    }
+
+    #[test]
+    fn square_to_roi_clamps_into_frame() {
+        // 通常ケース: 中心 (800,540)・一辺 400 → そのまま
+        let r = square_to_roi(800.0, 540.0, 400.0, 1620, 1080);
+        assert_eq!(r, Roi { x: 600, y: 340, w: 400, h: 400 });
+        // フレームより大きい正方は短辺で頭打ち(1620x1080 なら 1080)
+        let r = square_to_roi(800.0, 540.0, 3000.0, 1620, 1080);
+        assert_eq!(r.w, 1080);
+        assert_eq!(r.h, 1080);
+        assert_eq!(r.y, 0);
+        assert!(r.x + r.w <= 1620);
+        // 枠外中心でも必ずフレーム内に収まる(辺は痩せない)
+        let r = square_to_roi(-500.0, 2000.0, 400.0, 1620, 1080);
+        assert_eq!(r, Roi { x: 0, y: 680, w: 400, h: 400 });
+        // 0 や負の一辺でも 1px 以上
+        let r = square_to_roi(10.0, 10.0, 0.0, 1620, 1080);
+        assert!(r.w >= 1 && r.h >= 1);
+    }
+
+    #[test]
+    fn person_mode_falls_back_to_full_frame_without_detector() {
+        // 検出器を渡さずに Person モードが呼ばれた場合、ROI は全面(=従来挙動)
+        let r = palm_rois(PERSON_ROI, 1620, 1080);
+        assert_eq!(r, vec![Roi { x: 0, y: 0, w: 1620, h: 1080 }]);
+        // Person は単一 ROI なので重複統合は走らない
+        assert!(!PERSON_ROI.is_multi_roi());
+        assert_eq!(PERSON_ROI.label(), "person(fullbody,1.25)");
+    }
+
+    /// 人物 ROI → Palm 前処理 → 逆変換 の 2 段が元フレーム座標へ正しく戻ることを、
+    /// **実際に画素を切り出して**確認する(実験4の往復テストの人物 ROI 版)。
+    /// 人物検出の bbox がそのまま Palm の ROI になるため、ここがずれると
+    /// 手クロップの位置がずれ、ランドマークが見当違いの場所に出る。
+    #[test]
+    fn person_roi_crop_and_inverse_round_trip() {
+        let (w, h) = (1620usize, 1080usize);
+        let mut frame = Array3::<u8>::zeros((h, w, 3));
+        // 元フレームの (1200..1240, 800..840) に白い正方形(中心 = (1220, 820))
+        for y in 800..840 {
+            for x in 1200..1240 {
+                for c in 0..3 {
+                    frame[[y, x, c]] = 255;
+                }
+            }
+        }
+        // 実測に近い人物 ROI(肩中心 (830,724) 起点で 1080 正方 → x=290,y=0)
+        let det = PersonDet {
+            score: 0.85,
+            bbox: [660.0, 410.0, 985.0, 734.0],
+            keypoints: [
+                [859.0, 1477.0],
+                [817.0, 224.0],
+                [830.0, 724.0],
+                [801.0, -196.0],
+            ],
+        };
+        let (cx, cy, side) = person_region_square(&det, PersonRegion::UpperBody, PERSON_ROI_SCALE);
+        let roi = square_to_roi(cx, cy, side, w as u32, h as u32);
+        assert!(roi.w == 1080 && roi.h == 1080, "roi={:?}", roi);
+        assert!(
+            (roi.x as i64 - 290).abs() <= 2,
+            "肩中心を中心にした 1080 正方になっていない: {:?}",
+            roi
+        );
+
+        let pre = preprocess_for_palm_roi(&frame, roi).unwrap();
+        let size = PALM_INPUT_SIZE as usize;
+        let (mut sx, mut sy, mut wsum) = (0.0f64, 0.0f64, 0.0f64);
+        for py in 0..size {
+            for px in 0..size {
+                let v = pre.data[(py * size + px) * 3] as f64;
+                if v > 0.5 {
+                    sx += px as f64 * v;
+                    sy += py as f64 * v;
+                    wsum += v;
+                }
+            }
+        }
+        assert!(wsum > 0.0, "人物 ROI の中に白い領域が見つからない");
+        let (ox, oy) = palm_norm_to_orig(
+            ((sx / wsum + 0.5) / size as f64) as f32,
+            ((sy / wsum + 0.5) / size as f64) as f32,
+            &pre,
+        );
+        assert!(
+            (ox - 1220.0).abs() < 8.0 && (oy - 820.0).abs() < 8.0,
+            "往復がずれた: got ({:.1}, {:.1}), want (1220, 820)",
+            ox,
+            oy
+        );
+    }
+
+    /// 実験5 Step 1: 人物検出 ONNX の入出力仕様を実物で確認する。
+    /// Web 上の情報ではなくモデル自身に語らせるための調査用。
+    /// 手動実行: `cargo test inspect_person_model --release -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn inspect_person_model() {
+        if !Path::new(PERSON_MODEL).exists() {
+            eprintln!("skip: {} が無い", PERSON_MODEL);
+            return;
+        }
+        let mut session = Session::builder()
+            .unwrap()
+            .commit_from_file(PERSON_MODEL)
+            .unwrap();
+        eprintln!("=== {} ===", PERSON_MODEL);
+        for i in session.inputs().iter() {
+            eprintln!("input : {:?}", i);
+        }
+        for o in session.outputs().iter() {
+            eprintln!("output: {:?}", o);
+        }
+        let anchors = load_person_anchors();
+        eprintln!("anchors: {} (first={:?} last={:?})", anchors.len(), anchors[0], anchors[anchors.len() - 1]);
+
+        // 中間グレーのダミー入力を通し、実際の出力 shape を得る
+        let n = (PERSON_INPUT_SIZE * PERSON_INPUT_SIZE) as usize;
+        let data = vec![0.0f32; n * 3];
+        let v = Value::from_array((
+            vec![1usize, 3, PERSON_INPUT_SIZE as usize, PERSON_INPUT_SIZE as usize],
+            data,
+        ))
+        .unwrap();
+        let outputs = session.run(ort::inputs!["input_1:0" => v]).unwrap();
+        for (name, value) in outputs.iter() {
+            let (shape, d) = value.try_extract_tensor::<f32>().unwrap();
+            eprintln!("run   : {} shape={:?} len={}", name, shape, d.len());
+        }
+    }
+
+    /// 実験5 副次確認: **人物クロップを BlazePose(256x256)に渡すと身体ランドマークが
+    /// 復活するか**を目視するためのテスト(S6 の破綻が直るかどうか)。
+    ///
+    /// 現行の `preprocess_frame` は「中央正方クロップ」(改善案 A)だが、MediaPipe 本来の
+    /// 2 段パイプラインが landmark モデルに渡すのは**人物検出から作った全身 ROI**で、
+    /// これは**フレーム外へはみ出してよい**(足りない部分は黒で埋める)。本テストは
+    /// その本来の ROI を再現し、既存の中央正方クロップと並べて PNG を出す。
+    ///
+    /// 環境変数: BODY_VIDEO / BODY_FRAMES / BODY_OUT
+    /// 手動実行: `cargo test person_crop_body_landmarks --release -- --ignored --nocapture`
+    ///
+    /// **これは目視確認までで、身体特徴量の実装・評価には進まない**(スコープ外)。
+    #[test]
+    #[ignore]
+    fn person_crop_body_landmarks() {
+        let video = PathBuf::from(
+            std::env::var("BODY_VIDEO")
+                .unwrap_or_else(|_| "/tmp/palm_roi_measure/takes/arigatou-03.mp4".into()),
+        );
+        for p in [video.as_path(), Path::new(PERSON_MODEL), Path::new(DEFAULT_MODEL)] {
+            if !p.exists() {
+                eprintln!("skip: fixture not found: {}", p.display());
+                return;
+            }
+        }
+        let n_frames: usize = std::env::var("BODY_FRAMES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+        let dir = PathBuf::from(
+            std::env::var("BODY_OUT").unwrap_or_else(|_| "/tmp/person_body".into()),
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut person = Session::builder().unwrap().commit_from_file(PERSON_MODEL).unwrap();
+        let mut pose = Session::builder().unwrap().commit_from_file(DEFAULT_MODEL).unwrap();
+        let anchors = load_person_anchors();
+        let info = probe_video(&video).unwrap();
+        let indices = downsample_indices(info.frame_count as usize, n_frames + 4);
+        // 手が写っている中盤だけ見る(前後は手が下りている)
+        let wanted: std::collections::BTreeSet<usize> =
+            indices.iter().skip(2).take(n_frames).copied().collect();
+        let stem = video.file_stem().unwrap().to_string_lossy().to_string();
+
+        extract_frames_filtered(
+            &video,
+            info.width,
+            info.height,
+            |i| wanted.contains(&i),
+            |idx, frame| {
+                let (w, h) = (info.width, info.height);
+                let dets = run_person_detection(&mut person, &anchors, &frame)?;
+                let Some(d) = dets.first() else {
+                    eprintln!("frame {}: 人物検出なし", idx);
+                    return Ok(());
+                };
+                // MediaPipe 本来の全身 ROI(フレーム外へはみ出したままにする)
+                let (cx, cy, side) =
+                    person_region_square(d, PersonRegion::FullBody, PERSON_ROI_SCALE);
+                eprintln!(
+                    "frame {:>4}: 全身ROI 中心=({:.0},{:.0}) 一辺={:.0} \
+                     (フレーム {}x{} をはみ出す割合 {:.2}x)",
+                    idx, cx, cy, side, w, h, side / h as f32
+                );
+
+                // ROI を 256x256 へ(範囲外は黒。sample_bilinear が 0 を返す)
+                let mut data = vec![0f32; 256 * 256 * 3];
+                for py in 0..256usize {
+                    for px in 0..256usize {
+                        let sxf = cx - side / 2.0 + (px as f32 + 0.5) / 256.0 * side;
+                        let syf = cy - side / 2.0 + (py as f32 + 0.5) / 256.0 * side;
+                        let rgb = sample_bilinear(&frame, sxf, syf);
+                        for c in 0..3 {
+                            data[(py * 256 + px) * 3 + c] = rgb[c] / 255.0;
+                        }
+                    }
+                }
+                let v = Value::from_array((vec![1usize, 256, 256, 3], data.clone()))?;
+                let (lms, conf0) = {
+                    let out = pose.run(ort::inputs!["input_1" => v])?;
+                    let (_, ld) = out["Identity"].try_extract_tensor::<f32>()?;
+                    let (_, conf) = out["Identity_1"].try_extract_tensor::<f32>()?;
+                    (parse_landmarks(ld)?, conf[0])
+                };
+                eprintln!("            人物クロップ: confidence={:.3}", sigmoid(conf0));
+
+                // 元フレームへ戻して描画(緑=visible, 赤=not)
+                let raw: Vec<u8> = frame.iter().copied().collect();
+                let mut img: ImageBuffer<Rgb<u8>, Vec<u8>> =
+                    ImageBuffer::from_raw(w, h, raw).unwrap();
+                let mut inside = 0usize;
+                for lm in &lms {
+                    let ox = cx - side / 2.0 + lm.x / 256.0 * side;
+                    let oy = cy - side / 2.0 + lm.y / 256.0 * side;
+                    let color = if sigmoid(lm.visibility) > 0.5 {
+                        Rgb([0u8, 255, 0])
+                    } else {
+                        Rgb([255u8, 0, 0])
+                    };
+                    if ox >= 0.0 && oy >= 0.0 && ox < w as f32 && oy < h as f32 {
+                        inside += 1;
+                    }
+                    for dy in -5i32..=5 {
+                        for dx in -5i32..=5 {
+                            let px = ox as i32 + dx;
+                            let py = oy as i32 + dy;
+                            if px >= 0 && py >= 0 && (px as u32) < w && (py as u32) < h {
+                                img.put_pixel(px as u32, py as u32, color);
+                            }
+                        }
+                    }
+                }
+                eprintln!("            フレーム内に落ちたランドマーク: {}/39", inside);
+                img.save(dir.join(format!("{}_{:05}_personcrop.png", stem, idx)))
+                    .unwrap();
+
+                // 比較用: 既存の中央正方クロップ経路(改善案 A のまま)
+                let (shape2, data2) = preprocess_frame(&frame)?;
+                let v2 = Value::from_array((shape2, data2))?;
+                let (lms2, conf2) = {
+                    let out2 = pose.run(ort::inputs!["input_1" => v2])?;
+                    let (_, ld2) = out2["Identity"].try_extract_tensor::<f32>()?;
+                    let (_, c2) = out2["Identity_1"].try_extract_tensor::<f32>()?;
+                    (parse_landmarks(ld2)?, c2[0])
+                };
+                eprintln!("            中央正方(既存): confidence={:.3}", sigmoid(conf2));
+                let raw2: Vec<u8> = frame.iter().copied().collect();
+                let mut img2: ImageBuffer<Rgb<u8>, Vec<u8>> =
+                    ImageBuffer::from_raw(w, h, raw2).unwrap();
+                let (crop_x, crop_y, cside) = crop_square_center(w, h);
+                let sc = cside as f32 / 256.0;
+                for lm in &lms2 {
+                    let ox = lm.x * sc + crop_x as f32;
+                    let oy = lm.y * sc + crop_y as f32;
+                    let color = if sigmoid(lm.visibility) > 0.5 {
+                        Rgb([0u8, 255, 0])
+                    } else {
+                        Rgb([255u8, 0, 0])
+                    };
+                    for dy in -5i32..=5 {
+                        for dx in -5i32..=5 {
+                            let px = ox as i32 + dx;
+                            let py = oy as i32 + dy;
+                            if px >= 0 && py >= 0 && (px as u32) < w && (py as u32) < h {
+                                img2.put_pixel(px as u32, py as u32, color);
+                            }
+                        }
+                    }
+                }
+                img2.save(dir.join(format!("{}_{:05}_centersquare.png", stem, idx)))
+                    .unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        eprintln!("PNG -> {}", dir.display());
+    }
+
+    /// 実験5 Step 1-2: 実撮影フレームで人物検出を走らせ、bbox / keypoints / 派生 ROI を
+    /// TSV に落とし、オーバーレイ PNG も出す(**数値でなく目で確かめる**ため)。
+    ///
+    /// 環境変数:
+    ///   PERSON_VIDEO  対象動画(既定 /tmp/palm_roi_measure/takes/arigatou-01.mp4)
+    ///   PERSON_FRAMES 何フレーム見るか(既定 10、build-dict と同じ等間隔サンプル)
+    ///   PERSON_OUT    出力ディレクトリ(既定 /tmp/person_det)
+    ///
+    /// 手動実行: `cargo test measure_person_detection --release -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn measure_person_detection() {
+        let video = PathBuf::from(
+            std::env::var("PERSON_VIDEO")
+                .unwrap_or_else(|_| "/tmp/palm_roi_measure/takes/arigatou-01.mp4".into()),
+        );
+        for p in [video.as_path(), Path::new(PERSON_MODEL)] {
+            if !p.exists() {
+                eprintln!("skip: fixture not found: {}", p.display());
+                return;
+            }
+        }
+        let n_frames: usize = std::env::var("PERSON_FRAMES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+        let dir = PathBuf::from(
+            std::env::var("PERSON_OUT").unwrap_or_else(|_| "/tmp/person_det".into()),
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut session = Session::builder()
+            .unwrap()
+            .commit_from_file(PERSON_MODEL)
+            .unwrap();
+        let anchors = load_person_anchors();
+        let info = probe_video(&video).unwrap();
+        let indices = downsample_indices(info.frame_count as usize, n_frames);
+        let wanted: std::collections::BTreeSet<usize> = indices.iter().copied().collect();
+        let stem = video.file_stem().unwrap().to_string_lossy().to_string();
+
+        eprintln!("video {}x{} frames={}", info.width, info.height, info.frame_count);
+        let mut tsv = String::from(
+            "frame\tn\tscore\tbx1\tby1\tbx2\tby2\tkp0x\tkp0y\tkp1x\tkp1y\tkp2x\tkp2y\tkp3x\tkp3y\t\
+             full_x\tfull_y\tfull_w\tupper_x\tupper_y\tupper_w\n",
+        );
+        extract_frames_filtered(
+            &video,
+            info.width,
+            info.height,
+            |i| wanted.contains(&i),
+            |idx, frame| {
+                let dets = run_person_detection(&mut session, &anchors, &frame)?;
+                let w = info.width;
+                let h = info.height;
+                if let Some(d) = dets.first() {
+                    let (fx, fy, fs) = person_region_square(d, PersonRegion::FullBody, PERSON_ROI_SCALE);
+                    let full = square_to_roi(fx, fy, fs, w, h);
+                    let (ux, uy, us) = person_region_square(d, PersonRegion::UpperBody, PERSON_ROI_SCALE);
+                    let upper = square_to_roi(ux, uy, us, w, h);
+                    tsv.push_str(&format!(
+                        "{}\t{}\t{:.4}\t{:.0}\t{:.0}\t{:.0}\t{:.0}\t\
+                         {:.0}\t{:.0}\t{:.0}\t{:.0}\t{:.0}\t{:.0}\t{:.0}\t{:.0}\t\
+                         {}\t{}\t{}\t{}\t{}\t{}\n",
+                        idx, dets.len(), d.score,
+                        d.bbox[0], d.bbox[1], d.bbox[2], d.bbox[3],
+                        d.keypoints[0][0], d.keypoints[0][1],
+                        d.keypoints[1][0], d.keypoints[1][1],
+                        d.keypoints[2][0], d.keypoints[2][1],
+                        d.keypoints[3][0], d.keypoints[3][1],
+                        full.x, full.y, full.w, upper.x, upper.y, upper.w,
+                    ));
+                    eprintln!(
+                        "frame {:>4}: n={} score={:.3} bbox=({:.0},{:.0})-({:.0},{:.0}) \
+                         kp0=({:.0},{:.0}) kp1=({:.0},{:.0}) kp2=({:.0},{:.0}) kp3=({:.0},{:.0}) \
+                         full_roi={:?} upper_roi={:?}",
+                        idx, dets.len(), d.score,
+                        d.bbox[0], d.bbox[1], d.bbox[2], d.bbox[3],
+                        d.keypoints[0][0], d.keypoints[0][1],
+                        d.keypoints[1][0], d.keypoints[1][1],
+                        d.keypoints[2][0], d.keypoints[2][1],
+                        d.keypoints[3][0], d.keypoints[3][1],
+                        full, upper,
+                    );
+                    // オーバーレイ: bbox=黄 / kp=赤緑青白 / full ROI=シアン / upper ROI=マゼンタ
+                    let raw: Vec<u8> = frame.iter().copied().collect();
+                    let mut img: ImageBuffer<Rgb<u8>, Vec<u8>> =
+                        ImageBuffer::from_raw(w, h, raw).unwrap();
+                    let rect = |img: &mut ImageBuffer<Rgb<u8>, Vec<u8>>,
+                                x1: f32, y1: f32, x2: f32, y2: f32,
+                                c: Rgb<u8>| {
+                        draw_line(img, x1, y1, x2, y1, c, 2);
+                        draw_line(img, x2, y1, x2, y2, c, 2);
+                        draw_line(img, x2, y2, x1, y2, c, 2);
+                        draw_line(img, x1, y2, x1, y1, c, 2);
+                    };
+                    rect(&mut img, d.bbox[0], d.bbox[1], d.bbox[2], d.bbox[3], Rgb([255, 255, 0]));
+                    rect(&mut img, full.x as f32, full.y as f32,
+                         (full.x + full.w) as f32, (full.y + full.h) as f32, Rgb([0, 255, 255]));
+                    rect(&mut img, upper.x as f32, upper.y as f32,
+                         (upper.x + upper.w) as f32, (upper.y + upper.h) as f32, Rgb([255, 0, 255]));
+                    let kp_colors = [
+                        Rgb([255u8, 0, 0]),   // kp0 hip center
+                        Rgb([0u8, 255, 0]),   // kp1 full body
+                        Rgb([0u8, 0, 255]),   // kp2 shoulder center
+                        Rgb([255u8, 255, 255]), // kp3 upper body
+                    ];
+                    for (k, c) in kp_colors.iter().enumerate() {
+                        let (x, y) = (d.keypoints[k][0], d.keypoints[k][1]);
+                        for dy in -6i32..=6 {
+                            for dx in -6i32..=6 {
+                                let px = x as i32 + dx;
+                                let py = y as i32 + dy;
+                                if px >= 0 && py >= 0 && (px as u32) < w && (py as u32) < h {
+                                    img.put_pixel(px as u32, py as u32, *c);
+                                }
+                            }
+                        }
+                    }
+                    img.save(dir.join(format!("{}_{:05}.png", stem, idx))).unwrap();
+                } else {
+                    eprintln!("frame {:>4}: 人物検出なし", idx);
+                    tsv.push_str(&format!("{}\t0\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\n", idx));
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        let out = dir.join(format!("person_{}.tsv", stem));
+        std::fs::write(&out, tsv).unwrap();
+        eprintln!("wrote {} (PNG も同ディレクトリ)", out.display());
     }
 
     /// 改善前後のオーバーレイを目視するための出力テスト(S6 の教訓「数値でなく目で確かめる」)。
@@ -3199,13 +4094,7 @@ mod tests {
             }
         }
         let mode_name = std::env::var("OVERLAY_MODE").unwrap_or_else(|_| "full".into());
-        let mode = match mode_name.as_str() {
-            "full" => PalmRoiMode::FullFrame,
-            "center" => PalmRoiMode::CenterSquare,
-            "sign" => SIGN_ROI,
-            "tiles3" => PalmRoiMode::Tiles { count: 3 },
-            other => panic!("unknown OVERLAY_MODE: {}", other),
-        };
+        let mode = parse_roi_mode(&mode_name);
         let frames: usize = std::env::var("OVERLAY_FRAMES")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -3255,13 +4144,7 @@ mod tests {
             }
         }
         let mode_name = std::env::var("DICT_ROI_MODE").unwrap_or_else(|_| "tiles3".into());
-        let mode = match mode_name.as_str() {
-            "full" => PalmRoiMode::FullFrame,
-            "center" => PalmRoiMode::CenterSquare,
-            "sign" => SIGN_ROI,
-            "tiles3" => PalmRoiMode::Tiles { count: 3 },
-            other => panic!("unknown DICT_ROI_MODE: {}", other),
-        };
+        let mode = parse_roi_mode(&mode_name);
         let out = PathBuf::from(std::env::var("DICT_OUT").unwrap_or_else(|_| {
             format!("../transformer_burn/data/pose_dict_full_{}.json", mode_name)
         }));

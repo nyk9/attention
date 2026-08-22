@@ -461,8 +461,11 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
-        // 生ポーズ → 手形記述子への変換(raw ならクローンのみで内容は不変)
-        let data = data.to_input_features(input_features);
+        // 生ポーズ → 手形記述子への変換(raw ならクローンのみで内容は不変)。
+        // --eval-holdout 経路(387-388行目付近)と同じく parts を渡す: --drop-descriptor で
+        // 成分を落とした場合、model_config.input_dim も縮んでいる(252-256行目)ため、
+        // データ側の次元も揃えないと学習時に形状不一致になる
+        let data = data.to_input_features_with_parts(input_features, parts);
         // ここでは学習データ全体が train なので、そこから統計量を取るのが正しい
         let stats = if args.standardize {
             let stats = data.fit_standardizer();
@@ -550,4 +553,76 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// clap のデフォルト値に合わせた Args。各テストは差分だけ上書きする
+    fn base_args() -> Args {
+        Args {
+            train: false,
+            save: None,
+            load: None,
+            predict: None,
+            backend: "wgpu".to_string(),
+            export_attn: false,
+            train_pose: None,
+            predict_pose: None,
+            epochs: config::POSE_EPOCHS,
+            eval_holdout: None,
+            inspect_dict: None,
+            holdout_per_label: 1,
+            mirror_augment: false,
+            seed: 42,
+            model_size: None,
+            d_model: None,
+            num_heads: None,
+            d_ff: None,
+            num_layers: None,
+            input_features: "raw".to_string(),
+            standardize: false,
+            pose_lr: None,
+            drop_descriptor: String::new(),
+        }
+    }
+
+    // [TEST向き] --train-pose + --drop-descriptor + --save は、既存ガード(267行目付近)で
+    // 引き続き拒否されること。落とした成分は model_config.json に保存できないため、
+    // このガードが無いと二度と読み込めないモデルを保存できてしまう
+    #[test]
+    fn train_pose_with_drop_descriptor_and_save_is_rejected() {
+        let mut args = base_args();
+        args.train_pose = Some(PathBuf::from("data/pose_dict_smoke.json"));
+        args.input_features = "handshape".to_string();
+        args.drop_descriptor = "wrist".to_string();
+        args.save = Some(PathBuf::from("models/_test_should_not_be_created"));
+
+        let err = run_recognition(&args)
+            .expect_err("--train-pose + --drop-descriptor + --save は拒否されるべき");
+        assert!(
+            err.to_string().contains("--save"),
+            "エラーメッセージに --save が含まれていません: {}",
+            err
+        );
+    }
+
+    // [TEST向き] --train-pose + --drop-descriptor(--save 無し)が形状不一致にならないこと。
+    // 修正前は main.rs:465 が to_input_features(input_features) を呼んでおり、data 側は
+    // 全成分(66次元)のまま、model_config.input_dim だけ parts.feature_dim()(62次元)に
+    // 縮んでいたため、学習開始直後に形状不一致で落ちていた。--eval-holdout 経路と同じく
+    // to_input_features_with_parts(input_features, parts) に揃えたことで解消したはず
+    #[test]
+    fn train_pose_with_drop_descriptor_matches_model_input_dim() {
+        let mut args = base_args();
+        args.train_pose = Some(PathBuf::from("data/pose_dict_smoke.json"));
+        args.input_features = "handshape".to_string();
+        args.drop_descriptor = "wrist".to_string();
+        args.model_size = Some("micro".to_string());
+        args.epochs = 1;
+
+        run_recognition(&args)
+            .expect("--train-pose + --drop-descriptor が形状不一致で失敗した(main.rs:465 を確認)");
+    }
 }

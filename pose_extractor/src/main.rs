@@ -63,6 +63,19 @@ const PERSON_ROI: PalmRoiMode = PalmRoiMode::Person {
     scale: PERSON_ROI_SCALE,
 };
 
+// === 実験6: フレームの選び方(サイン区間からの選択) ===
+// build-dict は動画全体を等間隔に 10 分割して特徴にしているが、一人撮影のため
+// 動画の前後には手を下ろしている時間がある(検出率が時間位置に対して∩字になる。
+// docs/experiments/palm-detection-roi.md §2.3)。SignSpan モードは一次パスで
+// 「手が写っている最長区間」を推定し、その区間内から等間隔に選ぶ。
+
+/// 一次パスで動画全体から何点サンプリングするか(多いほど区間の端が正確・遅い)。
+/// 4 秒 120 フレームなら step=7(約 0.23 秒)刻みになる。
+const SIGN_SPAN_SAMPLES: usize = 16;
+/// 一次パスで「手が見えなかったサンプル」を何個まで橋渡しして同一区間とみなすか。
+/// progress.rs の MAX_RUN_GAP_SAMPLES と同じ発想(モーションブラー等の瞬断対策)。
+const SIGN_SPAN_MAX_GAP: usize = 1;
+
 // build-dict: 1 フレームの特徴量 = 左手 21 点 + 右手 21 点、各 [x, y, z]
 const HAND_POINTS: usize = 21;
 const DICT_FEATURE_DIM: usize = HAND_POINTS * 3 * 2; // = 126
@@ -214,6 +227,9 @@ struct PoseDictMeta {
     coverage_basis: String,
     /// Palm 検出に渡した領域(既定 "full-frame" が従来の挙動)。旧 dict には無い
     palm_roi: String,
+    /// どのフレームを選んだか(既定 "uniform" が従来の挙動)。実験6 以前の dict には無い。
+    /// **学習と推論でここが食い違うと train/test 不一致になる**
+    frame_select: String,
     /// 辞書に含めたタグ数
     tag_count: usize,
 }
@@ -392,7 +408,14 @@ fn export_wizard(theme: &ColorfulTheme) -> Result<()> {
             .with_prompt("ダウンサンプルするフレーム数(transformer_burn の SEQ_LEN と揃える)")
             .default(10)
             .interact_text()?;
-        build_dict(&out_dir, Path::new(output.trim()), frames)?;
+        let select = select_frame_mode(theme)?;
+        build_dict_mode(
+            &out_dir,
+            Path::new(output.trim()),
+            frames,
+            PalmRoiMode::FullFrame,
+            select,
+        )?;
     }
     Ok(())
 }
@@ -414,10 +437,14 @@ fn build_dict_wizard(theme: &ColorfulTheme) -> Result<()> {
         .default(10)
         .interact_text()?;
 
-    build_dict(
+    let select = select_frame_mode(theme)?;
+
+    build_dict_mode(
         Path::new(input_dir.trim()),
         Path::new(output.trim()),
         frames,
+        PalmRoiMode::FullFrame,
+        select,
     )
 }
 
@@ -440,6 +467,9 @@ fn recognize_wizard(theme: &ColorfulTheme) -> Result<()> {
         .with_prompt("上位何件のタグを表示するか")
         .default(5)
         .interact_text()?;
+    // 学習に使った dict と同じ選び方でないと train/test 不一致になる
+    // (dict の metadata.frame_select に何で作ったかが入っている)
+    let select = select_frame_mode(theme)?;
 
     // 4. Palm + Hand モデルをロード(build_dict と同じ手順)
     let palm_anchors = load_palm_anchors();
@@ -458,6 +488,7 @@ fn recognize_wizard(theme: &ColorfulTheme) -> Result<()> {
         &mut hand_session,
         &palm_anchors,
         frames,
+        select,
     )?;
     eprintln!(
         "left_hand_coverage={:.0}% right_hand_coverage={:.0}%",
@@ -534,6 +565,22 @@ fn select_palm_roi(theme: &ColorfulTheme) -> Result<PalmRoiMode> {
     ];
     let idx = Select::with_theme(theme)
         .with_prompt("Palm 検出に渡す領域")
+        .items(&items)
+        .default(0)
+        .interact()?;
+    Ok(modes[idx])
+}
+
+/// 学習特徴にするフレームの選び方を選ばせる。**先頭(既定)が従来の等間隔**。
+/// build-dict と認識で同じものを選ばないと train/test 不一致になる。
+fn select_frame_mode(theme: &ColorfulTheme) -> Result<FrameSelectMode> {
+    let modes = [FrameSelectMode::Uniform, SIGN_SPAN];
+    let items = [
+        "動画全体から等間隔(従来・既定)",
+        "サイン区間から等間隔(実験6・一次パスで手の区間を推定。約2倍遅い)",
+    ];
+    let idx = Select::with_theme(theme)
+        .with_prompt("フレームの選び方(学習した dict と揃えること)")
         .items(&items)
         .default(0)
         .interact()?;
@@ -883,15 +930,23 @@ fn run_extraction(cfg: RunConfig) -> Result<()> {
 /// 各動画のハンドランドマークを `frames` フレームにダウンサンプルして JSON に書き出す。
 // [評価/スモーク] ディレクトリ統合処理。中の純粋部品(downsample/frame_hand_feature)を個別にテストする方が筋が良い
 fn build_dict(input_dir: &Path, output: &Path, frames: usize) -> Result<()> {
-    build_dict_mode(input_dir, output, frames, PalmRoiMode::FullFrame)
+    build_dict_mode(
+        input_dir,
+        output,
+        frames,
+        PalmRoiMode::FullFrame,
+        FrameSelectMode::Uniform,
+    )
 }
 
-/// `roi_mode` で Palm 検出に渡す領域を切り替えられる版。既定 (`FullFrame`) は従来と同一結果。
+/// `roi_mode`(Palm 検出に渡す領域)と `select`(どのフレームを選ぶか)を切り替えられる版。
+/// 既定 (`FullFrame` + `Uniform`) は従来と同一結果。
 fn build_dict_mode(
     input_dir: &Path,
     output: &Path,
     frames: usize,
     roi_mode: PalmRoiMode,
+    select: FrameSelectMode,
 ) -> Result<()> {
     if frames == 0 {
         anyhow::bail!("--frames must be >= 1");
@@ -941,6 +996,7 @@ fn build_dict_mode(
             false,
             roi_mode,
             person.as_mut(),
+            select,
         )?;
         eprintln!(
             "  left_hand_coverage={:.0}% right_hand_coverage={:.0}%",
@@ -962,6 +1018,7 @@ fn build_dict_mode(
             normalization: "x/=width, y/=height, z/=width (z is relative depth)".into(),
             coverage_basis: "selected frames only (the frames that became `sequence`)".into(),
             palm_roi: roi_mode.label(),
+            frame_select: select.label(),
             tag_count: tags.len(),
         },
         tags,
@@ -1005,6 +1062,7 @@ fn extract_tag_features(
     hand_session: &mut Session,
     palm_anchors: &[[f32; 2]],
     target: usize,
+    select: FrameSelectMode,
 ) -> Result<TagEntry> {
     extract_tag_features_impl(
         video,
@@ -1015,6 +1073,7 @@ fn extract_tag_features(
         false,
         PalmRoiMode::FullFrame,
         None,
+        select,
     )
 }
 
@@ -1029,6 +1088,7 @@ fn extract_tag_features_impl(
     force_full_scan: bool,
     roi_mode: PalmRoiMode,
     mut person: Option<&mut PersonDetector>,
+    select: FrameSelectMode,
 ) -> Result<TagEntry> {
     if target == 0 {
         anyhow::bail!("target frames must be >= 1");
@@ -1043,7 +1103,16 @@ fn extract_tag_features_impl(
     let selected: Vec<([f32; DICT_FEATURE_DIM], bool, bool)> =
         if info.frame_count > 0 && !force_full_scan {
             // 高速経路: 選択フレームのみ推論(推論回数 全フレーム → 高々 target)
-            let indices = downsample_indices(info.frame_count as usize, target);
+            let indices = select_frame_indices(
+                video,
+                &info,
+                palm_session,
+                palm_anchors,
+                roi_mode,
+                person.as_deref_mut(),
+                target,
+                select,
+            )?;
             let wanted: std::collections::BTreeSet<usize> = indices.iter().copied().collect();
             let mut got: BTreeMap<usize, ([f32; DICT_FEATURE_DIM], bool, bool)> = BTreeMap::new();
             extract_frames_filtered(
@@ -1100,7 +1169,26 @@ fn extract_tag_features_impl(
             if per_frame.is_empty() {
                 anyhow::bail!("no frames extracted from {}", video.display());
             }
-            let indices = downsample_indices(per_frame.len(), target);
+            let indices = match select {
+                FrameSelectMode::Uniform => downsample_indices(per_frame.len(), target),
+                // 全フレーム推論済みなので一次パスは不要。同じ粒度(step)で hits を作り、
+                // 高速経路と同じ区間推定をかける(こちらの hits は Palm ではなく
+                // Hand ランドマークまで通った結果なので、わずかに厳しめになる)
+                FrameSelectMode::SignSpan { samples, max_gap } => {
+                    let step = (per_frame.len() / samples.max(1)).max(1);
+                    let hits: Vec<bool> = per_frame
+                        .iter()
+                        .step_by(step)
+                        .map(|(_, l, r)| *l || *r)
+                        .collect();
+                    match longest_hit_span(&hits, max_gap)
+                        .and_then(|sp| sign_span_frames(sp, step, per_frame.len(), target))
+                    {
+                        Some((start, end)) => span_indices(start, end, target),
+                        None => downsample_indices(per_frame.len(), target),
+                    }
+                }
+            };
             indices.iter().map(|&i| per_frame[i]).collect()
         };
 
@@ -1120,6 +1208,126 @@ fn extract_tag_features_impl(
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default(),
     })
+}
+
+/// 「どのフレームを推論・学習に使うか」を決める唯一の場所。
+/// **build-dict(学習データ生成)も 認識(動画→タグ)も同じ `extract_tag_features_impl`
+/// 経由でここを通る**ので、学習と推論でフレームの選び方がずれない。
+/// SignSpan のときだけ一次パス(Palm 検出のみ)が走る。
+fn select_frame_indices(
+    video: &PathBuf,
+    info: &VideoInfo,
+    palm_session: &mut Session,
+    palm_anchors: &[[f32; 2]],
+    roi_mode: PalmRoiMode,
+    person: Option<&mut PersonDetector>,
+    target: usize,
+    select: FrameSelectMode,
+) -> Result<Vec<usize>> {
+    let frame_count = info.frame_count as usize;
+    match select {
+        FrameSelectMode::Uniform => Ok(downsample_indices(frame_count, target)),
+        // 実験6: 一次パスで手が写っている区間を推定し、その中から等間隔に選ぶ。
+        // 区間が取れないテイクは従来の等間隔へフォールバックする。
+        FrameSelectMode::SignSpan { samples, max_gap } => {
+            match detect_sign_span(
+                video,
+                info,
+                palm_session,
+                palm_anchors,
+                roi_mode,
+                person,
+                samples,
+                max_gap,
+                target,
+            )? {
+                Some(span) => {
+                    eprintln!(
+                        "  sign-span: frames {}..={} / {} (一次パス {} サンプル中 {} で手を検出)",
+                        span.start, span.end, frame_count, span.samples, span.hits
+                    );
+                    Ok(span_indices(span.start, span.end, target))
+                }
+                None => {
+                    eprintln!(
+                        "  warning: サイン区間が見つからず等間隔へフォールバック(手が 1 度も検出できないテイク)"
+                    );
+                    Ok(downsample_indices(frame_count, target))
+                }
+            }
+        }
+    }
+}
+
+/// 実験6 の一次パスの結果。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SignSpan {
+    /// 本番で使うフレーム区間の開始(両端含む)
+    start: usize,
+    /// 同・終了(両端含む)
+    end: usize,
+    /// 一次パスで実際に推論したサンプル数
+    samples: usize,
+    /// そのうち手(手のひら候補)が見つかったサンプル数
+    hits: usize,
+}
+
+/// 実験6 の一次パス: 動画を粗くサンプリングして **Palm 検出だけ**を走らせ、
+/// 手が写っているフレーム区間を推定する。Hand ランドマークは走らせない
+/// (区間の判定には手の有無で足り、1 フレームあたりの推論を約半分に抑えられる)。
+///
+/// Palm 検出は Hand ランドマーク段の上位集合になっている(実測: 1530 フレーム中、
+/// palm あり hand なしが 28、その逆は 0)。したがって palm のみの判定は
+/// わずかに広め(取りこぼしにくい)側に倒れる。
+///
+/// 手が 1 度も検出できなければ None(呼び出し側で等間隔へフォールバックする)。
+fn detect_sign_span(
+    video: &PathBuf,
+    info: &VideoInfo,
+    palm_session: &mut Session,
+    palm_anchors: &[[f32; 2]],
+    roi_mode: PalmRoiMode,
+    mut person: Option<&mut PersonDetector>,
+    samples: usize,
+    max_gap: usize,
+    target: usize,
+) -> Result<Option<SignSpan>> {
+    let frame_count = info.frame_count as usize;
+    if frame_count == 0 || samples == 0 {
+        return Ok(None);
+    }
+    let step = (frame_count / samples.max(1)).max(1);
+    let mut hits: Vec<bool> = Vec::new();
+    extract_frames_filtered(
+        video,
+        info.width,
+        info.height,
+        |idx| idx % step == 0,
+        |_idx, frame| {
+            let palms = run_palm_detection_mode(
+                palm_session,
+                &frame,
+                palm_anchors,
+                roi_mode,
+                person.as_deref_mut(),
+            )?;
+            hits.push(!palms.is_empty());
+            Ok(())
+        },
+    )?;
+    let n_hits = hits.iter().filter(|h| **h).count();
+    let Some(span) = longest_hit_span(&hits, max_gap) else {
+        return Ok(None);
+    };
+    let Some((start, end)) = sign_span_frames(span, step, frame_count, target) else {
+        return Ok(None);
+    };
+    Ok(Some(SignSpan {
+        start,
+        end,
+        samples: hits.len(),
+        hits: n_hits,
+    }))
 }
 
 /// 1 フレームに Palm 検出 → Hand ランドマークをかけ、126 次元特徴量を返す。
@@ -1620,6 +1828,116 @@ impl PalmRoiMode {
             }
         }
     }
+}
+
+/// **実験6**: build-dict / 認識で「動画のどのフレームを T 枚選ぶか」の方式。
+/// 既定 `Uniform` は従来どおり動画全体の等間隔で、出力は 1 ビットも変わらない。
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FrameSelectMode {
+    /// 動画全体から等間隔(従来・既定)
+    Uniform,
+    /// 一次パス(Palm 検出のみ)で手が写っている最長区間を推定し、その区間内から等間隔に選ぶ。
+    /// `samples` は一次パスのサンプル数、`max_gap` は瞬断を橋渡しするサンプル数。
+    SignSpan { samples: usize, max_gap: usize },
+}
+
+impl FrameSelectMode {
+    fn label(&self) -> String {
+        match self {
+            FrameSelectMode::Uniform => "uniform".into(),
+            FrameSelectMode::SignSpan { samples, max_gap } => {
+                format!("sign-span(samples={},max_gap={})", samples, max_gap)
+            }
+        }
+    }
+}
+
+/// 実験6 の既定形(一次パス 16 サンプル・瞬断 1 サンプルまで橋渡し)。
+const SIGN_SPAN: FrameSelectMode = FrameSelectMode::SignSpan {
+    samples: SIGN_SPAN_SAMPLES,
+    max_gap: SIGN_SPAN_MAX_GAP,
+};
+
+/// 一次パスのサンプル列 `hits`(そのサンプルで手が見えたか)から、
+/// 連続して見えた最長区間を (開始添字, 終了添字) の**両端含む**形で返す。
+/// `max_gap` 個までの瞬断は同一区間として橋渡しする
+/// (progress.rs の `longest_run_seconds` と同じ発想)。長さが同じなら先に現れた方を採る。
+/// hit が 1 つも無ければ None。
+// [TEST向き] 純粋関数。ギャップ橋渡しの境界・全 hit・全 miss・同長タイブレーク
+fn longest_hit_span(hits: &[bool], max_gap: usize) -> Option<(usize, usize)> {
+    fn close(
+        cur: &mut Option<(usize, usize)>,
+        best: &mut Option<(usize, usize)>,
+    ) {
+        if let Some(c) = cur.take() {
+            let len = c.1 - c.0 + 1;
+            if best.map_or(true, |b| len > b.1 - b.0 + 1) {
+                *best = Some(c);
+            }
+        }
+    }
+    let mut best: Option<(usize, usize)> = None;
+    let mut cur: Option<(usize, usize)> = None;
+    let mut gap = 0usize;
+    for (i, &h) in hits.iter().enumerate() {
+        if h {
+            gap = 0;
+            cur = Some(match cur {
+                Some((start, _)) => (start, i),
+                None => (i, i),
+            });
+        } else {
+            gap += 1;
+            if gap > max_gap {
+                close(&mut cur, &mut best);
+            }
+        }
+    }
+    close(&mut cur, &mut best);
+    best
+}
+
+/// 一次パスで得た区間(サンプル添字)を、本番で使うフレーム区間 [start, end](両端含む)へ変換する。
+/// - サンプル添字 i は フレーム番号 i * step に対応する
+/// - 区間の端は一次パスの粒度でしか分からないので、前後に step/2 の余裕を付ける
+/// - target 枚に満たない短い区間は、target フレーム分になるまで対称に広げる
+///   (広げないと `downsample_indices` が同じフレームを重複して選ぶため)
+/// - 最後に [0, frame_count-1] にクランプする
+// [TEST向き] 純粋関数。マージン・短区間の拡張・端でのクランプ
+fn sign_span_frames(
+    span: (usize, usize),
+    step: usize,
+    frame_count: usize,
+    target: usize,
+) -> Option<(usize, usize)> {
+    if frame_count == 0 || target == 0 || step == 0 {
+        return None;
+    }
+    let last = frame_count - 1;
+    let margin = step / 2;
+    let mut start = (span.0 * step).saturating_sub(margin).min(last);
+    let mut end = (span.1 * step + margin).min(last).max(start);
+    // 短すぎる区間は target 枚ぶんまで広げる(片側が端に着いたらもう片側で埋める)
+    while end - start + 1 < target && (start > 0 || end < last) {
+        if start > 0 {
+            start -= 1;
+        }
+        if end - start + 1 < target && end < last {
+            end += 1;
+        }
+    }
+    Some((start, end))
+}
+
+/// フレーム区間 [start, end](両端含む)の中から target 枚を等間隔に選ぶ。
+/// 区間内の選び方は動画全体のときと同じ規則(`downsample_indices`)。
+// [TEST向き] 純粋関数。オフセットが乗るだけであること・端点を必ず含むこと
+fn span_indices(start: usize, end: usize, target: usize) -> Vec<usize> {
+    let n = end.saturating_sub(start) + 1;
+    downsample_indices(n, target)
+        .into_iter()
+        .map(|i| start + i)
+        .collect()
 }
 
 /// ROI モードを実フレームサイズのピクセル矩形へ展開する。
@@ -2935,6 +3253,15 @@ mod tests {
         }
     }
 
+    /// 計測用テストが環境変数からフレーム選択モードを選ぶための共通パーサ。
+    fn parse_select_mode(name: &str) -> FrameSelectMode {
+        match name {
+            "uniform" => FrameSelectMode::Uniform,
+            "sign-span" => SIGN_SPAN,
+            other => panic!("unknown frame select mode: {}", other),
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -3299,6 +3626,83 @@ mod tests {
         assert_eq!(sample_bilinear(&frame, -5.0, -5.0), [0.0, 0.0, 0.0]);
     }
 
+    // === 実験6: サイン区間からのフレーム選択(純粋関数) ===
+
+    #[test]
+    fn longest_hit_span_basics() {
+        // 期待値の根拠: hit が無ければ区間なし
+        assert_eq!(longest_hit_span(&[false, false, false], 1), None);
+        assert_eq!(longest_hit_span(&[], 1), None);
+        // 全部 hit なら全体
+        assert_eq!(longest_hit_span(&[true; 5], 1), Some((0, 4)));
+        // 両端の miss は区間に含めない(端点は必ず hit)
+        assert_eq!(
+            longest_hit_span(&[false, true, true, false], 1),
+            Some((1, 2))
+        );
+        // 瞬断 1 個は max_gap=1 なら橋渡しされ、2 個なら分断される
+        assert_eq!(
+            longest_hit_span(&[true, false, true, false, false, true], 1),
+            Some((0, 2))
+        );
+        // 同じ列でも max_gap=2 なら全部つながる
+        assert_eq!(
+            longest_hit_span(&[true, false, true, false, false, true], 2),
+            Some((0, 5))
+        );
+        // 長い方を採る
+        assert_eq!(
+            longest_hit_span(&[true, false, false, true, true, true], 0),
+            Some((3, 5))
+        );
+        // 同長なら先に現れた方(サインは動画前半に寄るという実測に合わせる)
+        assert_eq!(
+            longest_hit_span(&[true, true, false, false, true, true], 0),
+            Some((0, 1))
+        );
+    }
+
+    #[test]
+    fn sign_span_frames_margin_and_clamp() {
+        // 期待値の根拠: サンプル添字 i → フレーム i*step、端は step/2 の余裕
+        // sample 2..4, step 8 → frames 16..32、margin 4 → 12..36
+        assert_eq!(sign_span_frames((2, 4), 8, 120, 10), Some((12, 36)));
+        // 先頭側は 0 未満にならない(saturating)
+        assert_eq!(sign_span_frames((0, 2), 8, 120, 10), Some((0, 20)));
+        // 末尾側は frame_count-1 でクランプ(sample 14..15 → frames 112..120 → margin 4 → 108..124)
+        assert_eq!(sign_span_frames((14, 15), 8, 120, 10), Some((108, 119)));
+        // クランプが要らない位置ではそのまま(sample 13..14 → 104..112 → margin 4 → 100..116)
+        assert_eq!(sign_span_frames((13, 14), 8, 120, 10), Some((100, 116)));
+        // 短い区間は target フレーム分まで対称に広げる(1 サンプルだけ hit のケース)
+        let (s, e) = sign_span_frames((5, 5), 2, 120, 10).unwrap();
+        assert_eq!(e - s + 1, 10, "target 枚に満たない区間が広げられていない");
+        assert!(s <= 10 && e >= 10, "元の区間 {}..{} を含んでいない", s, e);
+        // 動画自体が target より短ければ全体になる(広げようがない)
+        assert_eq!(sign_span_frames((0, 0), 1, 5, 10), Some((0, 4)));
+        // 退化した入力
+        assert_eq!(sign_span_frames((0, 0), 1, 0, 10), None);
+        assert_eq!(sign_span_frames((0, 0), 0, 10, 10), None);
+    }
+
+    #[test]
+    fn span_indices_offsets_and_covers_endpoints() {
+        // 期待値の根拠: 区間内の選び方は downsample_indices と同じ規則 + オフセット
+        assert_eq!(span_indices(10, 19, 10), (10..20).collect::<Vec<_>>());
+        let idx = span_indices(20, 40, 5);
+        assert_eq!(idx.first(), Some(&20), "区間の先頭を含むこと");
+        assert_eq!(idx.last(), Some(&40), "区間の末尾を含むこと");
+        assert_eq!(idx.len(), 5);
+        // 区間 = 動画全体なら従来の等間隔と完全に一致する(モードの退化)
+        for n in [1usize, 7, 10, 123, 200] {
+            assert_eq!(
+                span_indices(0, n - 1, 10),
+                downsample_indices(n, 10),
+                "全体を区間にしたとき等間隔と一致しない (n={})",
+                n
+            );
+        }
+    }
+
     #[test]
     fn assemble_selected_fills_missing_tail() {
         let mut got: BTreeMap<usize, char> = BTreeMap::new();
@@ -3352,7 +3756,7 @@ mod tests {
         let fast =
             extract_tag_features_impl(
                 &video, &mut palm, &mut hand, &palm_anchors, 10, false,
-                PalmRoiMode::FullFrame, None,
+                PalmRoiMode::FullFrame, None, FrameSelectMode::Uniform,
             )
                 .unwrap();
         let fast_elapsed = t.elapsed();
@@ -3360,7 +3764,7 @@ mod tests {
         let full =
             extract_tag_features_impl(
                 &video, &mut palm, &mut hand, &palm_anchors, 10, true,
-                PalmRoiMode::FullFrame, None,
+                PalmRoiMode::FullFrame, None, FrameSelectMode::Uniform,
             )
                 .unwrap();
         let full_elapsed = t.elapsed();
@@ -4125,14 +4529,124 @@ mod tests {
         eprintln!("mode={} ({}) overlay -> {}", mode_name, mode.label(), dir.display());
     }
 
-    /// 指定した ROI モードで pose dict を作り直す(Step 5 の下流評価用)。
+    /// 実験6: 選ばれた 10 フレームを **実際に目で見る**ための出力。
+    /// 選択モードごとに、選ばれたフレームへ手のランドマークを描いた PNG を並べて保存する。
+    /// 「集計値は良くなったが実は壊れている」を防ぐための目視導線(S6 の教訓)。
+    ///
+    /// 環境変数:
+    ///   SELECT_VIDEO  対象動画(既定 /tmp/palm_roi_measure/takes/arigatou-03.mp4)
+    ///   SELECT_ROI    full(既定) | center | tiles3 ...(parse_roi_mode と同じ)
+    ///   SELECT_OUT    出力先(既定 /tmp/exp6_selected)
+    ///
+    /// 手動実行: `SELECT_VIDEO=... cargo test overlay_selected_frames --release -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn overlay_selected_frames() {
+        let video = PathBuf::from(
+            std::env::var("SELECT_VIDEO")
+                .unwrap_or_else(|_| "/tmp/palm_roi_measure/takes/arigatou-03.mp4".into()),
+        );
+        for p in [video.as_path(), Path::new(PALM_MODEL), Path::new(HAND_MODEL)] {
+            if !p.exists() {
+                eprintln!("skip: fixture not found: {}", p.display());
+                return;
+            }
+        }
+        let roi = parse_roi_mode(&std::env::var("SELECT_ROI").unwrap_or_else(|_| "full".into()));
+        let out_root = PathBuf::from(
+            std::env::var("SELECT_OUT").unwrap_or_else(|_| "/tmp/exp6_selected".into()),
+        );
+        let name = video.file_stem().unwrap().to_string_lossy().to_string();
+
+        let palm_anchors = load_palm_anchors();
+        let mut palm = Session::builder().unwrap().commit_from_file(PALM_MODEL).unwrap();
+        let mut hand = Session::builder().unwrap().commit_from_file(HAND_MODEL).unwrap();
+        let info = probe_video(&video).unwrap();
+
+        for (label, select) in [
+            ("uniform", FrameSelectMode::Uniform),
+            ("sign-span", SIGN_SPAN),
+        ] {
+            let dir = out_root.join(&name).join(label);
+            std::fs::create_dir_all(&dir).unwrap();
+            let indices = select_frame_indices(
+                &video, &info, &mut palm, &palm_anchors, roi, None, 10, select,
+            )
+            .unwrap();
+            eprintln!("[{}] {} -> indices {:?}", label, name, indices);
+            let wanted: std::collections::BTreeSet<usize> = indices.iter().copied().collect();
+            let mut per_frame: BTreeMap<usize, usize> = BTreeMap::new();
+            extract_frames_filtered(
+                &video,
+                info.width,
+                info.height,
+                |i| wanted.contains(&i),
+                |idx, frame| {
+                    let palms =
+                        run_palm_detection_mode(&mut palm, &frame, &palm_anchors, roi, None)?;
+                    let mut hands: Vec<Hand> = Vec::new();
+                    for p in &palms {
+                        if let Some(h) = run_hand_landmark(&mut hand, &frame, p)? {
+                            hands.push(h);
+                        }
+                    }
+                    per_frame.insert(idx, hands.len());
+                    // 生フレームに手の骨格を描いて保存(目視用)
+                    let h_px = frame.shape()[0] as u32;
+                    let w_px = frame.shape()[1] as u32;
+                    let raw: Vec<u8> = frame.iter().copied().collect();
+                    let mut img: ImageBuffer<Rgb<u8>, Vec<u8>> =
+                        ImageBuffer::from_raw(w_px, h_px, raw).unwrap();
+                    for hd in &hands {
+                        let color = if hd.handedness > 0.5 {
+                            Rgb([255u8, 0, 200])
+                        } else {
+                            Rgb([60u8, 120, 255])
+                        };
+                        for &(a, b) in HAND_CONNECTIONS {
+                            let p = &hd.landmarks[a];
+                            let q = &hd.landmarks[b];
+                            draw_line(&mut img, p.x, p.y, q.x, q.y, color, 2);
+                        }
+                        for lm in &hd.landmarks {
+                            draw_dot(&mut img, lm.x, lm.y, 4, color);
+                        }
+                    }
+                    let rank = indices.iter().position(|&i| i == idx).unwrap_or(0);
+                    img.save(dir.join(format!(
+                        "sel{:02}_frame{:05}_hands{}.png",
+                        rank,
+                        idx,
+                        hands.len()
+                    )))
+                    .unwrap();
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let with_hand = indices
+                .iter()
+                .filter(|i| per_frame.get(i).copied().unwrap_or(0) > 0)
+                .count();
+            eprintln!(
+                "[{}] 手が写っていた選択フレーム: {}/{} -> {}",
+                label,
+                with_hand,
+                indices.len(),
+                dir.display()
+            );
+        }
+    }
+
+    /// 指定した ROI モード・フレーム選択モードで pose dict を作り直す(下流評価用)。
     /// **既存の dict は上書きしない**。出力先は必ず新しいファイル名を指定すること。
     ///
     /// 環境変数:
-    ///   DICT_ROI_MODE full | center | sign | tiles3(既定 tiles3)
+    ///   DICT_ROI_MODE full | center | sign | tiles3 | person | person-upper(既定 tiles3)
+    ///   DICT_SELECT   uniform(既定・従来) | sign-span(実験6)
     ///   DICT_OUT      出力 JSON パス(既定 ../transformer_burn/data/pose_dict_full_<mode>.json)
     ///
-    /// 手動実行: `DICT_ROI_MODE=tiles3 cargo test build_dict_with_palm_roi --release -- --ignored --nocapture`
+    /// 手動実行: `DICT_ROI_MODE=center DICT_SELECT=sign-span cargo test build_dict_with_palm_roi --release -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn build_dict_with_palm_roi() {
@@ -4145,8 +4659,15 @@ mod tests {
         }
         let mode_name = std::env::var("DICT_ROI_MODE").unwrap_or_else(|_| "tiles3".into());
         let mode = parse_roi_mode(&mode_name);
+        let select_name = std::env::var("DICT_SELECT").unwrap_or_else(|_| "uniform".into());
+        let select = parse_select_mode(&select_name);
+        let suffix = if select_name == "uniform" {
+            mode_name.clone()
+        } else {
+            format!("{}_{}", mode_name, select_name)
+        };
         let out = PathBuf::from(std::env::var("DICT_OUT").unwrap_or_else(|_| {
-            format!("../transformer_burn/data/pose_dict_full_{}.json", mode_name)
+            format!("../transformer_burn/data/pose_dict_full_{}.json", suffix)
         }));
         assert!(
             !out.ends_with("pose_dict_full.json") && !out.ends_with("pose_dict_stage1.json")
@@ -4162,8 +4683,19 @@ mod tests {
             eprintln!("exported {} takes", n);
         }
         let t = std::time::Instant::now();
-        build_dict_mode(&export_dir, &out, 10, mode).unwrap();
-        eprintln!("mode={} ({}) -> {} ({:?})", mode_name, mode.label(), out.display(), t.elapsed());
+        build_dict_mode(&export_dir, &out, 10, mode, select).unwrap();
+        let elapsed = t.elapsed();
+        let n_videos = list_videos(&export_dir).len().max(1);
+        eprintln!(
+            "mode={} ({}) select={} ({}) -> {} ({:?} total, {:.2} s/本)",
+            mode_name,
+            mode.label(),
+            select_name,
+            select.label(),
+            out.display(),
+            elapsed,
+            elapsed.as_secs_f64() / n_videos as f64
+        );
     }
 
     #[test]
@@ -4211,7 +4743,11 @@ mod tests {
             .unwrap();
 
         let entry =
-            extract_tag_features(&video, &mut palm, &mut hand, &palm_anchors, frames).unwrap();
+            extract_tag_features(
+                &video, &mut palm, &mut hand, &palm_anchors, frames,
+                FrameSelectMode::Uniform,
+            )
+            .unwrap();
         let flat: Vec<f32> = entry.sequence.iter().flatten().copied().collect();
         assert_eq!(flat.len(), frames * DICT_FEATURE_DIM);
 

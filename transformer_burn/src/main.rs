@@ -82,9 +82,9 @@ struct Args {
     #[arg(long)]
     mirror_augment: bool,
 
-    /// 乱数シード(モデル重み初期化に使用)。--train-pose / --eval-holdout / --predict-pose で
-    /// 同じ値を指定すれば結果が再現できる。バッチの並び順は現状シャッフルしていないため、
-    /// 揺れの発生源は重み初期化のみ
+    /// 乱数シード(モデル重み初期化に使用)。固定されるのは重み初期化の乱数列のみで、
+    /// wgpu バックエンドは行列積・reduction の実行順序が非決定的なため、同じ値を指定しても
+    /// 学習結果(loss・予測)までは再現されない。バッチの並び順は現状シャッフルしていない
     #[arg(long, default_value_t = 42)]
     seed: u64,
 
@@ -226,7 +226,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///   未見テイク評価: cargo run --release -- --eval-holdout data/pose_dict_smoke.json [--holdout-per-label 1]
 fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let device = WgpuDevice::default();
-    // モデル重み初期化を再現可能にする(データのシャッフルは無いため揺れの発生源はここのみ)。
+    // モデル重み初期化の乱数列を固定する(データのシャッフルは無い)。ただし wgpu バックエンドの
+    // 浮動小数演算は並列実行順序に依存して非決定的なため、これだけでは学習結果までは固定されない。
     // モデル構築より前に呼ぶ必要がある
     TrainingBackend::seed(args.seed);
     println!("seed: {}", args.seed);

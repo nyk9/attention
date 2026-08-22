@@ -609,10 +609,10 @@ mod tests {
     }
 
     // [TEST向き] --train-pose + --drop-descriptor(--save 無し)が形状不一致にならないこと。
-    // 修正前は main.rs:465 が to_input_features(input_features) を呼んでおり、data 側は
+    // 修正前は --train-pose 経路が to_input_features(input_features) を呼んでおり、data 側は
     // 全成分(66次元)のまま、model_config.input_dim だけ parts.feature_dim()(62次元)に
     // 縮んでいたため、学習開始直後に形状不一致で落ちていた。--eval-holdout 経路と同じく
-    // to_input_features_with_parts(input_features, parts) に揃えたことで解消したはず
+    // to_input_features_with_parts(input_features, parts) に揃えて解消した
     #[test]
     fn train_pose_with_drop_descriptor_matches_model_input_dim() {
         let mut args = base_args();
@@ -623,6 +623,9 @@ mod tests {
         args.epochs = 1;
 
         run_recognition(&args)
-            .expect("--train-pose + --drop-descriptor が形状不一致で失敗した(main.rs:465 を確認)");
+            .expect(
+                "--train-pose + --drop-descriptor が形状不一致で失敗した\
+                 (--train-pose 経路の to_input_features_with_parts 呼び出しを確認)",
+            );
     }
 }

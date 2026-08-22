@@ -210,6 +210,7 @@ hand landmark: 170 frames with hands, 335 hands total
 入力ディレクトリ(<タグ名>.mp4 を置いた場所)  [videos]
 出力 JSON パス                                [tag_pose_dict.json]
 ダウンサンプルするフレーム数                  [10]
+フレームの選び方                              [動画全体から等間隔(従来・既定)]
 ```
 
 - **入力**: `--input-dir` 内の `<タグ名>.mp4`(ファイル名の拡張子を除いた部分がタグ名)
@@ -230,6 +231,8 @@ hand landmark: 170 frames with hands, 335 hands total
     "feature_layout": "left_hand[21*xyz] then right_hand[21*xyz]; missing hand = zeros",
     "normalization": "x/=width, y/=height, z/=width (z is relative depth)",
     "coverage_basis": "selected frames only (the frames that became `sequence`)",
+    "palm_roi": "full-frame",
+    "frame_select": "uniform",
     "tag_count": 2
   },
   "tags": {
@@ -253,6 +256,21 @@ hand landmark: 170 frames with hands, 335 hands total
   (実測で1本あたり約3倍。残りはデコードとパイプ転送のコスト)。sequence は
   旧版と完全一致する(等価性スモーク `selected_frames_equivalence_smoke` で回帰確認可)。
 
+### フレームの選び方(2026-08-22 追加)
+
+- **動画全体から等間隔(従来・既定)**: `downsample_indices` による均等間隔。
+  総フレーム数だけで選ぶフレームが決まるので、一次パス不要で速い
+- **サイン区間から等間隔(実験6)**: 一次パスで動画を 16 点サンプリングして
+  **Palm 検出だけ**を走らせ、連続して手が見えた最長区間を求めてから、
+  その区間内で等間隔に選ぶ(瞬断は 1 サンプルまで橋渡し。手が 1 度も見つからなければ
+  従来の等間隔にフォールバック)
+  - **手が写っている選択フレームは 3.69/10 → 8.68/10 に増える**が、
+    **下流の認識精度は変わらなかった**(実験6、20 runs: top-1 +0.1 件 p=0.89)。
+    **処理時間は 2.3 倍**(1本 1.77 秒 → 4.12 秒)。詳細は
+    `docs/experiments/sign-span-frame-selection.md`
+  - **学習に使った dict と推論で選び方を揃えること**。ずれると train/test 不一致になる。
+    dict の `metadata.frame_select` に何で作ったかが記録される
+
 ## 動画からタグを認識(メニュー:「動画からタグを認識(推論)」)
 
 学習済みの認識モデル(手ポーズ列→タグ)を使って、**動画1本を入れたらタグが出る**直結パス。
@@ -267,6 +285,8 @@ build-dict→学習→判定の3手順のうち、判定だけをワンショッ
    `tag_vocab.json` を持たないので候補に出ません
 3. **フレーム数**: 学習時の `SEQ_LEN`(既定 10)と揃える
 4. **表示件数**: 上位何件のタグを出すか(既定 5)
+5. **フレームの選び方**: build-dict と同じ選択肢(既定は従来の等間隔)。
+   **学習に使った dict と揃えること**(揃えないと train/test 不一致になる)
 
 動画から 126 次元の手ポーズ列を抽出し、モデルを **CPU(NdArray)で読み込んで**推論します
 (動画1本の判定に GPU は不要)。出力は上位 k タグと確率、加えて手の検出率(coverage)。

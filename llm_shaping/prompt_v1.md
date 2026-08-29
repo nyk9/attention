@@ -4,7 +4,8 @@
 下記「プロンプト本文」をシステムプロンプト(または会話の先頭)に置き、
 「入力形式」の形でスロット列を渡す。
 
-- 語彙表は words.tsv(`transformer_burn/data/raw_jsl/words.tsv`)から生成した(50語)。
+- 語彙表は words.tsv(`transformer_burn/data/raw_jsl/words.tsv`)から生成した(51語、2026-08-14同期)。
+  stage 2 での語彙整理(hai/iie→atteru/chigau、hanasu→iu、samui→samui-kowai 等)を反映済み。
   **認識モデルのタグ語彙(tag_vocab.json)を増やしたら語彙表も同期すること**
 
 ---
@@ -35,8 +36,8 @@ kare → かれ
 kanojo → かのじょ
 kore → これ
 are-sore → あれ・それ(文脈でどちらかを選ぶ)
-hai → はい
-iie → いいえ
+atteru → 合ってる
+chigau → 違う
 wakaru → わかる
 wakaranai → わからない
 ok → OK
@@ -49,16 +50,17 @@ iku → 行く
 kuru → 来る
 miru → 見る
 kiku → 聞く
-hanasu → 話す
+iu → 言う
 kaku → 書く
 yomu → 読む
 suki → 好き
 kirai → 嫌い
 dekiru → できる
+dekinai-muzukashii → できない・難しい(文脈でどちらかを選ぶ)
 ookii → 大きい
 chiisai → 小さい
 atsui → 暑い
-samui → 寒い
+samui-kowai → 寒い・怖い(文脈でどちらかを選ぶ)
 atarashii → 新しい
 furui → 古い
 ichi → 1

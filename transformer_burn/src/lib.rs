@@ -8,6 +8,8 @@
 pub mod checkpoint;
 pub mod config;
 pub mod export;
+pub mod feature_stats;
+pub mod handshape_features;
 #[cfg(feature = "wgpu")]
 pub mod inference;
 pub mod jsl_data;

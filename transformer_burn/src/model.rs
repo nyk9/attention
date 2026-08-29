@@ -9,8 +9,14 @@ pub struct FeedForward<B: Backend> {
 }
 impl<B: Backend> FeedForward<B> {
     pub fn new(device: &B::Device) -> Self {
-        let w1 = LinearConfig::new(D_MODEL, D_FF).init(device);
-        let w2 = LinearConfig::new(D_FF, D_MODEL).init(device);
+        Self::new_with_dims(D_MODEL, D_FF, device)
+    }
+
+    /// 寸法を指定して構築する版。認識モデル(縮小可能)向けの口で、
+    /// 足場の Seq2Seq は上の `new` から現行 const を渡して呼ぶだけなので挙動は変わらない
+    pub fn new_with_dims(d_model: usize, d_ff: usize, device: &B::Device) -> Self {
+        let w1 = LinearConfig::new(d_model, d_ff).init(device);
+        let w2 = LinearConfig::new(d_ff, d_model).init(device);
 
         Self { w_1: w1, w_2: w2 }
     }
@@ -30,12 +36,23 @@ impl<B: Backend> FeedForward<B> {
 }
 impl<B: Backend> TransformerBlock<B> {
     pub fn new(device: &B::Device) -> Self {
-        let attention = CustomMultiHeadAttention::new(device);
-        let feed_forward = FeedForward::new(device);
+        Self::new_with_dims(D_MODEL, NUM_HEADS, D_HEAD, D_FF, device)
+    }
+
+    /// 寸法を指定して構築する版。認識モデル(縮小可能)向けの口
+    pub fn new_with_dims(
+        d_model: usize,
+        num_heads: usize,
+        d_head: usize,
+        d_ff: usize,
+        device: &B::Device,
+    ) -> Self {
+        let attention = CustomMultiHeadAttention::new_with_dims(d_model, num_heads, d_head, device);
+        let feed_forward = FeedForward::new_with_dims(d_model, d_ff, device);
 
         // Layer Normalization  (d_model次元で正規化)
-        let layer_norm1 = LayerNormConfig::new(D_MODEL).init(device);
-        let layer_norm2 = LayerNormConfig::new(D_MODEL).init(device);
+        let layer_norm1 = LayerNormConfig::new(d_model).init(device);
+        let layer_norm2 = LayerNormConfig::new(d_model).init(device);
 
         Self {
             attention,
@@ -89,19 +106,24 @@ pub struct CustomMultiHeadAttention<B: Backend> {
 
 impl<B: Backend> CustomMultiHeadAttention<B> {
     pub fn new(device: &B::Device) -> Self {
+        Self::new_with_dims(D_MODEL, NUM_HEADS, D_HEAD, device)
+    }
+
+    /// 寸法を指定して構築する版。認識モデル(縮小可能)向けの口
+    pub fn new_with_dims(d_model: usize, num_heads: usize, d_head: usize, device: &B::Device) -> Self {
         let mut w_q = Vec::new();
         let mut w_k = Vec::new();
         let mut w_v = Vec::new();
 
         // 各ヘッド用の重み行列を作成
-        for _ in 0..NUM_HEADS {
-            w_q.push(LinearConfig::new(D_MODEL, D_HEAD).init(device));
-            w_k.push(LinearConfig::new(D_MODEL, D_HEAD).init(device));
-            w_v.push(LinearConfig::new(D_MODEL, D_HEAD).init(device));
+        for _ in 0..num_heads {
+            w_q.push(LinearConfig::new(d_model, d_head).init(device));
+            w_k.push(LinearConfig::new(d_model, d_head).init(device));
+            w_v.push(LinearConfig::new(d_model, d_head).init(device));
         }
 
         // 出力射影層 [d_model, d_model]
-        let w_o = LinearConfig::new(D_MODEL, D_MODEL).init(device);
+        let w_o = LinearConfig::new(d_model, d_model).init(device);
 
         Self { w_q, w_k, w_v, w_o }
     }
@@ -110,8 +132,8 @@ impl<B: Backend> CustomMultiHeadAttention<B> {
         // x: [batch_size, seq_len, d_model]
         let mut head_outputs = Vec::new();
 
-        // 各ヘッドで処理
-        for head_idx in 0..NUM_HEADS {
+        // 各ヘッドで処理(ヘッド数はフィールド長から。寸法可変化に伴い定数参照をやめた)
+        for head_idx in 0..self.w_q.len() {
             let output = self.compute_head(x.clone(), head_idx, mask.clone());
             head_outputs.push(output);
         }
@@ -136,9 +158,12 @@ impl<B: Backend> CustomMultiHeadAttention<B> {
 
         // Attention Score: Q × K^T / sqrt(d_head)
         // [batch_size, seq_len, d_head] × [batch_size, d_head, seq_len]
+        // d_head はテンソルの最後の次元(q.dims()[2])から取る。定数参照だと寸法可変化に耐えないため。
+        // q は matmul に値渡しで消費されるので、先に dims() を読んでおく
+        let d_head = q.dims()[2];
         let k_t = k.transpose(); // 最後の2次元を転置
         let scores = q.matmul(k_t);
-        let scale = (D_HEAD as f32).sqrt();
+        let scale = (d_head as f32).sqrt();
         let scores = scores / scale;
 
         // マスクを適用（オプション）
@@ -335,19 +360,24 @@ pub struct CustomCrossAttention<B: Backend> {
 
 impl<B: Backend> CustomCrossAttention<B> {
     pub fn new(device: &B::Device) -> Self {
+        Self::new_with_dims(D_MODEL, NUM_HEADS, D_HEAD, device)
+    }
+
+    /// 寸法を指定して構築する版。認識モデル(縮小可能)向けの口
+    pub fn new_with_dims(d_model: usize, num_heads: usize, d_head: usize, device: &B::Device) -> Self {
         let mut w_q = Vec::new();
         let mut w_k = Vec::new();
         let mut w_v = Vec::new();
 
         // 各ヘッド用の重み行列を作成
-        for _ in 0..NUM_HEADS {
-            w_q.push(LinearConfig::new(D_MODEL, D_HEAD).init(device));
-            w_k.push(LinearConfig::new(D_MODEL, D_HEAD).init(device));
-            w_v.push(LinearConfig::new(D_MODEL, D_HEAD).init(device));
+        for _ in 0..num_heads {
+            w_q.push(LinearConfig::new(d_model, d_head).init(device));
+            w_k.push(LinearConfig::new(d_model, d_head).init(device));
+            w_v.push(LinearConfig::new(d_model, d_head).init(device));
         }
 
         // 出力射影層 [d_model, d_model]
-        let w_o = LinearConfig::new(D_MODEL, D_MODEL).init(device);
+        let w_o = LinearConfig::new(d_model, d_model).init(device);
 
         Self { w_q, w_k, w_v, w_o }
     }
@@ -364,8 +394,8 @@ impl<B: Backend> CustomCrossAttention<B> {
     ) -> Tensor<B, 3> {
         let mut head_outputs = Vec::new();
 
-        // 各ヘッドで処理
-        for head_idx in 0..NUM_HEADS {
+        // 各ヘッドで処理(ヘッド数はフィールド長から。寸法可変化に伴い定数参照をやめた)
+        for head_idx in 0..self.w_q.len() {
             let output = self.compute_head(
                 query_input.clone(),
                 key_value_input.clone(),
@@ -398,9 +428,12 @@ impl<B: Backend> CustomCrossAttention<B> {
 
         // Attention Score: Q × K^T / sqrt(d_head)
         // [batch, tgt_seq_len, d_head] × [batch, d_head, src_seq_len]
+        // d_head はテンソルの最後の次元(q.dims()[2])から取る。定数参照だと寸法可変化に耐えないため。
+        // q は matmul に値渡しで消費されるので、先に dims() を読んでおく
+        let d_head = q.dims()[2];
         let k_t = k.transpose(); // 最後の2次元を転置
         let scores = q.matmul(k_t);
-        let scale = (D_HEAD as f32).sqrt();
+        let scale = (d_head as f32).sqrt();
         let scores = scores / scale;
 
         // マスクを適用（Encoderのパディングマスク）

@@ -1,6 +1,8 @@
 #![recursion_limit = "256"]
 mod checkpoint;
 mod config;
+mod feature_stats;
+mod handshape_features;
 mod inference;
 mod jsl_data;
 mod jsl_vocabulary;
@@ -18,6 +20,7 @@ use metrics::save_metrics;
 use training::train_jsl;
 
 use burn::backend::wgpu::WgpuDevice;
+use burn::prelude::{Backend, Module};
 use clap::Parser;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -73,6 +76,61 @@ struct Args {
     /// held-out にするテイク数(ラベルごと、テイク番号の後ろから)。--eval-holdout 用
     #[arg(long, default_value_t = 1)]
     holdout_per_label: usize,
+
+    /// ミラー拡張: 学習データに左右反転コピーを追加する(--train-pose / --eval-holdout の train 側のみ。
+    /// held-out の未見テイクには適用しない)
+    #[arg(long)]
+    mirror_augment: bool,
+
+    /// 乱数シード(モデル重み初期化に使用)。固定されるのは重み初期化の乱数列のみで、
+    /// wgpu バックエンドは行列積・reduction の実行順序が非決定的なため、同じ値を指定しても
+    /// 学習結果(loss・予測)までは再現されない。バッチの並び順は現状シャッフルしていない
+    #[arg(long, default_value_t = 42)]
+    seed: u64,
+
+    /// 認識モデルのサイズプリセット(base/small/tiny/micro)。未指定なら base(= 現状の設定)。
+    /// --d-model 等の個別フラグはこのプリセットを上書きする
+    #[arg(long)]
+    model_size: Option<String>,
+
+    /// 認識モデルの埋め込み次元 d_model を個別指定(未指定ならプリセット値)
+    #[arg(long)]
+    d_model: Option<usize>,
+
+    /// 認識モデルの Multi-head Attention のヘッド数を個別指定(未指定ならプリセット値)
+    #[arg(long)]
+    num_heads: Option<usize>,
+
+    /// 認識モデルの Feed-forward 中間層の次元数を個別指定
+    /// (未指定時: --d-model のみ指定していれば d_model*4 を自動導出、それ以外はプリセット値)
+    #[arg(long)]
+    d_ff: Option<usize>,
+
+    /// 認識モデルの Transformer 層数を個別指定(未指定ならプリセット値)
+    #[arg(long)]
+    num_layers: Option<usize>,
+
+    /// 認識モデルの入力特徴量(raw / handshape / handshape-mean)。
+    /// raw(既定)= 従来通り生の 126 次元ハンドランドマーク。
+    /// handshape = フレームごとの手形記述子 66 次元(関節角・指先間距離・手首座標)。
+    /// handshape-mean = テイク平均の手形記述子を全フレームに複製したもの
+    #[arg(long, default_value = "raw")]
+    input_features: String,
+
+    /// 入力特徴量を z-score 標準化する(平均・標準偏差は train 分割からのみ算出)。
+    /// 統計量は --save 時に feature_stats.json として保存され、推論時にも同じ変換がかかる
+    #[arg(long)]
+    standardize: bool,
+
+    /// 認識モデルの学習率(未指定なら config::POSE_LEARNING_RATE)
+    #[arg(long)]
+    pose_lr: Option<f64>,
+
+    /// アブレーション: 手形記述子から落とす成分をカンマ区切りで指定
+    /// (angles / tipwrist / tippairs / wrist / offhand)。
+    /// 前処理を保存済みモデルから復元する手段が無いため --save とは併用できない
+    #[arg(long, default_value = "")]
+    drop_descriptor: String,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -168,6 +226,108 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///   未見テイク評価: cargo run --release -- --eval-holdout data/pose_dict_smoke.json [--holdout-per-label 1]
 fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let device = WgpuDevice::default();
+    // モデル重み初期化の乱数列を固定する(データのシャッフルは無い)。ただし wgpu バックエンドの
+    // 浮動小数演算は並列実行順序に依存して非決定的なため、これだけでは学習結果までは固定されない。
+    // モデル構築より前に呼ぶ必要がある
+    TrainingBackend::seed(args.seed);
+    println!("seed: {}", args.seed);
+
+    // 認識モデルのサイズ設定を解決する(サイズ系フラグ未指定なら base = 現行 const と同じ値)。
+    // 学習を始める前に検証エラーで落としたいので、モデルを組む前・分岐の外側で一度だけ呼ぶ
+    let parts = handshape_features::DescriptorParts::parse_drop(&args.drop_descriptor)?;
+    let learning_rate = args.pose_lr.unwrap_or(config::POSE_LEARNING_RATE);
+    if learning_rate <= 0.0 {
+        return Err("--pose-lr には 0 より大きい値を指定してください".into());
+    }
+    // 入力特徴量の種類も、学習を始める前に解決しておく(未知の値なら理由付きで落とす)
+    let input_features = handshape_features::InputFeatures::parse(&args.input_features)?;
+    let model_config = config::RecognitionModelConfig::resolve(
+        args.model_size.as_deref(),
+        args.d_model,
+        args.num_heads,
+        args.d_ff,
+        args.num_layers,
+    )?
+    .with_input_features(input_features);
+    // アブレーションで成分を落とした場合、入力次元も縮む
+    let model_config = if parts.is_full() {
+        model_config
+    } else {
+        model_config.with_input_dim(parts.feature_dim())
+    };
+
+    // --predict-pose(--load 経由の推論)ではモデル構造は保存済みモデル側が真実。
+    // サイズ系フラグを黙って無視すると誤用に気づけないため、何かを始める前にエラーで止める
+    // (--eval-holdout × --load のエラー処理と同じ流儀)
+    let size_flag_given = args.model_size.is_some()
+        || args.d_model.is_some()
+        || args.num_heads.is_some()
+        || args.d_ff.is_some()
+        || args.num_layers.is_some();
+    if !parts.is_full() {
+        // 落とした成分の情報は model_config.json に載せられないので、保存すると
+        // 推論時に同じ前処理を再現できないモデルができてしまう。作らせない
+        if args.save.is_some() {
+            return Err(
+                "--drop-descriptor は測定用のアブレーション専用で、前処理を保存済みモデルから\
+                 復元できないため --save とは併用できません".into(),
+            );
+        }
+        if args.predict_pose.is_some() {
+            return Err("--drop-descriptor は --predict-pose では使えません".into());
+        }
+        if input_features.is_raw() {
+            return Err(
+                "--drop-descriptor は手形記述子専用です(--input-features handshape 系を指定してください)"
+                    .into(),
+            );
+        }
+    }
+    if args.predict_pose.is_some() && args.standardize {
+        return Err(
+            "--predict-pose(--load 経由の推論)では標準化の有無も保存済みモデル側が真実のため、\
+             --standardize は指定できません(feature_stats.json の有無から自動で決まります)"
+                .into(),
+        );
+    }
+    if args.predict_pose.is_some() && !input_features.is_raw() {
+        return Err(
+            "--predict-pose(--load 経由の推論)では入力表現も保存済みモデル側が真実のため、\
+             --input-features は指定できません(モデルの model_config.json から自動で決まります)"
+                .into(),
+        );
+    }
+    if args.predict_pose.is_some() && size_flag_given {
+        return Err(
+            "--predict-pose(--load 経由の推論)ではモデル構造は保存済みモデル側が真実のため、\
+             サイズ系フラグ(--model-size/--d-model/--num-heads/--d-ff/--num-layers)は指定できません"
+                .into(),
+        );
+    }
+
+    // ここで解決した構成でモデルを組むのは学習経路だけ。推論経路では保存済みモデル側の
+    // 構成が使われるため、ここで表示すると実際に読み込まれる構造と食い違って誤解を招く
+    // (推論時の構成表示は load_recognition_model 側が行う)
+    if args.predict_pose.is_none() {
+        println!(
+            "入力特徴量: {} ({}次元/フレーム) 標準化={}",
+            input_features.name(),
+            model_config.input_dim,
+            if args.standardize { "あり" } else { "なし" }
+        );
+        println!("エポック数: {} / 学習率: {}", args.epochs, learning_rate);
+        if !parts.is_full() {
+            println!("記述子アブレーション: 落とした成分={}", parts.dropped_names());
+        }
+        println!(
+            "モデル構成: d_model={} / num_heads={} / d_head={} / d_ff={} / num_layers={}",
+            model_config.d_model,
+            model_config.num_heads,
+            model_config.d_head,
+            model_config.d_ff,
+            model_config.num_layers
+        );
+    }
 
     // --- 未見テイク評価モード(Phase 0a の合否判定) ---
     if let Some(dict_path) = &args.eval_holdout {
@@ -199,16 +359,64 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             split.test.len()
         );
 
+        // ミラー拡張は train 側のみに適用する。held-out(未見テイク)は実撮影データの
+        // 分布のまま評価しないと「解けたことにする」測定になってしまうため対象外。
+        //
+        // 拡張は必ず「生の 126 次元のうちに」行う。手形記述子は左右反転に不変なので、
+        // 記述子へ変換したあとで反転しても完全に同じベクトルが増えるだけで拡張にならない
+        // (handshape_features::tests::mirror_invariance 参照)。そのため記述子を使うときは
+        // ミラー拡張を無効化し、黙って効かないのではなく理由を表示する
+        let mut train_data = split.train;
+        if args.mirror_augment {
+            if input_features.is_raw() {
+                let before = train_data.len();
+                train_data = train_data.with_mirror_augmentation();
+                println!(
+                    "ミラー拡張適用: 学習サンプル {} 件 → {} 件",
+                    before,
+                    train_data.len()
+                );
+            } else {
+                println!(
+                    "注意: --input-features {} は左右反転に不変な記述子のため、\
+                     --mirror-augment は同一ベクトルの複製にしかならず適用しません",
+                    input_features.name()
+                );
+            }
+        }
+        // 生ポーズ → 手形記述子への変換(raw ならクローンのみで内容は不変)
+        let train_data = train_data.to_input_features_with_parts(input_features, parts);
+        let test_data = split.test.to_input_features_with_parts(input_features, parts);
+
+        // 標準化の統計量は train からのみ算出する。held-out を混ぜて計算すると
+        // 未見テイクの情報が前処理に漏れ、評価が甘くなる(転導的な情報漏洩)
+        let stats = if args.standardize {
+            let stats = train_data.fit_standardizer();
+            println!("標準化を適用(統計量は train {} 件から算出)", train_data.len());
+            Some(stats)
+        } else {
+            None
+        };
+        let (train_data, test_data) = match &stats {
+            Some(s) => (train_data.standardized(s), test_data.standardized(s)),
+            None => (train_data, test_data),
+        };
+
         // 語彙は学習データ(train)から構築。held-out のラベルは train の部分集合なので必ず含まれる
-        let vocab = split.train.build_vocabulary();
-        let model =
-            recognition::RecognitionModel::<TrainingBackend>::new(vocab.vocab_size(), &device);
+        let vocab = train_data.build_vocabulary();
+        let model = recognition::RecognitionModel::<TrainingBackend>::new_with_config(
+            vocab.vocab_size(),
+            &model_config,
+            &device,
+        );
+        println!("パラメータ数: {}", model.num_params());
         let (model, loss_history) = recognition_training::train_recognition(
             model,
-            &split.train,
+            &train_data,
             &vocab,
             &device,
             args.epochs,
+            learning_rate,
         );
         println!(
             "訓練完了: Loss {:.6} → {:.6}",
@@ -217,10 +425,13 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         );
 
         println!("\n===== 未見テイクでの評価(これが Phase 0a の合否判定) =====");
-        recognition_training::evaluate_topk(&model, &split.test, &vocab, &device);
+        recognition_training::evaluate_topk(&model, &test_data, &vocab, &device);
 
         if let Some(save_dir) = &args.save {
-            recognition::save_recognition_model(&model, &vocab, save_dir)?;
+            recognition::save_recognition_model(&model, &vocab, &model_config, save_dir)?;
+            if let Some(stats) = &stats {
+                stats.save(save_dir)?;
+            }
         }
         return Ok(());
     }
@@ -235,7 +446,38 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             return Err("--train-pose と --load の併用(継続訓練)は未対応です".into());
         }
 
-        let data = pose_data::PoseTrainingData::load(dict_path)?;
+        let mut data = pose_data::PoseTrainingData::load(dict_path)?;
+        if args.mirror_augment {
+            if input_features.is_raw() {
+                let before = data.len();
+                data = data.with_mirror_augmentation();
+                println!("ミラー拡張適用: {} 件 → {} 件", before, data.len());
+            } else {
+                // 理由は --eval-holdout 側のコメント参照(記述子は左右反転に不変)
+                println!(
+                    "注意: --input-features {} は左右反転に不変な記述子のため、\
+                     --mirror-augment は同一ベクトルの複製にしかならず適用しません",
+                    input_features.name()
+                );
+            }
+        }
+        // 生ポーズ → 手形記述子への変換(raw ならクローンのみで内容は不変)。
+        // --eval-holdout 経路(387-388行目付近)と同じく parts を渡す: --drop-descriptor で
+        // 成分を落とした場合、model_config.input_dim も縮んでいる(252-256行目)ため、
+        // データ側の次元も揃えないと学習時に形状不一致になる
+        let data = data.to_input_features_with_parts(input_features, parts);
+        // ここでは学習データ全体が train なので、そこから統計量を取るのが正しい
+        let stats = if args.standardize {
+            let stats = data.fit_standardizer();
+            println!("標準化を適用(統計量は学習データ {} 件から算出)", data.len());
+            Some(stats)
+        } else {
+            None
+        };
+        let data = match &stats {
+            Some(s) => data.standardized(s),
+            None => data,
+        };
         let vocab = data.build_vocabulary();
         println!(
             "サンプル数: {} / タグ数: {} ({:?})",
@@ -244,10 +486,21 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             vocab.tags
         );
 
-        let model =
-            recognition::RecognitionModel::<TrainingBackend>::new(vocab.vocab_size(), &device);
+        let model = recognition::RecognitionModel::<TrainingBackend>::new_with_config(
+            vocab.vocab_size(),
+            &model_config,
+            &device,
+        );
+        println!("パラメータ数: {}", model.num_params());
         let (model, loss_history) =
-            recognition_training::train_recognition(model, &data, &vocab, &device, args.epochs);
+            recognition_training::train_recognition(
+                model,
+                &data,
+                &vocab,
+                &device,
+                args.epochs,
+                learning_rate,
+            );
 
         println!(
             "訓練完了: Loss {:.6} → {:.6}",
@@ -259,24 +512,120 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         recognition_training::evaluate_topk(&model, &data, &vocab, &device);
 
         if let Some(save_dir) = &args.save {
-            recognition::save_recognition_model(&model, &vocab, save_dir)?;
+            recognition::save_recognition_model(&model, &vocab, &model_config, save_dir)?;
+            if let Some(stats) = &stats {
+                stats.save(save_dir)?;
+            }
         }
         return Ok(());
     }
 
     // --- 推論モード ---
     if let Some(dict_path) = &args.predict_pose {
+        // サイズ系フラグとの併用チェックは run_recognition 冒頭で済ませている
         println!("\n===== 認識モデル推論(手ポーズ列→タグ) =====");
         let load_dir = args
             .load
             .as_ref()
             .ok_or("--predict-pose には --load <モデルディレクトリ> が必要です")?;
 
+        // モデルを組む前に、そのモデルがどの入力表現で学習されたかを読む
+        let saved_config = recognition::load_recognition_config(load_dir)?;
         let (model, vocab) =
             recognition::load_recognition_model::<TrainingBackend>(load_dir, &device)?;
-        let data = pose_data::PoseTrainingData::load(dict_path)?;
+        let data = pose_data::PoseTrainingData::load(dict_path)?
+            .to_input_features(saved_config.input_features);
+        if !saved_config.input_features.is_raw() {
+            println!(
+                "保存済みモデルの入力表現に合わせて pose dict を変換しました: {}",
+                saved_config.input_features.name()
+            );
+        }
+        // 学習時に標準化していたモデルには、保存された統計量で同じ変換を掛ける
+        let data = match feature_stats::FeatureStats::load(load_dir)? {
+            Some(stats) => {
+                println!("保存済みの feature_stats.json で標準化を適用しました");
+                data.standardized(&stats)
+            }
+            None => data,
+        };
         recognition_training::evaluate_topk(&model, &data, &vocab, &device);
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// clap のデフォルト値に合わせた Args。各テストは差分だけ上書きする
+    fn base_args() -> Args {
+        Args {
+            train: false,
+            save: None,
+            load: None,
+            predict: None,
+            backend: "wgpu".to_string(),
+            export_attn: false,
+            train_pose: None,
+            predict_pose: None,
+            epochs: config::POSE_EPOCHS,
+            eval_holdout: None,
+            inspect_dict: None,
+            holdout_per_label: 1,
+            mirror_augment: false,
+            seed: 42,
+            model_size: None,
+            d_model: None,
+            num_heads: None,
+            d_ff: None,
+            num_layers: None,
+            input_features: "raw".to_string(),
+            standardize: false,
+            pose_lr: None,
+            drop_descriptor: String::new(),
+        }
+    }
+
+    // [TEST向き] --train-pose + --drop-descriptor + --save は、既存ガード(267行目付近)で
+    // 引き続き拒否されること。落とした成分は model_config.json に保存できないため、
+    // このガードが無いと二度と読み込めないモデルを保存できてしまう
+    #[test]
+    fn train_pose_with_drop_descriptor_and_save_is_rejected() {
+        let mut args = base_args();
+        args.train_pose = Some(PathBuf::from("data/pose_dict_smoke.json"));
+        args.input_features = "handshape".to_string();
+        args.drop_descriptor = "wrist".to_string();
+        args.save = Some(PathBuf::from("models/_test_should_not_be_created"));
+
+        let err = run_recognition(&args)
+            .expect_err("--train-pose + --drop-descriptor + --save は拒否されるべき");
+        assert!(
+            err.to_string().contains("--save"),
+            "エラーメッセージに --save が含まれていません: {}",
+            err
+        );
+    }
+
+    // [TEST向き] --train-pose + --drop-descriptor(--save 無し)が形状不一致にならないこと。
+    // 修正前は --train-pose 経路が to_input_features(input_features) を呼んでおり、data 側は
+    // 全成分(66次元)のまま、model_config.input_dim だけ parts.feature_dim()(62次元)に
+    // 縮んでいたため、学習開始直後に形状不一致で落ちていた。--eval-holdout 経路と同じく
+    // to_input_features_with_parts(input_features, parts) に揃えて解消した
+    #[test]
+    fn train_pose_with_drop_descriptor_matches_model_input_dim() {
+        let mut args = base_args();
+        args.train_pose = Some(PathBuf::from("data/pose_dict_smoke.json"));
+        args.input_features = "handshape".to_string();
+        args.drop_descriptor = "wrist".to_string();
+        args.model_size = Some("micro".to_string());
+        args.epochs = 1;
+
+        run_recognition(&args)
+            .expect(
+                "--train-pose + --drop-descriptor が形状不一致で失敗した\
+                 (--train-pose 経路の to_input_features_with_parts 呼び出しを確認)",
+            );
+    }
 }

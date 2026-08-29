@@ -1,4 +1,6 @@
 use crate::config::POSE_FEATURE_DIM;
+use crate::feature_stats::FeatureStats;
+use crate::handshape_features::{handshape_sequence_with_parts, DescriptorParts, InputFeatures};
 use crate::tag_vocabulary::TagVocabulary;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -222,6 +224,53 @@ fn read_raw_entries(
     Ok((entries, dict.metadata.frames, dict.metadata.feature_dim))
 }
 
+/// 1 枠(片手分)の次元数(21 点 × [x, y, z])
+const HAND_SLOT_DIM: usize = POSE_FEATURE_DIM / 2;
+
+/// 手ポーズ特徴量を左右反転する(ミラー拡張)。
+///
+/// レイアウト(pose_extractor `frame_hand_feature` 側): 1 フレーム = 左手枠[0..63] +
+/// 右手枠[63..126]、各枠は 21 点 × [x, y, z]、x は width で正規化済み(概ね [0, 1])。
+/// 反転規則: 枠ごと入れ替え(利き手が反転したとみなす)+ 各枠内の x 座標を `1.0 - x` に反転。
+/// y, z は水平反転で値が変わらないためそのまま。検出なし(全ゼロ)の枠は反転してもゼロのまま
+/// (ゼロを 1.0 反転して偽の座標を作らないための安全策)。
+///
+/// 撮影時の左右手ゆれ([[stage1-hand-switching-finding]])に対してモデルを
+/// 汎化させるための学習データ拡張(同じサインを逆の手で行った場合の疑似データを作る)
+// [TEST向き] 純粋関数。境界(片手のみ・両手・両手ゼロ・複数フレーム・反転の対合性)
+pub fn mirror_features(features: &[f32]) -> Vec<f32> {
+    assert_eq!(
+        features.len() % POSE_FEATURE_DIM,
+        0,
+        "features の長さが feature_dim({}) の倍数ではありません: {}",
+        POSE_FEATURE_DIM,
+        features.len()
+    );
+    let frames = features.len() / POSE_FEATURE_DIM;
+    let mut out = vec![0.0f32; features.len()];
+    for t in 0..frames {
+        let frame = &features[t * POSE_FEATURE_DIM..(t + 1) * POSE_FEATURE_DIM];
+        let (left, right) = frame.split_at(HAND_SLOT_DIM);
+        let out_frame = &mut out[t * POSE_FEATURE_DIM..(t + 1) * POSE_FEATURE_DIM];
+        let (out_left, out_right) = out_frame.split_at_mut(HAND_SLOT_DIM);
+        mirror_hand_slot(right, out_left);
+        mirror_hand_slot(left, out_right);
+    }
+    out
+}
+
+/// 片手枠(63次元)を反対側の枠へ x 反転してコピーする。全ゼロ(未検出)ならゼロのまま
+fn mirror_hand_slot(src: &[f32], dst: &mut [f32]) {
+    if src.iter().all(|&v| v == 0.0) {
+        return;
+    }
+    for k in 0..HAND_SLOT_DIM / 3 {
+        dst[k * 3] = 1.0 - src[k * 3]; // x
+        dst[k * 3 + 1] = src[k * 3 + 1]; // y
+        dst[k * 3 + 2] = src[k * 3 + 2]; // z
+    }
+}
+
 /// テイク単位の train/held-out 分割の結果
 pub struct HoldoutSplit {
     /// 学習に使うデータ(held-out を除いたテイク)
@@ -353,6 +402,90 @@ impl PoseTrainingData {
             per_label,
             train_only,
         })
+    }
+
+    /// 各サンプルの左右反転コピーを追加した学習データを返す(件数は2倍)。
+    /// ラベルは元のまま(左右反転しても同じサインという想定)。
+    /// held-out(未見テイク評価用)には使わないこと: 評価は実撮影データの分布で行うべきで、
+    /// 拡張データを混ぜると「解けたことにする」測定になってしまう
+    pub fn with_mirror_augmentation(&self) -> PoseTrainingData {
+        let mut samples = self.samples.clone();
+        samples.extend(self.samples.iter().map(|s| PoseSample {
+            features: mirror_features(&s.features),
+            label: s.label.clone(),
+        }));
+        PoseTrainingData {
+            samples,
+            frames: self.frames,
+            feature_dim: self.feature_dim,
+        }
+    }
+
+    /// 生の手ポーズ列(126次元)を手形記述子(66次元)に変換した学習データを返す。
+    /// ラベル・サンプル件数・フレーム数は変わらず、1 フレームの次元だけが変わる。
+    /// `InputFeatures::Raw` を渡した場合は変換せずクローンを返す(呼び出し側で分岐しなくて済む)
+    pub fn to_input_features(&self, mode: InputFeatures) -> PoseTrainingData {
+        self.to_input_features_with_parts(mode, DescriptorParts::all())
+    }
+
+    /// `to_input_features` の成分選択版(アブレーション用)
+    pub fn to_input_features_with_parts(
+        &self,
+        mode: InputFeatures,
+        parts: DescriptorParts,
+    ) -> PoseTrainingData {
+        if mode.is_raw() {
+            return PoseTrainingData {
+                samples: self.samples.clone(),
+                frames: self.frames,
+                feature_dim: self.feature_dim,
+            };
+        }
+        let samples = self
+            .samples
+            .iter()
+            .map(|s| PoseSample {
+                features: handshape_sequence_with_parts(&s.features, self.frames, mode, parts),
+                label: s.label.clone(),
+            })
+            .collect();
+        PoseTrainingData {
+            samples,
+            frames: self.frames,
+            feature_dim: parts.feature_dim(),
+        }
+    }
+
+    /// このデータから標準化の統計量を求める。
+    /// **train 分割に対してのみ呼ぶこと**(held-out に対して呼ぶと評価が汚染される)
+    pub fn fit_standardizer(&self) -> FeatureStats {
+        FeatureStats::fit(
+            self.samples.iter().map(|s| s.features.as_slice()),
+            self.feature_dim,
+        )
+    }
+
+    /// 与えられた統計量で標準化したデータを返す。統計量は train 由来のものを使う
+    pub fn standardized(&self, stats: &FeatureStats) -> PoseTrainingData {
+        assert_eq!(
+            stats.feature_dim(),
+            self.feature_dim,
+            "標準化の統計量の次元({})がデータの次元({})と一致しません",
+            stats.feature_dim(),
+            self.feature_dim
+        );
+        PoseTrainingData {
+            samples: self
+                .samples
+                .iter()
+                .map(|s| PoseSample {
+                    features: stats.apply(&s.features),
+                    label: s.label.clone(),
+                })
+                .collect(),
+            frames: self.frames,
+            feature_dim: self.feature_dim,
+        }
     }
 
     /// データに現れたラベルからタグ語彙を構築する
@@ -574,5 +707,96 @@ mod tests {
         assert!(!split.train_only.contains(&"word".to_string()));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // [TEST向き] ミラー反転の核。境界(両手・片手のみ・両手ゼロ・複数フレーム)
+    #[test]
+    fn mirror_features_swaps_slots_and_flips_x() {
+        // 1フレーム: 左手枠は point0=(0.1,0.2,0.3)、他は0。右手枠は point0=(0.7,0.8,0.9)、他は0
+        let mut frame = vec![0.0f32; POSE_FEATURE_DIM];
+        frame[0] = 0.1;
+        frame[1] = 0.2;
+        frame[2] = 0.3;
+        frame[HAND_SLOT_DIM] = 0.7;
+        frame[HAND_SLOT_DIM + 1] = 0.8;
+        frame[HAND_SLOT_DIM + 2] = 0.9;
+
+        let mirrored = mirror_features(&frame);
+
+        // 元・右手枠(0.7,0.8,0.9) → 反転して左手枠へ、x = 1.0 - 0.7 = 0.3、y,zはそのまま
+        assert!((mirrored[0] - 0.3).abs() < 1e-6);
+        assert!((mirrored[1] - 0.8).abs() < 1e-6);
+        assert!((mirrored[2] - 0.9).abs() < 1e-6);
+        // 元・左手枠(0.1,0.2,0.3) → 反転して右手枠へ、x = 1.0 - 0.1 = 0.9
+        assert!((mirrored[HAND_SLOT_DIM] - 0.9).abs() < 1e-6);
+        assert!((mirrored[HAND_SLOT_DIM + 1] - 0.2).abs() < 1e-6);
+        assert!((mirrored[HAND_SLOT_DIM + 2] - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mirror_features_leaves_undetected_hand_zero() {
+        // 左手枠のみ検出(右手枠は全ゼロ = 未検出)
+        let mut frame = vec![0.0f32; POSE_FEATURE_DIM];
+        frame[0] = 0.4;
+        frame[1] = 0.5;
+        frame[2] = 0.6;
+
+        let mirrored = mirror_features(&frame);
+
+        // 右手枠(未検出)から反転コピーされた新しい左手枠は、ゼロ入力なのでゼロのまま
+        assert!(mirrored[0..HAND_SLOT_DIM].iter().all(|&v| v == 0.0));
+        // 左手枠(検出あり)から反転コピーされた新しい右手枠は x が反転
+        assert!((mirrored[HAND_SLOT_DIM] - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mirror_features_is_involution_over_multiple_frames() {
+        // 2フレーム分のランダムでない適当な非ゼロ値。2回反転すれば元に戻るはず
+        let mut features = vec![0.0f32; POSE_FEATURE_DIM * 2];
+        for (i, v) in features.iter_mut().enumerate() {
+            *v = (i % 7) as f32 * 0.1 + 0.05; // 全て非ゼロ(両手とも「検出あり」扱いにする)
+        }
+
+        let once = mirror_features(&features);
+        let twice = mirror_features(&once);
+
+        for (a, b) in features.iter().zip(twice.iter()) {
+            assert!((a - b).abs() < 1e-6, "2回反転すれば元に戻るはず: {} vs {}", a, b);
+        }
+    }
+
+    #[test]
+    fn with_mirror_augmentation_doubles_samples_and_keeps_labels() {
+        let data = PoseTrainingData {
+            samples: vec![
+                PoseSample {
+                    features: {
+                        let mut f = vec![0.0f32; POSE_FEATURE_DIM];
+                        f[0] = 0.2;
+                        f
+                    },
+                    label: "word".to_string(),
+                },
+                PoseSample {
+                    features: vec![0.0f32; POSE_FEATURE_DIM],
+                    label: "other".to_string(),
+                },
+            ],
+            frames: 1,
+            feature_dim: POSE_FEATURE_DIM,
+        };
+
+        let augmented = data.with_mirror_augmentation();
+        assert_eq!(augmented.len(), 4, "元2件 + ミラー2件 = 4件");
+        let labels: Vec<&str> = augmented.samples.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(
+            labels.iter().filter(|&&l| l == "word").count(),
+            2,
+            "'word' は元+ミラーの2件になるはず"
+        );
+        // ミラー後のサンプルは元の特徴とは異なる(左右反転が実際に効いている)
+        let mirrored_word = &augmented.samples[2];
+        assert_eq!(mirrored_word.label, "word");
+        assert_ne!(mirrored_word.features, augmented.samples[0].features);
     }
 }

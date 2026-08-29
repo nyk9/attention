@@ -4,6 +4,7 @@
     <title>手話⇄日本語翻訳AI パラメータ数分析</title>
     <date>2025-10-24</date>
     <purpose>本格的な手話翻訳AI開発に必要な規模の見積もり</purpose>
+    <note date="2026-08-30">本ファイルは2025-10-24時点の将来フェーズ(A〜C)の仮の見積もりであり、現在のモデル規模(約48万パラメータ、153サンプル)はここでのPhase A下限(1000万パラメータ)にも遠く届いていない。以下のGPU種別(RTX 3090/4090等)は将来この規模に達した場合の一般的な想定であり、現在のPC購入計画ではない。PC購入は当面保留(docs/cloud-migration-scenario.md、docs/development-plan.md参照)。</note>
   </metadata>
 
   <task-complexity>

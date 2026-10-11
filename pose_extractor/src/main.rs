@@ -458,18 +458,41 @@ fn recognize_wizard(theme: &ColorfulTheme) -> Result<()> {
     // 2. 認識モデル(model.bin + tag_vocab.json を含むディレクトリ)を選ぶ
     let model_dir = select_model_dir(theme)?;
 
+    // 学習に使った dict の前処理(ROI・フレーム選択)がモデルと一緒に保存されていれば読む。
+    // 合っていないと train/test 不一致になる(中央クロップで学習したモデルに
+    // フレーム全体で抽出した特徴を食わせる、など)
+    let preprocess = load_model_preprocess(&model_dir)?;
+
     // 3. フレーム数(学習時の SEQ_LEN と揃える)と表示件数
     let frames: usize = Input::with_theme(theme)
         .with_prompt("ダウンサンプルするフレーム数(学習時の SEQ_LEN と揃える)")
-        .default(10)
+        .default(preprocess.as_ref().and_then(|p| p.frames).unwrap_or(10))
         .interact_text()?;
     let topk: usize = Input::with_theme(theme)
         .with_prompt("上位何件のタグを表示するか")
         .default(5)
         .interact_text()?;
-    // 学習に使った dict と同じ選び方でないと train/test 不一致になる
-    // (dict の metadata.frame_select に何で作ったかが入っている)
-    let select = select_frame_mode(theme)?;
+    let (roi_mode, select) = match &preprocess {
+        Some(p) => {
+            eprintln!(
+                "モデルの preprocess.json に合わせます: palm_roi={} / frame_select={}",
+                p.roi.label(),
+                p.select.label()
+            );
+            (p.roi, p.select)
+        }
+        None => {
+            // 古いモデル(preprocess.json が無い)は従来どおり: ROI はフレーム全体、
+            // フレームの選び方は人が選ぶ(既定は等間隔)
+            eprintln!(
+                "警告: {} に preprocess.json がありません(前処理が記録されていない古いモデル)。\n\
+                 \x20     従来どおり ROI=フレーム全体で抽出します。学習した dict が中央クロップや\n\
+                 \x20     サイン区間選択で作られていた場合、結果が不安定になります",
+                model_dir.display()
+            );
+            (PalmRoiMode::FullFrame, select_frame_mode(theme)?)
+        }
+    };
 
     // 4. Palm + Hand モデルをロード(build_dict と同じ手順)
     let palm_anchors = load_palm_anchors();
@@ -480,14 +503,24 @@ fn recognize_wizard(theme: &ColorfulTheme) -> Result<()> {
         .commit_from_file(HAND_MODEL)
         .with_context(|| format!("failed to load hand model: {}", HAND_MODEL))?;
 
+    // 人物 ROI のモデルのときだけ人物検出モデルも読む(build_dict_mode と同じ)
+    let mut person: Option<PersonDetector> = if matches!(roi_mode, PalmRoiMode::Person { .. }) {
+        Some(PersonDetector::load(PERSON_MODEL)?)
+    } else {
+        None
+    };
+
     // 5. 動画 → 手ポーズ列(TagEntry)を抽出
     eprintln!("\n=== 抽出: {} ===", video.display());
-    let entry = extract_tag_features(
+    let entry = extract_tag_features_impl(
         &video,
         &mut palm_session,
         &mut hand_session,
         &palm_anchors,
         frames,
+        false,
+        roi_mode,
+        person.as_mut(),
         select,
     )?;
     eprintln!(
@@ -519,6 +552,68 @@ fn recognize_wizard(theme: &ColorfulTheme) -> Result<()> {
     println!("\n注意: 学習に使った動画なら当たって当然(配線確認)。本判定は未見テイクで行うこと。");
 
     Ok(())
+}
+
+/// モデルが学習に使った dict の前処理(preprocess.json)を、pose_extractor の型に直したもの。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ModelPreprocess {
+    roi: PalmRoiMode,
+    select: FrameSelectMode,
+    /// 学習時のフレーム数 T(dict の metadata.frames)。無ければ None
+    frames: Option<usize>,
+}
+
+/// モデルディレクトリの preprocess.json を読む。**ファイルが無ければ None**(古いモデル。
+/// 呼び出し側が警告を出して従来の挙動 = FullFrame + 均等間隔に戻す)。
+/// 読めたが解釈できない値が入っていた場合は警告を出して該当項目だけ従来の値にする。
+fn load_model_preprocess(model_dir: &Path) -> Result<Option<ModelPreprocess>> {
+    let info = transformer_burn::preprocess_info::PreprocessInfo::load(model_dir)
+        .map_err(|e| anyhow::anyhow!("preprocess.json の読み込みに失敗: {}", e))?;
+    Ok(info.map(|info| {
+        let (pre, warnings) = model_preprocess_from_info(&info);
+        for w in warnings {
+            eprintln!("警告: {}", w);
+        }
+        pre
+    }))
+}
+
+/// preprocess.json の中身 → ROI・フレーム選択。キーが無い(null)のは古い dict で、
+/// palm_roi なら FullFrame、frame_select なら Uniform で作られている(それぞれ追加前の挙動)。
+/// 解釈できない文字列は従来の値に戻し、理由を警告として返す。
+// [TEST向き] 純粋関数。キー無し・未知の文字列・正常値
+fn model_preprocess_from_info(
+    info: &transformer_burn::preprocess_info::PreprocessInfo,
+) -> (ModelPreprocess, Vec<String>) {
+    let mut warnings = Vec::new();
+    let roi = match info.palm_roi.as_deref() {
+        None => PalmRoiMode::FullFrame,
+        Some(label) => PalmRoiMode::from_label(label).unwrap_or_else(|| {
+            warnings.push(format!(
+                "preprocess.json の palm_roi '{}' を解釈できません。フレーム全体にします",
+                label
+            ));
+            PalmRoiMode::FullFrame
+        }),
+    };
+    let select = match info.frame_select.as_deref() {
+        None => FrameSelectMode::Uniform,
+        Some(label) => FrameSelectMode::from_label(label).unwrap_or_else(|| {
+            warnings.push(format!(
+                "preprocess.json の frame_select '{}' を解釈できません。等間隔にします",
+                label
+            ));
+            FrameSelectMode::Uniform
+        }),
+    };
+    (
+        ModelPreprocess {
+            roi,
+            select,
+            frames: info.frames,
+        },
+        warnings,
+    )
 }
 
 /// videos/ 内の動画を一覧から選ばせる(無ければ/その他はパス直接入力)
@@ -1056,6 +1151,9 @@ fn build_dict_mode(
 
 /// 1 動画からハンドランドマーク列を抽出し、`target` フレームにダウンサンプルした TagEntry を返す。
 // [評価] 推論依存。出力の良し悪しは coverage 等の指標で評価(テストでなく計測)
+// recognize_wizard が ROI を指定できる extract_tag_features_impl を直接呼ぶようになったため、
+// この FullFrame 固定の薄いラッパーはテストからだけ使う
+#[cfg(test)]
 fn extract_tag_features(
     video: &PathBuf,
     palm_session: &mut Session,
@@ -1828,6 +1926,41 @@ impl PalmRoiMode {
             }
         }
     }
+
+    /// `label()` の逆引き。pose dict の metadata.palm_roi や、モデルディレクトリの
+    /// preprocess.json に入っている文字列から ROI を復元するために使う。
+    /// 解釈できない文字列は None(呼び出し側で警告して既定に戻す)
+    fn from_label(label: &str) -> Option<Self> {
+        let label = label.trim();
+        match label {
+            "full-frame" => return Some(PalmRoiMode::FullFrame),
+            "center-square" => return Some(PalmRoiMode::CenterSquare),
+            _ => {}
+        }
+        // "name(args)" 形式
+        let (name, rest) = label.split_once('(')?;
+        let args = rest.strip_suffix(')')?;
+        let parts: Vec<&str> = args.split(',').map(str::trim).collect();
+        match name {
+            "relative" => {
+                let v: Vec<f32> = parts.iter().filter_map(|p| p.parse().ok()).collect();
+                if v.len() == 4 && parts.len() == 4 {
+                    Some(PalmRoiMode::Relative { x: v[0], y: v[1], w: v[2], h: v[3] })
+                } else {
+                    None
+                }
+            }
+            "tiles" if parts.len() == 1 => parts[0]
+                .parse()
+                .ok()
+                .map(|count| PalmRoiMode::Tiles { count }),
+            "person" if parts.len() == 2 => Some(PalmRoiMode::Person {
+                region: PersonRegion::from_label(parts[0])?,
+                scale: parts[1].parse().ok()?,
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// **実験6**: build-dict / 認識で「動画のどのフレームを T 枚選ぶか」の方式。
@@ -1849,6 +1982,30 @@ impl FrameSelectMode {
                 format!("sign-span(samples={},max_gap={})", samples, max_gap)
             }
         }
+    }
+
+    /// `label()` の逆引き(dict の metadata.frame_select / preprocess.json から復元する)。
+    /// 解釈できない文字列は None
+    fn from_label(label: &str) -> Option<Self> {
+        let label = label.trim();
+        if label == "uniform" {
+            return Some(FrameSelectMode::Uniform);
+        }
+        let args = label.strip_prefix("sign-span(")?.strip_suffix(')')?;
+        let mut samples = None;
+        let mut max_gap = None;
+        for kv in args.split(',') {
+            let (k, v) = kv.split_once('=')?;
+            match k.trim() {
+                "samples" => samples = v.trim().parse().ok(),
+                "max_gap" => max_gap = v.trim().parse().ok(),
+                _ => return None,
+            }
+        }
+        Some(FrameSelectMode::SignSpan {
+            samples: samples?,
+            max_gap: max_gap?,
+        })
     }
 }
 
@@ -2259,6 +2416,16 @@ impl PersonRegion {
             PersonRegion::Bbox => "bbox",
             PersonRegion::FullBody => "fullbody",
             PersonRegion::UpperBody => "upperbody",
+        }
+    }
+
+    /// `label()` の逆引き。未知の名前は None
+    fn from_label(name: &str) -> Option<Self> {
+        match name {
+            "bbox" => Some(PersonRegion::Bbox),
+            "fullbody" => Some(PersonRegion::FullBody),
+            "upperbody" => Some(PersonRegion::UpperBody),
+            _ => None,
         }
     }
 }
@@ -3974,6 +4141,66 @@ mod tests {
                 d.hits, d.misses
             );
         }
+    }
+
+    // === preprocess.json(モデルが学習した dict の前処理)の復元 ===
+
+    // [TEST向き] label() → from_label() で元のモードに戻ること(dict metadata と同じ書式)
+    #[test]
+    fn palm_roi_label_roundtrip() {
+        for mode in [
+            PalmRoiMode::FullFrame,
+            PalmRoiMode::CenterSquare,
+            SIGN_ROI,
+            PalmRoiMode::Tiles { count: 3 },
+            PERSON_ROI,
+            PalmRoiMode::Person { region: PersonRegion::UpperBody, scale: PERSON_ROI_SCALE },
+        ] {
+            assert_eq!(PalmRoiMode::from_label(&mode.label()), Some(mode), "{}", mode.label());
+        }
+        assert_eq!(PalmRoiMode::from_label("nonsense"), None);
+        assert_eq!(PalmRoiMode::from_label("tiles(x)"), None);
+        assert_eq!(PalmRoiMode::from_label("relative(0.1,0.2,0.3)"), None);
+    }
+
+    #[test]
+    fn frame_select_label_roundtrip() {
+        for mode in [FrameSelectMode::Uniform, SIGN_SPAN] {
+            assert_eq!(FrameSelectMode::from_label(&mode.label()), Some(mode), "{}", mode.label());
+        }
+        assert_eq!(
+            FrameSelectMode::from_label("sign-span(samples=16,max_gap=1)"),
+            Some(SIGN_SPAN)
+        );
+        assert_eq!(FrameSelectMode::from_label("sign-span(samples=16)"), None);
+        assert_eq!(FrameSelectMode::from_label("whatever"), None);
+    }
+
+    // [TEST向き] 実 dict の組み合わせ(center + sign-span)/ キー無しの古い dict / 未知の文字列
+    #[test]
+    fn model_preprocess_from_info_cases() {
+        use transformer_burn::preprocess_info::PreprocessInfo;
+        let (p, w) = model_preprocess_from_info(&PreprocessInfo {
+            palm_roi: Some("center-square".into()),
+            frame_select: Some("sign-span(samples=16,max_gap=1)".into()),
+            frames: Some(10),
+        });
+        assert_eq!((p.roi, p.select, p.frames), (PalmRoiMode::CenterSquare, SIGN_SPAN, Some(10)));
+        assert!(w.is_empty());
+
+        // 古い dict: キー無し = full-frame + uniform
+        let (p, w) = model_preprocess_from_info(&PreprocessInfo::default());
+        assert_eq!((p.roi, p.select), (PalmRoiMode::FullFrame, FrameSelectMode::Uniform));
+        assert!(w.is_empty());
+
+        // 解釈できない値は従来値に戻して警告
+        let (p, w) = model_preprocess_from_info(&PreprocessInfo {
+            palm_roi: Some("future-roi".into()),
+            frame_select: Some("future-select".into()),
+            frames: None,
+        });
+        assert_eq!((p.roi, p.select), (PalmRoiMode::FullFrame, FrameSelectMode::Uniform));
+        assert_eq!(w.len(), 2);
     }
 
     // === 実験5: 人物検出 ROI の幾何と座標の往復 ===

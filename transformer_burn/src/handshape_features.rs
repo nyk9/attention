@@ -331,14 +331,82 @@ fn detection_counts(features: &[f32], frames: usize) -> (usize, usize) {
 
 /// 主たる手が左手枠だったテイクを反転して「主たる手 = 右手枠」に揃える。
 /// 反転が必要なかった場合は入力をそのまま返す(無駄なコピーを避ける)
-fn align_to_right_dominant(features: &[f32], frames: usize) -> std::borrow::Cow<'_, [f32]> {
+fn align_to_right_dominant(features: &[f32], frames: usize) -> (std::borrow::Cow<'_, [f32]>, bool) {
     let (left, right) = detection_counts(features, frames);
     if left > right {
-        std::borrow::Cow::Owned(mirror_features(features))
+        (std::borrow::Cow::Owned(mirror_features(features)), true)
     } else {
         // 同数のときは右手枠を主たる手とする(事前調査の実装と同じ規則)
-        std::borrow::Cow::Borrowed(features)
+        (std::borrow::Cow::Borrowed(features), false)
     }
+}
+
+/// 身体アンカー(pose dict の `body_sequence`)1 フレームの次元。
+/// 並びは [鼻x, 鼻y, 左肩x, 左肩y, 右肩x, 右肩y, 有効フラグ, aspect(幅/高さ)]。
+/// 座標は手と同じく x/width, y/height の正規化済み。出力側: pose_extractor `BODY_ANCHOR_DIM`
+pub const BODY_ANCHOR_DIM: usize = 8;
+
+/// 1 テイクの身体アンカー。肩の中心を原点、肩幅を単位長にして手首位置を測るための基準。
+/// 立ち位置・カメラ距離・撮影日ごとの画角ずれを打ち消すのが目的(S6 の動機)。
+/// フレーム単位ではなくテイク内の中央値を使う(撮影者はほぼ静止しており、
+/// フレームごとの BlazePose の揺れを手首の動きに混ぜないため)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BodyAnchor {
+    /// 肩の中心(x/width, y/height 正規化)
+    pub center: [f32; 2],
+    /// 肩幅(x/width 正規化の単位)
+    pub shoulder_width: f32,
+    /// 画像の幅/高さ。y を x と同じ長さの単位にそろえるのに使う
+    pub aspect: f32,
+}
+
+fn median(values: &mut [f32]) -> f32 {
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = values.len();
+    if n % 2 == 1 {
+        values[n / 2]
+    } else {
+        (values[n / 2 - 1] + values[n / 2]) / 2.0
+    }
+}
+
+/// `[frames * BODY_ANCHOR_DIM]` のフラット列からテイクの身体アンカーを作る。
+/// 有効フレーム(有効フラグ > 0.5 かつ肩幅 > 0)が 1 つも無ければ None
+pub fn take_body_anchor(body: &[f32], frames: usize) -> Option<BodyAnchor> {
+    if body.len() != frames * BODY_ANCHOR_DIM {
+        return None;
+    }
+    let (mut cx, mut cy, mut sw) = (Vec::new(), Vec::new(), Vec::new());
+    let mut aspect = None;
+    for t in 0..frames {
+        let f = &body[t * BODY_ANCHOR_DIM..(t + 1) * BODY_ANCHOR_DIM];
+        let width = (f[2] - f[4]).abs();
+        if f[6] > 0.5 && width > 1e-4 {
+            cx.push((f[2] + f[4]) / 2.0);
+            cy.push((f[3] + f[5]) / 2.0);
+            sw.push(width);
+            aspect.get_or_insert(f[7]);
+        }
+    }
+    if sw.is_empty() {
+        return None;
+    }
+    Some(BodyAnchor {
+        center: [median(&mut cx), median(&mut cy)],
+        shoulder_width: median(&mut sw),
+        aspect: aspect.unwrap_or(1.0),
+    })
+}
+
+/// 手首の画像内座標 → 肩中心・肩幅基準の相対座標。
+/// `mirrored` はテイクを左右反転して読んでいる(x → 1 - x)場合で、アンカーも同じ変換を受ける
+fn wrist_relative_to_body(wrist: [f32; 2], anchor: &BodyAnchor, mirrored: bool) -> [f32; 2] {
+    let cx = if mirrored { 1.0 - anchor.center[0] } else { anchor.center[0] };
+    let sw = anchor.shoulder_width.max(1e-6);
+    [
+        (wrist[0] - cx) / sw,
+        (wrist[1] - anchor.center[1]) * anchor.aspect / sw,
+    ]
 }
 
 /// 手ポーズ列(生 126 次元 × frames)を手形記述子列(66 次元 × frames)に変換する。
@@ -372,7 +440,20 @@ pub fn handshape_sequence_with_parts(
     mode: InputFeatures,
     parts: DescriptorParts,
 ) -> Vec<f32> {
-    let full = handshape_sequence_full(features, frames, mode);
+    handshape_sequence_with_body(features, frames, mode, parts, None)
+}
+
+/// `handshape_sequence_with_parts` の身体アンカー版(S6)。
+/// `anchor` が Some なら、手首の画像内座標 xy を「肩中心・肩幅基準の相対座標」に置き換える。
+/// 次元数・並びは変わらない(差は手首 xy の値だけ)。None なら従来と完全に同一
+pub fn handshape_sequence_with_body(
+    features: &[f32],
+    frames: usize,
+    mode: InputFeatures,
+    parts: DescriptorParts,
+    anchor: Option<&BodyAnchor>,
+) -> Vec<f32> {
+    let full = handshape_sequence_full(features, frames, mode, anchor);
     if parts.is_full() {
         return full;
     }
@@ -387,7 +468,12 @@ pub fn handshape_sequence_with_parts(
     out
 }
 
-fn handshape_sequence_full(features: &[f32], frames: usize, mode: InputFeatures) -> Vec<f32> {
+fn handshape_sequence_full(
+    features: &[f32],
+    frames: usize,
+    mode: InputFeatures,
+    anchor: Option<&BodyAnchor>,
+) -> Vec<f32> {
     assert!(
         !mode.is_raw(),
         "handshape_sequence は Raw(生 126 次元)には使えません"
@@ -399,7 +485,7 @@ fn handshape_sequence_full(features: &[f32], frames: usize, mode: InputFeatures)
         POSE_FEATURE_DIM
     );
 
-    let aligned = align_to_right_dominant(features, frames);
+    let (aligned, mirrored) = align_to_right_dominant(features, frames);
     // 主たる手 = 右手枠(オフセット 63)、非主たる手 = 左手枠(オフセット 0)
     let slots = [HAND_SLOT_DIM, 0];
 
@@ -410,7 +496,13 @@ fn handshape_sequence_full(features: &[f32], frames: usize, mode: InputFeatures)
     for t in 0..frames {
         let frame = &aligned[t * POSE_FEATURE_DIM..(t + 1) * POSE_FEATURE_DIM];
         for (s, &offset) in slots.iter().enumerate() {
-            per_frame[s].push(hand_points(frame, offset).map(|p| hand_descriptor(&p)));
+            per_frame[s].push(hand_points(frame, offset).map(|p| {
+                let (geo, wrist) = hand_descriptor(&p);
+                match anchor {
+                    Some(a) => (geo, wrist_relative_to_body(wrist, a, mirrored)),
+                    None => (geo, wrist),
+                }
+            }));
         }
     }
 
@@ -735,5 +827,74 @@ mod tests {
         }
         // 4 フレーム中 3 フレームで検出 → カバレッジ 0.75
         assert!((first[GEOMETRY_DIM + 2] - 0.75).abs() < 1e-6);
+    }
+
+    // --- S6: 身体アンカー ---
+
+    fn body_frame(valid: f32, lx: f32, rx: f32, y: f32) -> [f32; BODY_ANCHOR_DIM] {
+        [0.5, y - 0.2, lx, y, rx, y, valid, 1.5]
+    }
+
+    // [TEST向き] 中央値(外れ値に引かれない)・無効フレームの除外・全無効で None
+    #[test]
+    fn take_body_anchor_uses_median_of_valid_frames() {
+        let frames = [
+            body_frame(1.0, 0.4, 0.6, 0.7),
+            body_frame(1.0, 0.4, 0.6, 0.7),
+            body_frame(1.0, 0.1, 0.9, 0.1), // 外れ値
+            body_frame(0.0, 0.0, 0.0, 0.0), // 無効
+        ];
+        let body: Vec<f32> = frames.iter().flatten().copied().collect();
+        let a = take_body_anchor(&body, 4).unwrap();
+        assert!((a.center[0] - 0.5).abs() < 1e-6);
+        assert!((a.center[1] - 0.7).abs() < 1e-6);
+        assert!((a.shoulder_width - 0.2).abs() < 1e-6);
+        assert!((a.aspect - 1.5).abs() < 1e-6);
+
+        let none: Vec<f32> = [body_frame(0.0, 0.0, 0.0, 0.0); 3].iter().flatten().copied().collect();
+        assert!(take_body_anchor(&none, 3).is_none());
+        // 長さ不整合も None
+        assert!(take_body_anchor(&body, 3).is_none());
+    }
+
+    // [TEST向き] 手計算オラクル: 手首 (0.7, 0.9)、肩中心 (0.5, 0.7)、肩幅 0.2、aspect 1.5
+    // → x = 0.2/0.2 = 1.0、y = 0.2*1.5/0.2 = 1.5。反転時は肩中心 x が 0.5 → 0.5(対称)なので
+    // 手首 x を 1-0.7=0.3 として渡すと x = (0.3-0.5)/0.2 = -1.0
+    #[test]
+    fn wrist_relative_to_body_oracle_and_mirror_sign() {
+        let a = BodyAnchor { center: [0.5, 0.7], shoulder_width: 0.2, aspect: 1.5 };
+        let r = wrist_relative_to_body([0.7, 0.9], &a, false);
+        assert!((r[0] - 1.0).abs() < 1e-5 && (r[1] - 1.5).abs() < 1e-5);
+        let m = wrist_relative_to_body([0.3, 0.9], &a, true);
+        assert!((m[0] + 1.0).abs() < 1e-5 && (m[1] - 1.5).abs() < 1e-5);
+        // 非対称な肩中心 0.4 のときアンカーも 1-0.4=0.6 に反転される
+        let a2 = BodyAnchor { center: [0.4, 0.7], shoulder_width: 0.2, aspect: 1.5 };
+        let m2 = wrist_relative_to_body([0.3, 0.9], &a2, true);
+        assert!((m2[0] - (0.3 - 0.6) / 0.2).abs() < 1e-5);
+    }
+
+    // [TEST向き] anchor=None は従来と完全に同一。Some のときは手首 xy 以外は同一
+    #[test]
+    fn body_anchor_none_is_identical_and_only_wrist_changes() {
+        let frames = 4;
+        let feats = take_with_one_hand(frames, true, 0.5);
+        let base = handshape_sequence_with_parts(&feats, frames, InputFeatures::Handshape, DescriptorParts::all());
+        let none = handshape_sequence_with_body(&feats, frames, InputFeatures::Handshape, DescriptorParts::all(), None);
+        assert_eq!(base, none);
+
+        let a = BodyAnchor { center: [0.5, 0.7], shoulder_width: 0.2, aspect: 1.5 };
+        let with = handshape_sequence_with_body(&feats, frames, InputFeatures::Handshape, DescriptorParts::all(), Some(&a));
+        for t in 0..frames {
+            for j in 0..HANDSHAPE_FEATURE_DIM {
+                let i = t * HANDSHAPE_FEATURE_DIM + j;
+                let is_wrist = j % HAND_BLOCK_DIM == GEOMETRY_DIM || j % HAND_BLOCK_DIM == GEOMETRY_DIM + 1;
+                let primary_detected = j < HAND_BLOCK_DIM;
+                if is_wrist && primary_detected {
+                    assert_ne!(base[i], with[i], "主たる手の手首 xy は置換されるはず");
+                } else {
+                    assert_eq!(base[i], with[i], "手首 xy 以外は不変のはず (j={})", j);
+                }
+            }
+        }
     }
 }

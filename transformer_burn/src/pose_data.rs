@@ -1,6 +1,9 @@
 use crate::config::POSE_FEATURE_DIM;
 use crate::feature_stats::FeatureStats;
-use crate::handshape_features::{handshape_sequence_with_parts, DescriptorParts, InputFeatures};
+use crate::handshape_features::{
+    handshape_sequence_with_body, take_body_anchor, DescriptorParts, InputFeatures,
+    BODY_ANCHOR_DIM,
+};
 use crate::tag_vocabulary::TagVocabulary;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -28,6 +31,9 @@ struct PoseDictEntry {
     sequence: Vec<Vec<f32>>,
     left_hand_coverage: f32,
     right_hand_coverage: f32,
+    /// [T フレーム][BODY_ANCHOR_DIM] の身体アンカー(S6)。無い dict では None
+    #[serde(default)]
+    body_sequence: Option<Vec<Vec<f32>>>,
 }
 
 /// 認識モデルの学習サンプル 1 件 = (手ポーズ列, タグラベル)
@@ -37,6 +43,8 @@ pub struct PoseSample {
     pub features: Vec<f32>,
     /// タグラベル(テイク番号を剥がした後の名前。例: "0205-01" → "0205")
     pub label: String,
+    /// [T * BODY_ANCHOR_DIM] の身体アンカー列(S6)。dict に無ければ空
+    pub body: Vec<f32>,
 }
 
 /// 認識モデル用の学習データ一式
@@ -163,6 +171,7 @@ struct RawEntry {
     label: String,
     take: Option<u32>,
     features: Vec<f32>,
+    body: Vec<f32>,
     left_cov: f32,
     right_cov: f32,
 }
@@ -208,11 +217,27 @@ fn read_raw_entries(
             }
         }
 
+        let body: Vec<f32> = match &entry.body_sequence {
+            Some(seq) => {
+                if seq.len() != dict.metadata.frames
+                    || seq.iter().any(|f| f.len() != BODY_ANCHOR_DIM)
+                {
+                    return Err(format!(
+                        "'{}' の body_sequence の形状が不正です(期待 {}x{})",
+                        stem, dict.metadata.frames, BODY_ANCHOR_DIM
+                    )
+                    .into());
+                }
+                seq.iter().flatten().copied().collect()
+            }
+            None => Vec::new(),
+        };
         entries.push(RawEntry {
             stem: stem.clone(),
             label: label_from_stem(stem),
             take: take_from_stem(stem),
             features: entry.sequence.iter().flatten().copied().collect(),
+            body,
             left_cov: entry.left_hand_coverage,
             right_cov: entry.right_hand_coverage,
         });
@@ -300,6 +325,7 @@ impl PoseTrainingData {
             samples.push(PoseSample {
                 features: e.features,
                 label: e.label,
+                body: e.body,
             });
         }
         Ok(Self {
@@ -347,6 +373,7 @@ impl PoseTrainingData {
                 train_samples.push(PoseSample {
                     features: e.features,
                     label: label.clone(),
+                    body: e.body,
                 });
             }
 
@@ -357,6 +384,7 @@ impl PoseTrainingData {
                     train_samples.push(PoseSample {
                         features: e.features,
                         label: label.clone(),
+                        body: e.body,
                     });
                 }
                 per_label.push((label, numbered_count + unnumbered_count, 0));
@@ -369,6 +397,7 @@ impl PoseTrainingData {
                 let sample = PoseSample {
                     features: e.features,
                     label: label.clone(),
+                    body: e.body,
                 };
                 if i < split_at {
                     train_samples.push(sample);
@@ -413,6 +442,7 @@ impl PoseTrainingData {
         samples.extend(self.samples.iter().map(|s| PoseSample {
             features: mirror_features(&s.features),
             label: s.label.clone(),
+            body: s.body.clone(),
         }));
         PoseTrainingData {
             samples,
@@ -445,8 +475,9 @@ impl PoseTrainingData {
             .samples
             .iter()
             .map(|s| PoseSample {
-                features: handshape_sequence_with_parts(&s.features, self.frames, mode, parts),
+                features: handshape_sequence_with_body(&s.features, self.frames, mode, parts, None),
                 label: s.label.clone(),
+                body: Vec::new(),
             })
             .collect();
         PoseTrainingData {
@@ -454,6 +485,48 @@ impl PoseTrainingData {
             frames: self.frames,
             feature_dim: parts.feature_dim(),
         }
+    }
+
+    /// `to_input_features_with_parts` の身体アンカー版(S6、評価専用)。
+    /// 各サンプルの手首 xy を肩中心・肩幅基準の相対座標に置き換える。
+    /// 身体アンカーが取れないサンプル(dict に無い・有効フレーム 0)は従来の手首 xy のままで、
+    /// その件数を返す。`mode` は handshape 系であること
+    pub fn to_input_features_with_body(
+        &self,
+        mode: InputFeatures,
+        parts: DescriptorParts,
+    ) -> (PoseTrainingData, usize) {
+        assert!(!mode.is_raw(), "身体アンカーは手形記述子専用です");
+        let mut fallback = 0usize;
+        let samples = self
+            .samples
+            .iter()
+            .map(|s| {
+                let anchor = take_body_anchor(&s.body, self.frames);
+                if anchor.is_none() {
+                    fallback += 1;
+                }
+                PoseSample {
+                    features: handshape_sequence_with_body(
+                        &s.features,
+                        self.frames,
+                        mode,
+                        parts,
+                        anchor.as_ref(),
+                    ),
+                    label: s.label.clone(),
+                    body: Vec::new(),
+                }
+            })
+            .collect();
+        (
+            PoseTrainingData {
+                samples,
+                frames: self.frames,
+                feature_dim: parts.feature_dim(),
+            },
+            fallback,
+        )
     }
 
     /// このデータから標準化の統計量を求める。
@@ -481,6 +554,7 @@ impl PoseTrainingData {
                 .map(|s| PoseSample {
                     features: stats.apply(&s.features),
                     label: s.label.clone(),
+                    body: s.body.clone(),
                 })
                 .collect(),
             frames: self.frames,
@@ -776,10 +850,12 @@ mod tests {
                         f
                     },
                     label: "word".to_string(),
+                    body: Vec::new(),
                 },
                 PoseSample {
                     features: vec![0.0f32; POSE_FEATURE_DIM],
                     label: "other".to_string(),
+                    body: Vec::new(),
                 },
             ],
             frames: 1,

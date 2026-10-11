@@ -1,3 +1,4 @@
+mod live;
 mod progress;
 
 use anyhow::{Context, Result};
@@ -256,6 +257,7 @@ fn main() -> Result<()> {
         "撮影テイクを build-dict 用にエクスポート",
         "タグ→ポーズ辞書を構築(build-dict)",
         "動画からタグを認識(推論)",
+        "ライブ認識デモ(カメラ/動画をフレーム入力にして単語を認識)",
         "[dev] ONNXモデルの入出力を調査(inspect)",
         "[dev] ダミー推論で出力shapeを確認(test-infer)",
         "終了",
@@ -274,8 +276,9 @@ fn main() -> Result<()> {
         3 => export_wizard(&theme),
         4 => build_dict_wizard(&theme),
         5 => recognize_wizard(&theme),
-        6 => inspect_wizard(&theme),
-        7 => test_infer_wizard(&theme),
+        6 => live::live_wizard(&theme),
+        7 => inspect_wizard(&theme),
+        8 => test_infer_wizard(&theme),
         _ => {
             println!("終了します");
             Ok(())

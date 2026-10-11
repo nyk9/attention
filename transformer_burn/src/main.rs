@@ -142,6 +142,12 @@ struct Args {
     /// 前処理を保存済みモデルから復元する手段が無いため --save とは併用できない
     #[arg(long, default_value = "")]
     drop_descriptor: String,
+
+    /// S6(評価専用): 手首の画像内座標を、pose dict の body_sequence から求めた
+    /// 肩中心・肩幅基準の相対座標に置き換える。--eval-holdout + handshape 系入力でのみ有効。
+    /// 前処理を保存済みモデルから復元できないため --save / --predict-pose とは併用できない
+    #[arg(long)]
+    body_relative: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -294,6 +300,26 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
+    if args.body_relative {
+        if args.save.is_some() || args.predict_pose.is_some() {
+            return Err(
+                "--body-relative は測定用で、前処理を保存済みモデルから復元できないため \
+                 --save / --predict-pose とは併用できません".into(),
+            );
+        }
+        if args.eval_holdout.is_none() {
+            return Err("--body-relative は --eval-holdout 専用です".into());
+        }
+        if input_features.is_raw() {
+            return Err(
+                "--body-relative は手形記述子専用です(--input-features handshape 系を指定してください)"
+                    .into(),
+            );
+        }
+        if !parts.is_full() {
+            return Err("--body-relative は --drop-descriptor と併用できません".into());
+        }
+    }
     if args.predict_pose.is_some() && args.standardize {
         return Err(
             "--predict-pose(--load 経由の推論)では標準化の有無も保存済みモデル側が真実のため、\
@@ -411,8 +437,24 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         // 生ポーズ → 手形記述子への変換(raw ならクローンのみで内容は不変)
-        let train_data = train_data.to_input_features_with_parts(input_features, parts);
-        let test_data = split.test.to_input_features_with_parts(input_features, parts);
+        let (train_data, test_data) = if args.body_relative {
+            let (tr, tr_fb) = train_data.to_input_features_with_body(input_features, parts);
+            let (te, te_fb) = split.test.to_input_features_with_body(input_features, parts);
+            println!(
+                "身体アンカー(手首 xy を肩基準の相対座標に置換): 取れなかったテイクは従来の手首 xy のまま \
+                 train {}/{} 件 / 未見 {}/{} 件",
+                tr_fb,
+                tr.len(),
+                te_fb,
+                te.len()
+            );
+            (tr, te)
+        } else {
+            (
+                train_data.to_input_features_with_parts(input_features, parts),
+                split.test.to_input_features_with_parts(input_features, parts),
+            )
+        };
 
         // 標準化の統計量は train からのみ算出する。held-out を混ぜて計算すると
         // 未見テイクの情報が前処理に漏れ、評価が甘くなる(転導的な情報漏洩)
@@ -629,6 +671,7 @@ mod tests {
             standardize: false,
             pose_lr: None,
             drop_descriptor: String::new(),
+            body_relative: false,
         }
     }
 

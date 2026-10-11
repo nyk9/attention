@@ -3405,6 +3405,182 @@ fn encode_overlay_video(dir: &Path, out: &Path, fps: f64) -> Result<()> {
     Ok(())
 }
 
+// === S6: 身体アンカー(人物検出 → 非クランプ ROI → BlazePose)===
+//
+// 手首位置を「肩中心・肩幅」基準にするための身体ランドマークを、pose dict に追記する。
+// 実験5 §6 の知見: 人物 ROI を**フレーム外へはみ出したままクランプせず**に BlazePose へ渡すと
+// 顔・肩が正しく乗る(現行の中央正方クロップでは 39 点が顔に密集する = S6 の破綻)。
+// 既存の build-dict / 認識経路は変更せず、既存 dict に `body_sequence` を後付けする。
+
+/// 身体アンカー 1 フレームの次元: [鼻x, 鼻y, 左肩x, 左肩y, 右肩x, 右肩y, 有効, aspect]。
+/// 座標は x/width, y/height 正規化(手と同じ)。transformer_burn `BODY_ANCHOR_DIM` と一致させる
+const BODY_ANCHOR_DIM: usize = 8;
+const BODY_NOSE: usize = 0;
+const BODY_LEFT_SHOULDER: usize = 11;
+const BODY_RIGHT_SHOULDER: usize = 12;
+const BODY_VISIBILITY_THRESHOLD: f32 = 0.5;
+
+/// 人物検出で得た全身 ROI(クランプしない)を 256x256 に切り出して BlazePose を走らせ、
+/// 39 点を元フレームのピクセル座標 (x, y, 可視性確率) で返す。人物が検出できなければ None
+#[allow(dead_code)]
+fn body_points_in_person_roi(
+    frame: &Array3<u8>,
+    person_session: &mut Session,
+    person_anchors: &[[f32; 2]],
+    pose_session: &mut Session,
+) -> Result<Option<Vec<(f32, f32, f32)>>> {
+    let dets = run_person_detection(person_session, person_anchors, frame)?;
+    let Some(d) = dets.first() else {
+        return Ok(None);
+    };
+    let (cx, cy, side) = person_region_square(d, PersonRegion::FullBody, PERSON_ROI_SCALE);
+    // 範囲外は sample_bilinear が 0(黒)を返す = 黒埋め
+    let mut data = vec![0f32; 256 * 256 * 3];
+    for py in 0..256usize {
+        for px in 0..256usize {
+            let sx = cx - side / 2.0 + (px as f32 + 0.5) / 256.0 * side;
+            let sy = cy - side / 2.0 + (py as f32 + 0.5) / 256.0 * side;
+            let rgb = sample_bilinear(frame, sx, sy);
+            for c in 0..3 {
+                data[(py * 256 + px) * 3 + c] = rgb[c] / 255.0;
+            }
+        }
+    }
+    let v = Value::from_array((vec![1usize, 256, 256, 3], data))?;
+    let lms = {
+        let out = pose_session.run(ort::inputs!["input_1" => v])?;
+        let (_, ld) = out["Identity"].try_extract_tensor::<f32>()?;
+        parse_landmarks(ld)?
+    };
+    Ok(Some(
+        lms.iter()
+            .map(|lm| {
+                (
+                    cx - side / 2.0 + lm.x / 256.0 * side,
+                    cy - side / 2.0 + lm.y / 256.0 * side,
+                    sigmoid(lm.visibility),
+                )
+            })
+            .collect(),
+    ))
+}
+
+/// 1 フレームの身体アンカー(8 次元)。人物未検出・鼻/両肩のどれかが不可視なら有効=0 の全ゼロ
+#[allow(dead_code)]
+fn infer_body_anchor(
+    frame: &Array3<u8>,
+    person_session: &mut Session,
+    person_anchors: &[[f32; 2]],
+    pose_session: &mut Session,
+) -> Result<[f32; BODY_ANCHOR_DIM]> {
+    let h = frame.shape()[0] as f32;
+    let w = frame.shape()[1] as f32;
+    let Some(pts) = body_points_in_person_roi(frame, person_session, person_anchors, pose_session)?
+    else {
+        return Ok([0.0; BODY_ANCHOR_DIM]);
+    };
+    let (n, l, r) = (pts[BODY_NOSE], pts[BODY_LEFT_SHOULDER], pts[BODY_RIGHT_SHOULDER]);
+    if [n, l, r].iter().any(|p| p.2 <= BODY_VISIBILITY_THRESHOLD) {
+        return Ok([0.0; BODY_ANCHOR_DIM]);
+    }
+    Ok([n.0 / w, n.1 / h, l.0 / w, l.1 / h, r.0 / w, r.1 / h, 1.0, w / h])
+}
+
+/// 既存 pose dict(JSON)の各タグに `body_sequence`([T][BODY_ANCHOR_DIM])を追記して書き出す。
+/// 選択フレームは build-dict の Uniform 選択と同じ `downsample_indices(nb_frames, T)`。
+/// ビデオは `video_dir/<タグ名>.<拡張子>`。既存 dict の hand 特徴はそのまま保つ(JSON Value 経由)
+#[allow(dead_code)]
+fn add_body_anchors_to_dict(dict_in: &Path, video_dir: &Path, dict_out: &Path) -> Result<()> {
+    let text = std::fs::read_to_string(dict_in)
+        .with_context(|| format!("read {}", dict_in.display()))?;
+    let mut dict: serde_json::Value = serde_json::from_str(&text)?;
+    let frames = dict["metadata"]["frames"]
+        .as_u64()
+        .context("metadata.frames missing")? as usize;
+    if let Some(sel) = dict["metadata"]["frame_select"].as_str() {
+        if sel != "uniform" {
+            anyhow::bail!("body anchors は Uniform 選択の dict にのみ対応 (frame_select={})", sel);
+        }
+    }
+
+    let videos = list_videos(video_dir);
+    let by_stem: BTreeMap<String, PathBuf> = videos
+        .into_iter()
+        .filter_map(|v| v.file_stem().map(|s| (s.to_string_lossy().to_string(), v.clone())))
+        .collect();
+
+    let mut person = Session::builder()?
+        .commit_from_file(PERSON_MODEL)
+        .with_context(|| format!("failed to load person model: {}", PERSON_MODEL))?;
+    let mut pose = Session::builder()?
+        .commit_from_file(DEFAULT_MODEL)
+        .with_context(|| format!("failed to load pose model: {}", DEFAULT_MODEL))?;
+    let anchors = load_person_anchors();
+
+    let (mut total, mut valid, mut takes_none) = (0usize, 0usize, 0usize);
+    let tag_count;
+    {
+    let tags = dict["tags"].as_object_mut().context("tags missing")?;
+    tag_count = tags.len();
+    for (stem, entry) in tags.iter_mut() {
+        let video = by_stem
+            .get(stem)
+            .with_context(|| format!("動画が見つかりません: {}/{}.*", video_dir.display(), stem))?;
+        let info = probe_video(video)?;
+        if info.frame_count == 0 {
+            anyhow::bail!("{}: nb_frames が取得できません(選択フレームを再現できない)", stem);
+        }
+        let indices = downsample_indices(info.frame_count as usize, frames);
+        let wanted: std::collections::BTreeSet<usize> = indices.iter().copied().collect();
+        let mut got: BTreeMap<usize, [f32; BODY_ANCHOR_DIM]> = BTreeMap::new();
+        extract_frames_filtered(
+            video,
+            info.width,
+            info.height,
+            |i| wanted.contains(&i),
+            |i, frame| {
+                got.insert(i, infer_body_anchor(&frame, &mut person, &anchors, &mut pose)?);
+                Ok(())
+            },
+        )?;
+        let (seq, _missing) = assemble_selected(&indices, &got)
+            .ok_or_else(|| anyhow::anyhow!("no frames extracted from {}", video.display()))?;
+        let n_valid = seq.iter().filter(|f| f[6] > 0.5).count();
+        total += seq.len();
+        valid += n_valid;
+        if n_valid == 0 {
+            takes_none += 1;
+        }
+        eprintln!("{}: 有効 {}/{}", stem, n_valid, seq.len());
+        entry["body_sequence"] = serde_json::to_value(
+            seq.iter().map(|f| f.to_vec()).collect::<Vec<_>>(),
+        )?;
+    }
+    }
+    dict["metadata"]["body_features"] = serde_json::Value::String(
+        "body_sequence[T][8] = [nose_x, nose_y, lshoulder_x, lshoulder_y, rshoulder_x, rshoulder_y, \
+         valid, aspect(w/h)]; x/=width, y/=height; BlazePose on unclamped person ROI (FullBody x1.25); \
+         valid=1 iff nose and both shoulders have sigmoid(visibility)>0.5, else all zeros"
+            .into(),
+    );
+    if let Some(parent) = dict_out.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    serde_json::to_writer_pretty(std::fs::File::create(dict_out)?, &dict)?;
+    eprintln!(
+        "wrote {} / 有効フレーム {}/{} ({:.1}%) / 有効フレームが 0 のテイク {}/{}",
+        dict_out.display(),
+        valid,
+        total,
+        valid as f32 * 100.0 / total.max(1) as f32,
+        takes_none,
+        tag_count
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -5168,5 +5344,111 @@ mod tests {
             "top-5 に正解タグ 0205 が含まれない: {:?}",
             ranked
         );
+    }
+
+    /// S6: 既存 dict に body_sequence を追記する(既存 dict は上書きしない)。
+    /// 環境変数: DICT_IN(既定 ../transformer_burn/data/pose_dict_full_center.json)/
+    ///   DICT_OUT(必須でない。既定 ..._body.json)
+    /// 手動実行: `cargo test add_body_to_dict --release -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn add_body_to_dict() {
+        let data_dir = Path::new(RAW_JSL_DIR);
+        for p in [data_dir, Path::new(PERSON_MODEL), Path::new(DEFAULT_MODEL)] {
+            if !p.exists() {
+                eprintln!("skip: fixture not found: {}", p.display());
+                return;
+            }
+        }
+        let din = PathBuf::from(std::env::var("DICT_IN").unwrap_or_else(|_| {
+            "../transformer_burn/data/pose_dict_full_center.json".into()
+        }));
+        let dout = PathBuf::from(std::env::var("DICT_OUT").unwrap_or_else(|_| {
+            "../transformer_burn/data/pose_dict_full_center_body.json".into()
+        }));
+        assert_ne!(din, dout, "入力と同名への上書きは禁止");
+        for protected in ["pose_dict_full.json", "pose_dict_stage1.json", "pose_dict_stage2.json"] {
+            assert!(!dout.ends_with(protected), "既存 dict の上書き禁止: {}", dout.display());
+        }
+        let export_dir = std::env::temp_dir().join("palm_roi_dict_takes");
+        if list_videos(&export_dir).is_empty() {
+            let n = progress::run_export(data_dir, &export_dir, None).unwrap();
+            eprintln!("exported {} takes", n);
+        }
+        add_body_anchors_to_dict(&din, &export_dir, &dout).unwrap();
+    }
+
+    /// S6: 身体アンカーの目視確認。選択フレームに鼻(赤)・両肩(緑/青)・39 点(黄)を描いた PNG を出す。
+    /// 環境変数: BODY_STEMS(カンマ区切りのテイク名)/ BODY_OUT(既定 /tmp/body_anchor)
+    /// 手動実行: `BODY_STEMS=arigatou-03 cargo test body_anchor_overlay --release -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn body_anchor_overlay() {
+        let export_dir = std::env::temp_dir().join("palm_roi_dict_takes");
+        if list_videos(&export_dir).is_empty() {
+            let n = progress::run_export(Path::new(RAW_JSL_DIR), &export_dir, None).unwrap();
+            eprintln!("exported {} takes", n);
+        }
+        for p in [export_dir.as_path(), Path::new(PERSON_MODEL), Path::new(DEFAULT_MODEL)] {
+            if !p.exists() {
+                eprintln!("skip: fixture not found: {}", p.display());
+                return;
+            }
+        }
+        let stems = std::env::var("BODY_STEMS").unwrap_or_else(|_| "arigatou-03".into());
+        let out_dir = PathBuf::from(
+            std::env::var("BODY_OUT").unwrap_or_else(|_| "/tmp/body_anchor".into()),
+        );
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let mut person = Session::builder().unwrap().commit_from_file(PERSON_MODEL).unwrap();
+        let mut pose = Session::builder().unwrap().commit_from_file(DEFAULT_MODEL).unwrap();
+        let anchors = load_person_anchors();
+        for stem in stems.split(',') {
+            let video = list_videos(&export_dir)
+                .into_iter()
+                .find(|v| v.file_stem().map(|s| s.to_string_lossy() == stem).unwrap_or(false))
+                .unwrap_or_else(|| panic!("video not found: {}", stem));
+            let info = probe_video(&video).unwrap();
+            let idx = downsample_indices(info.frame_count as usize, 10);
+            let wanted: std::collections::BTreeSet<usize> =
+                [idx[3], idx[5], idx[7]].into_iter().collect();
+            extract_frames_filtered(
+                &video,
+                info.width,
+                info.height,
+                |i| wanted.contains(&i),
+                |i, frame| {
+                    let (w, h) = (info.width, info.height);
+                    let raw: Vec<u8> = frame.iter().copied().collect();
+                    let mut img: ImageBuffer<Rgb<u8>, Vec<u8>> =
+                        ImageBuffer::from_raw(w, h, raw).unwrap();
+                    let pts = body_points_in_person_roi(&frame, &mut person, &anchors, &mut pose)?;
+                    let a = infer_body_anchor(&frame, &mut person, &anchors, &mut pose)?;
+                    eprintln!("{} frame {}: anchor={:?}", stem, i, a);
+                    let mut dot = |x: f32, y: f32, c: [u8; 3], r: i32| {
+                        for dy in -r..=r {
+                            for dx in -r..=r {
+                                let (px, py) = (x as i32 + dx, y as i32 + dy);
+                                if px >= 0 && py >= 0 && (px as u32) < w && (py as u32) < h {
+                                    img.put_pixel(px as u32, py as u32, Rgb(c));
+                                }
+                            }
+                        }
+                    };
+                    if let Some(pts) = &pts {
+                        for (x, y, _) in pts.iter().take(33) {
+                            dot(*x, *y, [255, 255, 0], 3);
+                        }
+                        dot(pts[BODY_NOSE].0, pts[BODY_NOSE].1, [255, 0, 0], 8);
+                        dot(pts[BODY_LEFT_SHOULDER].0, pts[BODY_LEFT_SHOULDER].1, [0, 255, 0], 8);
+                        dot(pts[BODY_RIGHT_SHOULDER].0, pts[BODY_RIGHT_SHOULDER].1, [0, 128, 255], 8);
+                    }
+                    img.save(out_dir.join(format!("{}_{:05}.png", stem, i))).unwrap();
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
+        eprintln!("PNG -> {}", out_dir.display());
     }
 }

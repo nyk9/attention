@@ -22,6 +22,15 @@ pub enum Phase {
     Stopping,
 }
 
+/// 画面のモード。待機中(エンジンが動いていない間)だけ切り替えられる
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppMode {
+    /// ライブ認識(従来の画面)
+    Live,
+    /// 撮影ガイド(R0)。区切り方「手動」で起動し、開始操作は送らない = 語の認識はしない。録画・保存もしない
+    CaptureGuide,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Recognized {
     pub tag: String,
@@ -63,8 +72,10 @@ pub struct AppModel {
     pub log: VecDeque<LogLine>,
     /// 画面に出すエラー(エンジンの error や、起動失敗)
     pub error: Option<String>,
-    /// 現在の区切り方(エンジンが反映したもの。start 前は選択中の値)
+    /// 現在の区切り方(エンジンが反映したもの。start 前は選択中の値)。
+    /// 撮影ガイドのセッション中は、エンジンからの値で上書きしない(ライブ認識に戻ったときに選択を保つ)
     pub segmenter: SegmenterMode,
+    pub mode: AppMode,
 }
 
 impl AppModel {
@@ -78,6 +89,7 @@ impl AppModel {
             log: VecDeque::new(),
             error: None,
             segmenter: SegmenterMode::Auto,
+            mode: AppMode::Live,
         }
     }
 
@@ -108,8 +120,10 @@ impl AppModel {
         match ev {
             EngineEvent::Ready { vocab, segmenter, .. } => {
                 self.vocab = vocab.clone();
-                if let Some(m) = SegmenterMode::parse(segmenter) {
-                    self.segmenter = m;
+                if self.mode == AppMode::Live {
+                    if let Some(m) = SegmenterMode::parse(segmenter) {
+                        self.segmenter = m;
+                    }
                 }
                 // 停止要求の後に遅れて ready が来ても、Stopping を上書きしない
                 if self.phase == Phase::Starting {
@@ -125,6 +139,9 @@ impl AppModel {
                 });
             }
             EngineEvent::Preview { .. } => {}
+            // 撮影ガイドでは認識結果を出さない(開始操作を送らないので、カメラでは来ない。
+            // 動画入力 + 手動では、エンジンが再生開始と同時に記録し終端で認識するので来ることがある)
+            EngineEvent::Result { .. } if self.mode == AppMode::CaptureGuide => {}
             EngineEvent::Result { tag, label, p, ranked, low_confidence, .. } => {
                 let r = Recognized {
                     tag: tag.clone(),
@@ -151,8 +168,10 @@ impl AppModel {
                 // プロセスの終了(EOF)を受けて engine_exited を呼ぶ。ここでは何も変えない
             }
             EngineEvent::Segmenter { mode } => {
-                if let Some(m) = SegmenterMode::parse(mode) {
-                    self.segmenter = m;
+                if self.mode == AppMode::Live {
+                    if let Some(m) = SegmenterMode::parse(mode) {
+                        self.segmenter = m;
+                    }
                 }
             }
             // 知らない種類のイベントは何もしない(読み捨て)
@@ -164,13 +183,28 @@ impl AppModel {
     /// 押せる。起動中・停止中は押せない: start はもう送った後(または終わる途中)なので、押しても表示だけが
     /// 変わって、エンジンの `ready` / `segmenter` で元に戻ってしまう
     pub fn segmenter_selectable(&self) -> bool {
-        matches!(self.phase, Phase::Idle | Phase::Running)
+        self.mode == AppMode::Live && matches!(self.phase, Phase::Idle | Phase::Running)
     }
 
-    /// `start` コマンドを作る。区切り方は、開始前に選んでおいた値(`self.segmenter`)をそのまま送る
-    /// (「カメラで開始」が選択を自動に戻してしまわないように、組み立てをここに集めてある)
+    /// モードを切り替えられるか(待機中だけ。セッション中に変えるとエンジンの起動設定と食い違うため)
+    pub fn mode_selectable(&self) -> bool {
+        self.phase == Phase::Idle
+    }
+
+    /// 手動の開始/停止(toggle)を送ってよいか。撮影ガイドでは送らない(語の認識をしない)
+    pub fn toggle_allowed(&self) -> bool {
+        self.mode == AppMode::Live && self.phase == Phase::Running
+    }
+
+    /// `start` コマンドを作る。ライブ認識では、区切り方は開始前に選んでおいた値(`self.segmenter`)をそのまま送る
+    /// (「カメラで開始」が選択を自動に戻してしまわないように、組み立てをここに集めてある)。
+    /// 撮影ガイドでは常に「手動」(開始操作を送らないので記録も認識も始まらない)。`self.segmenter` は変えない
     pub fn start_command(&self, source: SourceSpec) -> Command {
-        Command::Start { source, segmenter: self.segmenter }
+        let segmenter = match self.mode {
+            AppMode::Live => self.segmenter,
+            AppMode::CaptureGuide => SegmenterMode::Manual,
+        };
+        Command::Start { source, segmenter }
     }
 }
 
@@ -353,6 +387,38 @@ mod tests {
             m.phase = phase;
             assert_eq!(m.segmenter_selectable(), ok, "{phase:?}");
         }
+    }
+
+    // 撮影ガイド: start は常に手動、ライブ認識の選択(自動)は保たれる。toggle は送らない。認識結果は出さない
+    #[test]
+    fn capture_guide_mode_starts_manual_and_ignores_results() {
+        let camera = || SourceSpec::Camera { device: "0".into() };
+        let mut m = AppModel::new();
+        assert_eq!(m.mode, AppMode::Live);
+        assert!(m.mode_selectable());
+        m.mode = AppMode::CaptureGuide;
+        assert_eq!(
+            m.start_command(camera()),
+            Command::Start { source: camera(), segmenter: SegmenterMode::Manual }
+        );
+        assert_eq!(m.segmenter, SegmenterMode::Auto, "ライブ認識の選択は変えない");
+        m.begin_session();
+        assert!(!m.mode_selectable(), "セッション中はモードを変えられない");
+        m.apply(&parse_event(r#"{"type":"ready","vocab":[],"segmenter":"manual"}"#).unwrap().unwrap());
+        assert_eq!(m.phase, Phase::Running);
+        assert_eq!(m.segmenter, SegmenterMode::Auto, "エンジンの manual で上書きしない");
+        assert!(!m.toggle_allowed(), "撮影ガイドでは toggle を送らない");
+        assert!(!m.segmenter_selectable());
+        m.apply(&result_ev("こんにちは", 0.99, false));
+        assert!(m.current.is_none() && m.history.is_empty(), "撮影ガイドでは認識結果を出さない");
+        // ライブ認識に戻すと従来どおり
+        m.engine_exited();
+        m.mode = AppMode::Live;
+        m.begin_session();
+        m.apply(&parse_event(r#"{"type":"ready","vocab":[],"segmenter":"auto"}"#).unwrap().unwrap());
+        assert!(m.toggle_allowed());
+        m.apply(&result_ev("こんにちは", 0.99, false));
+        assert_eq!(m.current.as_ref().unwrap().label, "こんにちは");
     }
 
     // 知らない種類のイベントは何も変えない

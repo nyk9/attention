@@ -137,8 +137,13 @@ fn draw_hand(img: &mut RgbaImage, points: &[[f64; 2]], color: Rgba<u8>) {
     }
 }
 
-/// 反転済みの画像に、検出範囲の枠と手の骨格を描く
+/// 反転済みの画像に、検出範囲の枠と手の骨格を描く(ライブ認識の画面。枠は黄・太さ 2)
 pub fn draw_overlay(img: &mut RgbaImage, hands: &HandsPoints, crop: CropRect) {
+    draw_overlay_with(img, hands, crop, CROP_COLOR, 2);
+}
+
+/// `draw_overlay` の、検出範囲の枠の色と太さを指定できる版(撮影ガイドで、縁に近づいたら枠を赤く太くする)
+pub fn draw_overlay_with(img: &mut RgbaImage, hands: &HandsPoints, crop: CropRect, crop_color: Rgba<u8>, crop_thick: i32) {
     let (w, h) = (img.width() as f32, img.height() as f32);
     let c = mirror_crop(crop);
     // 全体を指す枠(0,0,1,1)は画像の縁に張り付くので描かない(人物追従・複数タイルのとき)
@@ -150,8 +155,8 @@ pub fn draw_overlay(img: &mut RgbaImage, hands: &HandsPoints, crop: CropRect) {
             c.y as f32 * h,
             (c.x + c.w) as f32 * w - 1.0,
             (c.y + c.h) as f32 * h - 1.0,
-            2,
-            CROP_COLOR,
+            crop_thick,
+            crop_color,
         );
     }
     if let Some(p) = &hands.left {

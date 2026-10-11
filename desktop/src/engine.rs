@@ -24,6 +24,7 @@
 //!
 //! 映像・特徴量・プレビュー画像は、メモリ上でのみ扱いディスクには一切書かない。
 
+use crate::capture_guide::{self, edge::EdgeStatus, HandSample};
 use crate::overlay;
 use crate::protocol::{parse_event, Command, EngineEvent};
 use gpui::RenderImage;
@@ -40,6 +41,18 @@ use std::time::{Duration, Instant};
 const QUEUE_MAX: usize = 1000;
 /// エラー出力のうち覚えておく行数
 const STDERR_KEEP: usize = 12;
+/// 撮影ガイド用の手サンプルのキューの上限(status は最大 10 回/秒なので、UI が 50 秒止まっても溢れない)
+const HAND_SAMPLES_MAX: usize = 512;
+
+/// プレビューに何を重ねるか(セッションの開始時に決め、途中では変えない)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayKind {
+    /// ライブ認識: 検出範囲の枠と手の骨格(従来どおり)
+    Live,
+    /// 撮影ガイド: 上に加えて立ち位置ガイド枠、縁に近づいたら検出範囲の枠を赤く。
+    /// 受信時刻つきの手サンプルと縁の判定も Inbox に入れる
+    CaptureGuide,
+}
 
 // ===== エンジンの場所 =====
 
@@ -49,6 +62,30 @@ pub struct EngineLocation {
     /// エンジンの作業ディレクトリ(`pose_extractor/`。モデルのパスが相対のため必須)
     pub cwd: PathBuf,
     pub bin: PathBuf,
+}
+
+/// `git rev-parse --git-common-dir` の出力から、本体チェックアウトのルートを求める(撮影ガイドのデータ探し用)。
+/// 出力は絶対パスのことも、実行場所からの相対パス(`.git`)のこともある。共通 git ディレクトリの親が本体。
+/// 撮影ガイドのソース(`capture_guide/`)は書き込み・プロセス起動 API を禁止しているので、git を呼ぶ処理はここに置く
+pub fn main_checkout_from_common_dir(output: &str, cwd: &Path) -> Option<PathBuf> {
+    let line = output.lines().next()?.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let p = Path::new(line);
+    let abs = if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) };
+    // 相対形でも `..` を含まないよう正規化する(失敗したら素のまま)
+    let abs = std::fs::canonicalize(&abs).unwrap_or(abs);
+    abs.parent().map(Path::to_path_buf)
+}
+
+/// 実際に git を呼んで、git worktree の本体チェックアウトのルートを探す(読み取り系の `rev-parse` のみ。失敗は None)
+pub fn find_main_checkout(repo_root: &Path) -> Option<PathBuf> {
+    let out = Proc::new("git").args(["rev-parse", "--git-common-dir"]).current_dir(repo_root).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    main_checkout_from_common_dir(&String::from_utf8_lossy(&out.stdout), repo_root)
 }
 
 /// リポジトリのルート: 環境変数 `ATTENTION_ROOT`、無ければコンパイル時の `CARGO_MANIFEST_DIR`(= desktop/)の親
@@ -97,12 +134,18 @@ pub struct Drained<F> {
     pub frame: Option<F>,
     pub status: Option<EngineEvent>,
     pub events: Vec<Incoming>,
+    /// 撮影ガイドのときだけ入る: status の手の有無と受信時刻(全件、時刻順)
+    pub hand_samples: Vec<HandSample>,
+    /// 撮影ガイドのときだけ入る: 最新のプレビューでの縁の判定
+    pub edge: Option<EdgeStatus>,
 }
 
 struct InboxInner<F> {
     frame: Option<F>,
     status: Option<EngineEvent>,
     queue: VecDeque<Incoming>,
+    hand_samples: VecDeque<HandSample>,
+    edge: Option<EdgeStatus>,
 }
 
 pub struct Inbox<F> {
@@ -112,7 +155,13 @@ pub struct Inbox<F> {
 impl<F> Default for Inbox<F> {
     fn default() -> Self {
         Self {
-            inner: Mutex::new(InboxInner { frame: None, status: None, queue: VecDeque::new() }),
+            inner: Mutex::new(InboxInner {
+                frame: None,
+                status: None,
+                queue: VecDeque::new(),
+                hand_samples: VecDeque::new(),
+                edge: None,
+            }),
         }
     }
 }
@@ -138,6 +187,21 @@ impl<F> Inbox<F> {
             g.queue.push_back(i);
         }
     }
+    /// 撮影ガイド用: 手サンプルを積む(上限を超えたら古いものから捨てる)
+    pub fn push_hand_sample(&self, s: HandSample) {
+        if let Ok(mut g) = self.inner.lock() {
+            if g.hand_samples.len() >= HAND_SAMPLES_MAX {
+                g.hand_samples.pop_front();
+            }
+            g.hand_samples.push_back(s);
+        }
+    }
+    /// 撮影ガイド用: 最新の縁の判定で置き換える
+    pub fn put_edge(&self, e: EdgeStatus) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.edge = Some(e);
+        }
+    }
     /// たまっているものをすべて取り出す(UI スレッドが定期的に呼ぶ)
     pub fn drain(&self) -> Drained<F> {
         match self.inner.lock() {
@@ -145,8 +209,10 @@ impl<F> Inbox<F> {
                 frame: g.frame.take(),
                 status: g.status.take(),
                 events: g.queue.drain(..).collect(),
+                hand_samples: g.hand_samples.drain(..).collect(),
+                edge: g.edge.take(),
             },
-            Err(_) => Drained { frame: None, status: None, events: Vec::new() },
+            Err(_) => Drained { frame: None, status: None, events: Vec::new(), hand_samples: Vec::new(), edge: None },
         }
     }
 }
@@ -210,8 +276,14 @@ pub struct EngineHandle {
 }
 
 impl EngineHandle {
-    /// エンジンを起動する(まだ start は送らない)
+    /// エンジンを起動する(まだ start は送らない)。プレビューはライブ認識の重ね描き
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn spawn(loc: &EngineLocation) -> Result<Self, String> {
+        Self::spawn_with(loc, OverlayKind::Live)
+    }
+
+    /// `spawn` の、プレビューの重ね描きの種類を指定できる版
+    pub fn spawn_with(loc: &EngineLocation, kind: OverlayKind) -> Result<Self, String> {
         let mut child = engine_command(loc)
             .spawn()
             .map_err(|e| format!("認識エンジンを起動できません({}): {e}", loc.bin.display()))?;
@@ -247,7 +319,7 @@ impl EngineHandle {
             let child = Arc::clone(&child);
             std::thread::Builder::new()
                 .name("engine-stdout".into())
-                .spawn(move || reader_loop(stdout, &inbox, &child, &tail))
+                .spawn(move || reader_loop(stdout, &inbox, &child, &tail, kind))
                 .map_err(|e| format!("スレッドを作れません: {e}"))?;
         }
 
@@ -301,6 +373,7 @@ fn reader_loop(
     inbox: &AppInbox,
     child: &Mutex<Child>,
     tail: &Mutex<VecDeque<String>>,
+    kind: OverlayKind,
 ) {
     // split(b'\n') + lossy: 万一 UTF-8 でない行が来ても読み続ける
     for raw in BufReader::with_capacity(1 << 16, stdout).split(b'\n').map_while(Result::ok) {
@@ -309,7 +382,16 @@ fn reader_loop(
             Ok(None) => {}
             Ok(Some(EngineEvent::Preview { jpeg_b64, hands, crop, .. })) => {
                 // JPEG デコード+鏡像+重ね描きはここ(UI スレッドの外)で済ませる
-                match overlay::compose_preview(&jpeg_b64, &hands, crop) {
+                let composed = match kind {
+                    OverlayKind::Live => overlay::compose_preview(&jpeg_b64, &hands, crop),
+                    OverlayKind::CaptureGuide => {
+                        capture_guide::compose_guide_preview(&jpeg_b64, &hands, crop).map(|(img, edge)| {
+                            inbox.put_edge(edge);
+                            img
+                        })
+                    }
+                };
+                match composed {
                     Ok(mut rgba) => {
                         overlay::rgba_to_bgra(&mut rgba);
                         let img = RenderImage::new(SmallVec::<[Frame; 1]>::from_elem(Frame::new(rgba), 1));
@@ -318,7 +400,15 @@ fn reader_loop(
                     Err(e) => inbox.push(Incoming::BadLine(format!("プレビューを表示できません: {e}"))),
                 }
             }
-            Ok(Some(ev @ EngineEvent::Status { .. })) => inbox.put_status(ev),
+            Ok(Some(ev @ EngineEvent::Status { .. })) => {
+                if kind == OverlayKind::CaptureGuide {
+                    // 受信時刻はここ(行を読んだ直後)で記録する。理由は capture_guide/mod.rs の冒頭
+                    if let EngineEvent::Status { hands, .. } = &ev {
+                        inbox.push_hand_sample(HandSample { at: Instant::now(), hands: hands.clone() });
+                    }
+                }
+                inbox.put_status(ev)
+            }
             // 知らない種類のイベント(エンジンの方が新しい)は、画面には出さず読み捨てる。
             // 診断用に、行の頭だけ標準エラーへ出す(映像などは含まれない種別の先頭 80 文字まで)
             Ok(Some(EngineEvent::Unknown)) => {
@@ -348,6 +438,32 @@ fn reader_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn main_checkout_from_git_output() {
+        let cwd = Path::new("/nonexistent/wt");
+        assert_eq!(main_checkout_from_common_dir("/main/.git\n", cwd), Some(PathBuf::from("/main")));
+        assert_eq!(main_checkout_from_common_dir("", cwd), None);
+        assert_eq!(
+            main_checkout_from_common_dir("../.git\n", Path::new("/nonexistent/a")),
+            Some(PathBuf::from("/nonexistent/a/.."))
+        );
+    }
+
+    /// この worktree(または本体)から実 git で解決できるか(手動実行・読むだけ)。
+    /// 本体の raw_jsl が実在する環境で ATTENTION_DATA_DIR 未設定なら、本体側が選ばれ「次の語」が出る
+    ///   cargo test --release real_resolution_finds_main_data -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn real_resolution_finds_main_data_and_next_word() {
+        use crate::capture_guide::progress as gp;
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let c = gp::choose_data_dir(None, &root, |p| p.is_dir(), || find_main_checkout(&root));
+        eprintln!("{c:?}");
+        let v = gp::load_progress_for(&c).expect("本体の raw_jsl が読めるはず");
+        eprintln!("{}", gp::next_word_text(&v));
+        assert!(v.next.is_some(), "次の語が出る");
+    }
 
     #[test]
     fn root_resolution_prefers_env_then_manifest_parent() {

@@ -5346,6 +5346,42 @@ mod tests {
         );
     }
 
+    /// 撮影モード(アプリ内録画)で撮った mp4 が、build-dict の経路(`extract_tag_features`)に通って
+    /// 手ポーズ列(10 フレーム × 126 次元)になること。環境変数 CAPTURED_TAKE に mp4 のパスを渡す
+    /// (録画の作り方: tests/engine_json_binary.rs の capture_file_input_end_to_end を ENGINE_CAPTURE_KEEP 付きで実行)。
+    /// 手動実行: `CAPTURED_TAKE=... cargo test captured_take_goes_through_build_dict_path --release -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn captured_take_goes_through_build_dict_path() {
+        let Some(video) = std::env::var_os("CAPTURED_TAKE").map(PathBuf::from) else {
+            eprintln!("skip: CAPTURED_TAKE が未設定");
+            return;
+        };
+        for p in [video.as_path(), Path::new(PALM_MODEL), Path::new(HAND_MODEL)] {
+            assert!(p.exists(), "fixture not found: {}", p.display());
+        }
+        let info = probe_video(&video).unwrap();
+        eprintln!("録画: {}x{} {}fps {}枚 {:.2}秒", info.width, info.height, info.fps, info.frame_count, info.duration);
+        assert_eq!((info.width, info.height), (1620, 1080));
+        let frames = 10usize;
+        let palm_anchors = load_palm_anchors();
+        let mut palm = Session::builder().unwrap().commit_from_file(PALM_MODEL).unwrap();
+        let mut hand = Session::builder().unwrap().commit_from_file(HAND_MODEL).unwrap();
+        let entry = extract_tag_features(&video, &mut palm, &mut hand, &palm_anchors, frames, FrameSelectMode::Uniform).unwrap();
+        assert_eq!(entry.sequence.len(), frames);
+        assert!(entry.sequence.iter().all(|f| f.len() == DICT_FEATURE_DIM));
+        let nonzero = entry.sequence.iter().filter(|f| f.iter().any(|v| *v != 0.0)).count();
+        eprintln!(
+            "手ポーズ列: {} フレーム × {} 次元、手が検出できたフレーム {} 枚、左 {:.0}% 右 {:.0}%",
+            entry.sequence.len(),
+            DICT_FEATURE_DIM,
+            nonzero,
+            entry.left_hand_coverage * 100.0,
+            entry.right_hand_coverage * 100.0
+        );
+        assert!(nonzero > 0, "手が 1 枚も検出できなかった");
+    }
+
     /// S6: 既存 dict に body_sequence を追記する(既存 dict は上書きしない)。
     /// 環境変数: DICT_IN(既定 ../transformer_burn/data/pose_dict_full_center.json)/
     ///   DICT_OUT(必須でない。既定 ..._body.json)

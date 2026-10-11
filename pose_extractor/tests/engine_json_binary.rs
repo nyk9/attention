@@ -516,3 +516,388 @@ fn debug_dump_env_is_announced_as_a_warn_message() {
     assert!(warned, "書き出しが有効になったのに画面向けの警告が無い: {:?}", e.events);
     assert_eq!(written, 0, "フレームを処理していないので何も書かれないはず");
 }
+
+// ===== 撮影モード(R1): 録画 → 判定 → 採用 =====
+//
+// 書き込みを伴うテストは、すべて専用の一時フォルダを登録先(data_dir)と TMPDIR にして行う。
+// 本物の transformer_burn/data/raw_jsl には書かない(読むのは入力動画としてだけ)。
+
+use std::collections::BTreeMap;
+
+/// テスト専用の作業フォルダ(登録先と TMPDIR を入れる)
+fn capture_scratch(tag: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("engine_capture_{}_{}", tag, std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+const CAPTURE_WORDS: &str = "word_id\tromaji\tlabel_ja\tstage\ttarget_takes\n\
+                             001\tkonnichiwa\tこんにちは\t1\t3\n\
+                             011\tkare\tかれ\t2\t3\n";
+
+/// 登録先(words.tsv だけ)と TMPDIR 用のフォルダを作る。(登録先, TMPDIR)
+fn capture_dirs(root: &Path) -> (PathBuf, PathBuf) {
+    let data = root.join("raw_jsl");
+    let tmp = root.join("tmp");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(data.join("words.tsv"), CAPTURE_WORDS).unwrap();
+    (data, tmp)
+}
+
+/// フォルダの中身(相対パス → (大きさ, 内容))。増減・変更の検出用
+fn snapshot_dir(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            let rel = p.strip_prefix(root).unwrap().display().to_string();
+            if p.is_dir() {
+                out.insert(format!("{rel}/"), Vec::new());
+                walk(root, &p, out);
+            } else {
+                out.insert(rel, std::fs::read(&p).unwrap());
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(root, root, &mut out);
+    out
+}
+
+fn hand_models_present() -> bool {
+    ["models/palm_detection_mediapipe.onnx", "models/handpose_estimation_mediapipe.onnx"]
+        .iter()
+        .all(|p| manifest_dir().join(p).exists())
+}
+
+fn capture_start_line(source: Value, data: &Path, countdown: f64) -> String {
+    json!({
+        "cmd": "start", "mode": "capture", "source": source,
+        "data_dir": data.display().to_string(), "countdown_secs": countdown, "preview": null,
+    })
+    .to_string()
+}
+
+// モデル不要: 登録先が無い / words.tsv が無い撮影モードは、カメラを開く前に error で終わり、何も作らない
+#[test]
+fn capture_start_with_a_bad_data_dir_fails_without_creating_anything() {
+    let root = capture_scratch("baddir");
+    let (data, tmp) = capture_dirs(&root);
+    let missing = root.join("not-there");
+    let bare = root.join("bare");
+    std::fs::create_dir_all(&bare).unwrap();
+    let before = snapshot_dir(&root);
+    for (label, line) in [
+        ("存在しない", capture_start_line(json!({"kind":"camera","device":"0"}), &missing, 0.0)),
+        ("words.tsv が無い", capture_start_line(json!({"kind":"camera","device":"0"}), &bare, 0.0)),
+        (
+            "data_dir 省略",
+            json!({"cmd":"start","mode":"capture","source":{"kind":"camera"}}).to_string(),
+        ),
+    ] {
+        let marker = std::env::temp_dir().join(format!("fake_ffmpeg_started_cap_{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let dir = fake_ffmpeg_dir_with_marker("capbad", 987_660, Some(&marker));
+        let mut e = Engine::spawn_with_env(Some(&dir), &[("TMPDIR", tmp.to_str().unwrap())]);
+        e.send(&line);
+        let err = e.wait_for("error", Duration::from_secs(60));
+        assert!(err["text"].as_str().unwrap().len() > 5, "{label}");
+        e.close_stdin();
+        let code = e.finish(Duration::from_secs(20)).expect("終了しない");
+        assert_ne!(code, 0, "{label}");
+        assert!(!marker.exists(), "{label}: カメラ(ffmpeg)を起動してはいけない");
+        assert!(!e.types().contains(&"ready".to_string()), "{label}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    assert_eq!(snapshot_dir(&root), before, "登録先・TMPDIR・その周りに何も作らない");
+    assert!(data.join("words.tsv").is_file());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// 撮影モードの終了のきっかけごとに、(映像が来ない最悪のカメラでも)ffmpeg が残らず、一時領域が消えることを確かめる
+fn capture_camera_cleanup(tag: &str, sleep_secs: u32, trigger: &str) {
+    if !hand_models_present() {
+        eprintln!("skip: モデルが無い");
+        return;
+    }
+    let root = capture_scratch(tag);
+    let (data, tmp) = capture_dirs(&root);
+    let dir = fake_ffmpeg_dir(tag, sleep_secs);
+    let mut e = Engine::spawn_with_env(Some(&dir), &[("TMPDIR", tmp.to_str().unwrap())]);
+    e.send(&capture_start_line(json!({"kind":"camera","device":"0"}), &data, 3.0));
+    e.wait_for("ready", Duration::from_secs(120));
+    let state = e.wait_for("capture_state", Duration::from_secs(10));
+    assert_eq!(state["phase"], "idle");
+    assert_eq!(state["data_dir"], data.display().to_string(), "登録先を画面へ伝える");
+    let marker = format!("sleep {sleep_secs}");
+    let up = Instant::now();
+    while !process_exists(&marker) && up.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(process_exists(&marker), "偽の ffmpeg が起動していない");
+    // 一時領域はこの間だけ存在する
+    let tmp_dir = tmp.join(format!("attention-capture-{}", e.child.id()));
+    assert!(tmp_dir.is_dir(), "一時領域がある: {}", tmp_dir.display());
+    match trigger {
+        "eof" => e.close_stdin(),
+        "quit" => e.send(r#"{"cmd":"quit"}"#),
+        "sigterm" => {
+            let pid = e.child.id().to_string();
+            Command::new("kill").args(["-TERM", &pid]).status().unwrap();
+        }
+        other => panic!("{other}"),
+    }
+    let code = e.finish(Duration::from_secs(20)).unwrap_or_else(|| {
+        panic!("{trigger}: 終了しない。stderr:\n{}", e.stderr_tail.lock().unwrap())
+    });
+    assert_eq!(code, 0, "{trigger}");
+    assert_eq!(e.types().last().unwrap(), "stopped", "{trigger}");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!process_exists(&marker), "{trigger}: ffmpeg が残っている");
+    assert!(!tmp_dir.exists(), "{trigger}: 一時領域が残っている");
+    assert_eq!(snapshot_dir(&data).keys().collect::<Vec<_>>(), vec!["words.tsv"], "{trigger}: 登録先に何も増えていない");
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn capture_camera_path_cleans_up_on_stdin_eof() {
+    capture_camera_cleanup("capeof", 987_661, "eof");
+}
+
+#[test]
+fn capture_camera_path_cleans_up_on_quit_command() {
+    capture_camera_cleanup("capquit", 987_662, "quit");
+}
+
+#[test]
+fn capture_camera_path_cleans_up_on_sigterm() {
+    capture_camera_cleanup("capterm", 987_663, "sigterm");
+}
+
+// 境界: ライブ認識モードで start → toggle → quit を流しても、一時領域にも登録先にもファイルが増えない
+// (撮影用のコマンドを送っても、録画も保存も始まらない)
+#[test]
+fn live_mode_never_writes_to_temp_or_data_dir() {
+    if !models_present() {
+        eprintln!("skip: モデルが無い");
+        return;
+    }
+    let root = capture_scratch("livenowrite");
+    let (data, tmp) = capture_dirs(&root);
+    let before = snapshot_dir(&root);
+    let sleep = 987_664;
+    let dir = fake_ffmpeg_dir("livenowrite", sleep);
+    let mut e = Engine::spawn_with_env(
+        Some(&dir),
+        &[("TMPDIR", tmp.to_str().unwrap()), ("ATTENTION_DATA_DIR", data.to_str().unwrap())],
+    );
+    // data_dir を付けても、ライブ認識(mode 省略)では使われない
+    e.send(
+        &json!({"cmd":"start","source":{"kind":"camera","device":"0"},"data_dir":data.display().to_string(),"preview":null})
+            .to_string(),
+    );
+    e.wait_for("ready", Duration::from_secs(120));
+    e.send(r#"{"cmd":"toggle"}"#);
+    e.send(r#"{"cmd":"capture_record","word_id":"001"}"#);
+    e.send(r#"{"cmd":"capture_accept","confirm_ng":true}"#);
+    e.send(r#"{"cmd":"toggle"}"#);
+    // (映像が来ないカメラでは、ループが 1 枚目を待っているあいだコマンドは読まれない。
+    //  撮影用のコマンドが警告されて無視されることは、ユニットテスト live_mode_ignores_capture_commands で確認している)
+    e.send(r#"{"cmd":"quit"}"#);
+    let code = e.finish(Duration::from_secs(20)).expect("終了しない");
+    assert_eq!(code, 0);
+    assert!(!e.types().iter().any(|t| t.starts_with("capture_")), "{:?}", e.types());
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!process_exists(&format!("sleep {sleep}")), "ffmpeg が残っている");
+    assert_eq!(snapshot_dir(&root), before, "ライブ認識で一時領域・登録先が変わった");
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// ffprobe で動画の主要な性質を読む
+fn probe(path: &Path) -> Value {
+    let out = Command::new("ffprobe")
+        .args([
+            "-v", "error", "-select_streams", "v:0", "-count_frames", "-show_entries",
+            "stream=codec_name,width,height,r_frame_rate,pix_fmt,bit_rate,nb_read_frames,profile,duration",
+            "-of", "json",
+        ])
+        .arg(path)
+        .output()
+        .expect("ffprobe を起動できない");
+    assert!(out.status.success(), "ffprobe 失敗: {}", String::from_utf8_lossy(&out.stderr));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    v["streams"][0].clone()
+}
+
+// 実モデル + 実 ffmpeg + 動画ファイル入力(カメラ無し): 撮影モードの一連の流れ。
+//  start → record → stop → 判定 → accept で、登録先に正しい名前の mp4 と index.tsv の行ができ、
+//  その mp4 が 1620x1080 / 30fps / h264 / yuv420p になること。discard で一時ファイルが消えること。
+//  終了後に ffmpeg が残らないこと。入力動画は読むだけ
+#[test]
+#[ignore]
+fn capture_file_input_end_to_end() {
+    let _serial = VIDEO_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    if !hand_models_present() {
+        eprintln!("skip: モデルが無い");
+        return;
+    }
+    let Some(video) = sample_video() else {
+        eprintln!("skip: raw_jsl の動画が無い(ENGINE_JSON_VIDEO で指定できる)");
+        return;
+    };
+    let root = capture_scratch("e2e");
+    let (data, tmp) = capture_dirs(&root);
+    let mut e = Engine::spawn_with_env(None, &[("TMPDIR", tmp.to_str().unwrap())]);
+    // 入力動画: カウントダウンを 2.5 秒にして、カウントダウンも通す(fps の実測は起動直後の 1 秒を除くので、それより長く)
+    e.send(&capture_start_line(json!({"kind":"file","path":video.display().to_string()}), &data, 2.5));
+    e.wait_for("ready", Duration::from_secs(120));
+    let state = e.wait_for("capture_state", Duration::from_secs(10));
+    assert_eq!(state["phase"], "idle");
+    let tmp_dir = tmp.join(format!("attention-capture-{}", e.child.id()));
+    assert!(tmp_dir.is_dir());
+
+    // --- 1 本目: 録画 → 停止 → 判定 → 採用 ---
+    e.send(r#"{"cmd":"capture_record","word_id":"011"}"#);
+    let cd = e.wait_for("capture_state", Duration::from_secs(10));
+    assert_eq!(cd["phase"], "countdown", "{cd}");
+    assert!(cd["countdown_left"].as_f64().unwrap() <= 2.5);
+    loop {
+        let s = e.wait_for("capture_state", Duration::from_secs(20));
+        if s["phase"] == "recording" {
+            assert_eq!(s["word"]["word_id"], "011");
+            assert_eq!(s["fps"], 30.0, "動画は 30fps: {s}");
+            break;
+        }
+    }
+    // 録画中は一時領域にファイルがあり、登録先にはまだ何も無い
+    std::thread::sleep(Duration::from_millis(3200));
+    let in_tmp: Vec<_> = std::fs::read_dir(&tmp_dir).unwrap().flatten().collect();
+    assert_eq!(in_tmp.len(), 1, "録画中の一時ファイル");
+    assert!(!data.join("011_kare").exists(), "採用するまで登録先に書かない");
+    e.send(r#"{"cmd":"capture_stop"}"#);
+    let judged = loop {
+        let s = e.wait_for("capture_state", Duration::from_secs(120));
+        if s["phase"] == "judged" {
+            break s;
+        }
+    };
+    let v = &judged["verdict"];
+    eprintln!("判定: {}", v);
+    assert!(v["summary"].as_str().unwrap().len() > 5);
+    assert!(v["duration_secs"].as_f64().unwrap() > 2.5, "約 3.2 秒以上録画したはず: {v}");
+    let usable = v["usable"].as_bool().unwrap();
+    e.send(&json!({"cmd":"capture_accept","confirm_ng":!usable}).to_string());
+    let saved = e.wait_for("capture_saved", Duration::from_secs(30));
+    assert_eq!(saved["file_path"], "011_kare/01.mp4");
+    assert_eq!(saved["usable"], usable);
+    assert_eq!(saved["quality_flag"], if usable { "ok" } else { v["quality_flag"].as_str().unwrap() });
+    let dest = data.join("011_kare/01.mp4");
+    assert!(dest.is_file());
+    assert_eq!(std::fs::read_dir(&tmp_dir).unwrap().count(), 0, "移したので一時領域は空");
+    let index = std::fs::read_to_string(data.join("index.tsv")).unwrap();
+    assert_eq!(index.lines().count(), 2, "{index}");
+    assert!(index.lines().nth(1).unwrap().starts_with("011_kare/01.mp4\t011\tkare\tかれ\t1\t"), "{index}");
+
+    // 確認用: ENGINE_CAPTURE_KEEP にフォルダを指定すると、録画した mp4 をコピーして残す
+    // (build-dict の経路に通すテスト captured_take_goes_through_build_dict_path で使う)
+    if let Ok(keep) = std::env::var("ENGINE_CAPTURE_KEEP") {
+        std::fs::create_dir_all(&keep).unwrap();
+        std::fs::copy(&dest, Path::new(&keep).join("captured-01.mp4")).unwrap();
+    }
+
+    // 録画した mp4 の性質(既存の raw_jsl の動画と同じ: 1620x1080 / 30fps / h264 / yuv420p / 約 7.7Mbps)
+    let p = probe(&dest);
+    eprintln!("録画の性質: {p}");
+    assert_eq!(p["codec_name"], "h264");
+    assert_eq!((p["width"].as_u64(), p["height"].as_u64()), (Some(1620), Some(1080)));
+    assert_eq!(p["r_frame_rate"], "30/1");
+    assert_eq!(p["pix_fmt"], "yuv420p");
+    assert_eq!(p["profile"], "High");
+    let bitrate: f64 = p["bit_rate"].as_str().unwrap().parse().unwrap();
+    assert!((3.0e6..12.0e6).contains(&bitrate), "ビットレートが約 7.7Mbps から外れている: {bitrate}");
+    let frames: f64 = p["nb_read_frames"].as_str().unwrap().parse().unwrap();
+    let dur = v["duration_secs"].as_f64().unwrap();
+    assert!((frames / 30.0 - dur).abs() < 0.2, "コマ数 {frames} と長さ {dur} が合わない");
+
+    // --- 2 本目: 録画 → 停止 → 判定 → 破棄(一時ファイルが残らない)---
+    e.send(r#"{"cmd":"capture_record","word_id":"011"}"#);
+    loop {
+        let s = e.wait_for("capture_state", Duration::from_secs(20));
+        if s["phase"] == "recording" {
+            assert_eq!(s["word"]["rep_idx"], 2, "次は 02.mp4");
+            break;
+        }
+    }
+    std::thread::sleep(Duration::from_millis(2500));
+    e.send(r#"{"cmd":"capture_stop"}"#);
+    loop {
+        if e.wait_for("capture_state", Duration::from_secs(120))["phase"] == "judged" {
+            break;
+        }
+    }
+    assert_eq!(std::fs::read_dir(&tmp_dir).unwrap().count(), 1);
+    let data_before = snapshot_dir(&data);
+    e.send(r#"{"cmd":"capture_discard"}"#);
+    loop {
+        if e.wait_for("capture_state", Duration::from_secs(20))["phase"] == "idle" {
+            break;
+        }
+    }
+    assert_eq!(std::fs::read_dir(&tmp_dir).unwrap().count(), 0, "破棄したので一時ファイルは残らない");
+    assert_eq!(snapshot_dir(&data), data_before, "破棄で登録先は変わらない");
+
+    // --- 終了: ffmpeg が残らず、一時領域が消える ---
+    e.send(r#"{"cmd":"quit"}"#);
+    let code = e.finish(Duration::from_secs(30)).expect("終了しない");
+    assert_eq!(code, 0);
+    assert_eq!(e.types().last().unwrap(), "stopped");
+    std::thread::sleep(Duration::from_millis(300));
+    // pgrep -f は親シェルのコマンド行にもマッチしうるので、このテストの ffmpeg にしか現れない引数と組み合わせて探す
+    let input_pat = format!("-re -stream_loop -1 -i {}", video.display());
+    let encoder_pat = format!("rawvideo.*{}", tmp_dir.display());
+    assert!(!process_exists(&input_pat), "入力動画用の ffmpeg が残っている");
+    assert!(!process_exists(&encoder_pat), "録画用の ffmpeg が残っている");
+    assert!(!tmp_dir.exists(), "一時領域が残っている");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+// 録画を始めてから最長(10 秒)で自動停止し、10 秒未満の動画になる(実 ffmpeg・動画ファイル入力)
+#[test]
+#[ignore]
+fn capture_auto_stops_before_ten_seconds() {
+    let _serial = VIDEO_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    if !hand_models_present() {
+        eprintln!("skip: モデルが無い");
+        return;
+    }
+    let Some(video) = sample_video() else {
+        eprintln!("skip: raw_jsl の動画が無い");
+        return;
+    };
+    let root = capture_scratch("autostop");
+    let (data, tmp) = capture_dirs(&root);
+    let mut e = Engine::spawn_with_env(None, &[("TMPDIR", tmp.to_str().unwrap())]);
+    e.send(&capture_start_line(json!({"kind":"file","path":video.display().to_string()}), &data, 0.0));
+    e.wait_for("ready", Duration::from_secs(120));
+    e.send(r#"{"cmd":"capture_record","word_id":"001"}"#);
+    let judged = loop {
+        let s = e.wait_for("capture_state", Duration::from_secs(120));
+        if s["phase"] == "judged" {
+            break s;
+        }
+    };
+    let secs = judged["rec_secs"].as_f64().unwrap();
+    assert!((9.5..10.0).contains(&secs), "最長に近いが 10 秒未満: {secs}");
+    assert!(judged["notes"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().contains("自動で止めました")));
+    assert!(judged["verdict"]["reasons"].as_array().unwrap().iter().all(|r| r != "too_long"), "自動停止で『長すぎる』にしない");
+    e.send(r#"{"cmd":"capture_discard"}"#);
+    e.send(r#"{"cmd":"quit"}"#);
+    assert_eq!(e.finish(Duration::from_secs(30)), Some(0));
+    let _ = std::fs::remove_dir_all(root);
+}

@@ -19,7 +19,8 @@
 //!
 //! # 守っていること
 //!
-//! - **カメラ映像・特徴量はディスクに一切書かない**(メモリ上のバッファのみ。ユーザー指定の制約)
+//! - **カメラ映像・特徴量はディスクに一切書かない**(メモリ上のバッファのみ。ユーザー指定の制約)。
+//!   録画・保存をするのは、別モードの撮影モード(`capture.rs`)だけ
 //! - モデルと ONNX セッションは起動時に 1 回だけ読み込む
 
 use crate::{
@@ -47,6 +48,10 @@ use transformer_burn::recognition::Predictor;
 // (子モジュールは親の非公開アイテムを参照できるので、可視性は変えない)
 mod json_engine;
 pub use json_engine::run_engine_json;
+// 撮影モード(録画・判定・登録。R1)。**ファイルを書くコードはここに閉じている**。ライブ認識の経路
+// (`run_session`・`json_engine::serve_live`)からは呼ばない(呼び出しは `json_engine::serve_dispatch` の 1 か所だけ)。
+// 設計: docs/desktop-capture-design.md
+mod capture;
 
 /// ライブ用の既定モデル(center-square + サイン区間の dict で学習済み。preprocess.json は無い)
 const DEFAULT_MODEL_DIR: &str = "../transformer_burn/models/rec_demo_center_signspan";

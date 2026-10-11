@@ -4203,6 +4203,179 @@ mod tests {
         assert_eq!(w.len(), 2);
     }
 
+    // === ライブ認識デモ L0: 処理 fps の実測 ===
+
+    /// 昇順ソート済みの値の q 分位点(最近順位法。q=0.5 が中央値、0.9 が 90% 点)
+    // [TEST向き] 純粋関数
+    fn percentile(sorted: &[f64], q: f64) -> f64 {
+        if sorted.is_empty() {
+            return f64::NAN;
+        }
+        let rank = (q * sorted.len() as f64).ceil() as usize;
+        sorted[rank.clamp(1, sorted.len()) - 1]
+    }
+
+    #[test]
+    fn percentile_nearest_rank() {
+        let v = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
+        assert_eq!(percentile(&v, 0.5), 5.0);
+        assert_eq!(percentile(&v, 0.9), 9.0);
+        assert_eq!(percentile(&v, 1.0), 10.0);
+        assert_eq!(percentile(&v, 0.0), 1.0);
+        assert!(percentile(&[], 0.5).is_nan());
+    }
+
+    /// raw_jsl の「ok」テイクを、語彙全体に散らして n 本選ぶ(index.tsv を読むだけで書き込まない)。
+    /// 見つからなければ空。ライブ関連の実データ測定/スモークの共通入口
+    pub(crate) fn sample_raw_jsl_takes(n: usize) -> Vec<PathBuf> {
+        let root = Path::new(RAW_JSL_DIR);
+        let Ok(index) = std::fs::read_to_string(root.join("index.tsv")) else {
+            return Vec::new();
+        };
+        // 列: file_path, word_id, romaji, label_ja, rep_idx, recorded_at, duration_ms, quality_flag, notes
+        let mut ok: Vec<PathBuf> = index
+            .lines()
+            .skip(1)
+            .filter_map(|l| {
+                let c: Vec<&str> = l.split('\t').collect();
+                (c.len() > 7 && c[7] == "ok").then(|| root.join(c[0]))
+            })
+            .filter(|p| p.exists())
+            .collect();
+        ok.sort();
+        let stride = (ok.len() / n.max(1)).max(1);
+        ok.into_iter().step_by(stride).take(n).collect()
+    }
+
+    /// ライブ認識の L0(推論側): フレームあたりの Palm / Hand の所要時間を、
+    /// **Palm が見つけた手の数(0/1/2)別**に実測する。Hand ランドマークは手の数だけ
+    /// 走るので、2 本のフレームが最も遅い。中央値と 90% 点から処理 fps の目安を出す
+    /// (窓あたり 10 枚を確保するには処理 fps ≥ 約 7 が要る。設計書 §3.1)。
+    /// 動画のデコード時間は含まない(ライブでは別スレッド/別プロセスの ffmpeg が担う)が、
+    /// 入力テンソルへの前処理(リサイズ等)は各推論関数に含まれるので計測に入る。
+    ///
+    /// 環境変数:
+    ///   FPS_VIDEOS      対象動画(':' 区切り。既定は raw_jsl の ok テイクから FPS_NUM_VIDEOS 本)
+    ///   FPS_NUM_VIDEOS  既定 6
+    ///   FPS_ROI         full | center(既定。ライブ用モデルの ROI)| tiles3 ...
+    ///
+    /// ffmpeg + Palm/Hand ONNX + raw_jsl 実データに依存するため #[ignore]。
+    /// 手動実行: `cargo test measure_live_fps --release -- --ignored --nocapture`
+    /// (debug ビルドだと桁違いに遅いので必ず --release)
+    #[test]
+    #[ignore]
+    fn measure_live_fps() {
+        for p in [Path::new(PALM_MODEL), Path::new(HAND_MODEL)] {
+            if !p.exists() {
+                eprintln!("skip: fixture not found: {}", p.display());
+                return;
+            }
+        }
+        let mode_name = std::env::var("FPS_ROI").unwrap_or_else(|_| "center".into());
+        let mode = parse_roi_mode(&mode_name);
+        let n: usize = std::env::var("FPS_NUM_VIDEOS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(6);
+        let videos: Vec<PathBuf> = match std::env::var("FPS_VIDEOS") {
+            Ok(v) => v.split(':').map(PathBuf::from).collect(),
+            Err(_) => sample_raw_jsl_takes(n),
+        };
+        if videos.is_empty() {
+            eprintln!("skip: 測定用の動画が無い");
+            return;
+        }
+        eprintln!("roi={} ({}) / {} 本", mode_name, mode.label(), videos.len());
+
+        let anchors = load_palm_anchors();
+        let mut palm = Session::builder().unwrap().commit_from_file(PALM_MODEL).unwrap();
+        let mut hand = Session::builder().unwrap().commit_from_file(HAND_MODEL).unwrap();
+        let mut person: Option<PersonDetector> = if matches!(mode, PalmRoiMode::Person { .. }) {
+            Some(PersonDetector::load(PERSON_MODEL).unwrap())
+        } else {
+            None
+        };
+
+        // (見つかった手の数, Palm ms, Hand 合計 ms)
+        let mut samples: Vec<(usize, f64, f64)> = Vec::new();
+        // ONNX Runtime は最初の数回が遅い(初期化・メモリ確保)ので捨てる
+        let mut warmup_left = 5usize;
+        for video in &videos {
+            let info = probe_video(video).unwrap();
+            let name = video.to_string_lossy().to_string();
+            let before = samples.len();
+            extract_frames(video, info.width, info.height, |_idx, frame| {
+                let t0 = std::time::Instant::now();
+                let palms =
+                    run_palm_detection_mode(&mut palm, &frame, &anchors, mode, person.as_mut())?;
+                let palm_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                let t1 = std::time::Instant::now();
+                for p in &palms {
+                    run_hand_landmark(&mut hand, &frame, p)?;
+                }
+                let hand_ms = t1.elapsed().as_secs_f64() * 1000.0;
+                if warmup_left > 0 {
+                    warmup_left -= 1;
+                } else {
+                    samples.push((palms.len().min(2), palm_ms, hand_ms));
+                }
+                Ok(())
+            })
+            .unwrap();
+            eprintln!("  {} : {} フレーム", name, samples.len() - before);
+        }
+
+        let report = |label: &str, rows: &[&(usize, f64, f64)]| {
+            if rows.is_empty() {
+                eprintln!("{:<16} n=0", label);
+                return;
+            }
+            let sorted = |f: &dyn Fn(&(usize, f64, f64)) -> f64| {
+                let mut v: Vec<f64> = rows.iter().map(|r| f(r)).collect();
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v
+            };
+            let palm_v = sorted(&|r| r.1);
+            let hand_v = sorted(&|r| r.2);
+            let tot_v = sorted(&|r| r.1 + r.2);
+            let (m, p9) = (percentile(&tot_v, 0.5), percentile(&tot_v, 0.9));
+            eprintln!(
+                "{:<16} n={:<5} Palm 中央{:6.1} 90%点{:6.1} | Hand計 中央{:6.1} 90%点{:6.1} | \
+                 合計 中央{:6.1}ms 90%点{:6.1}ms => {:.1} fps (中央) / {:.1} fps (90%点)",
+                label,
+                rows.len(),
+                percentile(&palm_v, 0.5),
+                percentile(&palm_v, 0.9),
+                percentile(&hand_v, 0.5),
+                percentile(&hand_v, 0.9),
+                m,
+                p9,
+                1000.0 / m,
+                1000.0 / p9
+            );
+        };
+        eprintln!("\n--- フレームあたり所要時間 (ms)。手の数 = Palm が見つけた数(Hand 推論の回数) ---");
+        for k in 0..=2usize {
+            let rows: Vec<&(usize, f64, f64)> = samples.iter().filter(|s| s.0 == k).collect();
+            report(&format!("手{}本", k), &rows);
+        }
+        let all: Vec<&(usize, f64, f64)> = samples.iter().collect();
+        report("全フレーム", &all);
+        let with_hand: Vec<&(usize, f64, f64)> = samples.iter().filter(|s| s.0 > 0).collect();
+        report("手あり(1+2本)", &with_hand);
+        let share = |k: usize| {
+            samples.iter().filter(|s| s.0 == k).count() as f64 * 100.0 / samples.len() as f64
+        };
+        eprintln!(
+            "\nフレーム構成: 手0本 {:.0}% / 1本 {:.0}% / 2本 {:.0}% (計 {} フレーム)",
+            share(0),
+            share(1),
+            share(2),
+            samples.len()
+        );
+        eprintln!("目安: 窓あたり 10 枚を確保するには処理 fps >= 約 7");
+    }
+
     // === 実験5: 人物検出 ROI の幾何と座標の往復 ===
 
     #[test]

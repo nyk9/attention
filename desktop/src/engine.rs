@@ -64,6 +64,30 @@ pub struct EngineLocation {
     pub bin: PathBuf,
 }
 
+/// `git rev-parse --git-common-dir` の出力から、本体チェックアウトのルートを求める(撮影ガイドのデータ探し用)。
+/// 出力は絶対パスのことも、実行場所からの相対パス(`.git`)のこともある。共通 git ディレクトリの親が本体。
+/// 撮影ガイドのソース(`capture_guide/`)は書き込み・プロセス起動 API を禁止しているので、git を呼ぶ処理はここに置く
+pub fn main_checkout_from_common_dir(output: &str, cwd: &Path) -> Option<PathBuf> {
+    let line = output.lines().next()?.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let p = Path::new(line);
+    let abs = if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) };
+    // 相対形でも `..` を含まないよう正規化する(失敗したら素のまま)
+    let abs = std::fs::canonicalize(&abs).unwrap_or(abs);
+    abs.parent().map(Path::to_path_buf)
+}
+
+/// 実際に git を呼んで、git worktree の本体チェックアウトのルートを探す(読み取り系の `rev-parse` のみ。失敗は None)
+pub fn find_main_checkout(repo_root: &Path) -> Option<PathBuf> {
+    let out = Proc::new("git").args(["rev-parse", "--git-common-dir"]).current_dir(repo_root).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    main_checkout_from_common_dir(&String::from_utf8_lossy(&out.stdout), repo_root)
+}
+
 /// リポジトリのルート: 環境変数 `ATTENTION_ROOT`、無ければコンパイル時の `CARGO_MANIFEST_DIR`(= desktop/)の親
 pub fn resolve_root(env_root: Option<&str>, manifest_dir: &Path) -> PathBuf {
     match env_root {
@@ -414,6 +438,32 @@ fn reader_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn main_checkout_from_git_output() {
+        let cwd = Path::new("/nonexistent/wt");
+        assert_eq!(main_checkout_from_common_dir("/main/.git\n", cwd), Some(PathBuf::from("/main")));
+        assert_eq!(main_checkout_from_common_dir("", cwd), None);
+        assert_eq!(
+            main_checkout_from_common_dir("../.git\n", Path::new("/nonexistent/a")),
+            Some(PathBuf::from("/nonexistent/a/.."))
+        );
+    }
+
+    /// この worktree(または本体)から実 git で解決できるか(手動実行・読むだけ)。
+    /// 本体の raw_jsl が実在する環境で ATTENTION_DATA_DIR 未設定なら、本体側が選ばれ「次の語」が出る
+    ///   cargo test --release real_resolution_finds_main_data -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn real_resolution_finds_main_data_and_next_word() {
+        use crate::capture_guide::progress as gp;
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let c = gp::choose_data_dir(None, &root, |p| p.is_dir(), || find_main_checkout(&root));
+        eprintln!("{c:?}");
+        let v = gp::load_progress_for(&c).expect("本体の raw_jsl が読めるはず");
+        eprintln!("{}", gp::next_word_text(&v));
+        assert!(v.next.is_some(), "次の語が出る");
+    }
 
     #[test]
     fn root_resolution_prefers_env_then_manifest_parent() {

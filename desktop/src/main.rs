@@ -126,14 +126,17 @@ impl LiveApp {
             .detach();
         }
 
-        // 撮影ガイドのデータディレクトリ: ATTENTION_DATA_DIR、無ければ <リポジトリ>/transformer_burn/data/raw_jsl
+        // 撮影ガイドのデータディレクトリ: ATTENTION_DATA_DIR、無ければ <リポジトリ>/transformer_burn/data/raw_jsl、
+        // それも無ければ git worktree の本体チェックアウトの raw_jsl
         let root = engine::resolve_root(
             std::env::var("ATTENTION_ROOT").ok().as_deref(),
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
         );
-        let data_dir = guide_progress::resolve_data_dir(
+        let data_choice = guide_progress::choose_data_dir(
             std::env::var(guide_progress::DATA_DIR_ENV).ok().as_deref(),
             &root,
+            |p| p.is_dir(),
+            || engine::find_main_checkout(&root),
         );
 
         let mut app = Self {
@@ -143,7 +146,7 @@ impl LiveApp {
             image: None,
             focus_handle,
             frames_shown: 0,
-            guide: GuideState::new(data_dir),
+            guide: GuideState::from_choice(data_choice),
             last_guide_log: String::new(),
         };
 

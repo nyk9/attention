@@ -142,6 +142,8 @@ R0(撮影ガイド。録画なし・書き込みなし)を `desktop/` に実装�
 - **縁の警告**(`edge.rs`): 手の点が検出範囲(`preview.crop`)の縁から枠の幅・高さの 3%(`EDGE_MARGIN_RATIO`)以内、または枠の外にあれば、枠を赤く太く(黄・2px → 赤・5px)し、「検出範囲の右の縁に手が近づいています。枠の内側へ」のように、画面に見えている向き(鏡像)で知らせる
 - **お題と進捗**(`progress.rs`): 「次の語」を大きく(例: `かれ(011)` と `4 本目 / 目標 10`)、全体の本数・完了語数を小さく表示。3 秒ごとに読み直す(撮影中に他のツールが動画や index.tsv を足すため)。読めないときは赤い枠に日本語の理由を出し、他の機能は動かす
 - **データの場所**: 環境変数 `ATTENTION_DATA_DIR`、無ければ `<リポジトリ>/transformer_burn/data/raw_jsl`(リポジトリの場所は既存の `ATTENTION_ROOT` の解決と同じ)
+  - **worktree 対応(後日修正)**: raw_jsl は gitignore 対象で worktree には複製されないため、既定の場所が無いときは `git rev-parse --git-common-dir`(読み取り系のみ)から本体チェックアウトを探し、その raw_jsl を使う。`ATTENTION_DATA_DIR` 指定時は従来どおり最優先でフォールバックしない。git の呼び出しは「書き込み・プロセス起動 API 禁止」の検査対象外の `engine.rs` に置き、決定ロジックは純関数 `choose_data_dir`(`progress.rs`)に分離してテスト
+  - 読めないときの表示に「決め方(環境変数 / 既定の場所 / 本体へのフォールバック)」と探した場所、「worktree では raw_jsl は複製されません。本体のパスを ATTENTION_DATA_DIR に指定してください」を併記
 - **開発・検証用の環境変数**: `ATTENTION_APP_MODE=capture-guide` で撮影ガイドから起動。`ATTENTION_APP_DEBUG` 有効時、撮影ガイドの表示内容(手・秒数・合格判定・直前・縁・お題)を変化時に標準エラーへ 1 行出す
 
 ### 9.2 規則の出典と、progress.rs との違い

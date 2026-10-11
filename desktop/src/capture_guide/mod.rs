@@ -91,18 +91,31 @@ pub struct GuideState {
     /// 進捗(読めないときは理由)。まだ読んでいなければ None
     pub progress: Option<Result<ProgressView, String>>,
     pub data_dir: PathBuf,
+    /// データディレクトリの決め方と探した場所(エラー文言用)。`new` で作った場合は既定の場所扱い
+    pub data_dir_choice: progress::DataDirChoice,
     last_reload: Option<Instant>,
 }
 
 impl GuideState {
+    #[cfg(test)]
     pub fn new(data_dir: PathBuf) -> Self {
+        let choice = progress::DataDirChoice {
+            tried: vec![data_dir.clone()],
+            path: data_dir,
+            origin: progress::DataDirOrigin::Default,
+        };
+        Self::from_choice(choice)
+    }
+
+    pub fn from_choice(choice: progress::DataDirChoice) -> Self {
         Self {
             epoch: None,
             runs: HandRuns::default(),
             hands: None,
             edge: EdgeStatus::default(),
             progress: None,
-            data_dir,
+            data_dir: choice.path.clone(),
+            data_dir_choice: choice,
             last_reload: None,
         }
     }
@@ -133,7 +146,7 @@ impl GuideState {
 
     /// 進捗を読み直す(読むだけ)
     pub fn reload_progress(&mut self, now: Instant) {
-        self.progress = Some(progress::load_progress(&self.data_dir));
+        self.progress = Some(progress::load_progress_for(&self.data_dir_choice));
         self.last_reload = Some(now);
     }
 }

@@ -73,12 +73,85 @@ pub struct ProgressView {
     pub total_words: usize,
 }
 
-/// データディレクトリ: 環境変数 `ATTENTION_DATA_DIR`、無ければ `<リポジトリ>/transformer_burn/data/raw_jsl`
-pub fn resolve_data_dir(env_value: Option<&str>, repo_root: &Path) -> PathBuf {
-    match env_value {
-        Some(v) if !v.trim().is_empty() => PathBuf::from(v.trim()),
-        _ => repo_root.join("transformer_burn/data/raw_jsl"),
+/// リポジトリ直下からのデータディレクトリの相対位置
+const DEFAULT_DATA_SUBDIR: &str = "transformer_burn/data/raw_jsl";
+
+/// データディレクトリがどの方法で決まったか(エラー文言に出す)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataDirOrigin {
+    /// 環境変数 `ATTENTION_DATA_DIR` の指定
+    Env,
+    /// 既定の場所(`<リポジトリ>/transformer_burn/data/raw_jsl`)
+    Default,
+    /// git worktree の本体チェックアウト側の raw_jsl(既定の場所が無かったときのフォールバック)
+    MainCheckout,
+}
+
+impl DataDirOrigin {
+    pub fn label(self) -> &'static str {
+        match self {
+            DataDirOrigin::Env => "環境変数",
+            DataDirOrigin::Default => "既定の場所",
+            DataDirOrigin::MainCheckout => "本体へのフォールバック",
+        }
     }
+}
+
+/// データディレクトリの決定結果。`tried` は決めるときに探した場所(順番どおり)
+#[derive(Debug, Clone, PartialEq)]
+pub struct DataDirChoice {
+    pub path: PathBuf,
+    pub origin: DataDirOrigin,
+    pub tried: Vec<PathBuf>,
+}
+
+/// データディレクトリを決める(純関数。ディスクや git には `exists` と `main_checkout` 経由でしか触れない)。
+/// 1. 環境変数 `ATTENTION_DATA_DIR` があれば最優先(存在確認も本体探しもしない)
+/// 2. 既定の場所 `<repo_root>/transformer_burn/data/raw_jsl` が存在すればそれ
+/// 3. 無ければ、git worktree の本体チェックアウト(`main_checkout()` が返す)の同じ相対位置が存在すればそれ
+/// 4. どれも無ければ既定の場所を返す(読むときに「見つかりません」になる)
+pub fn choose_data_dir(
+    env_value: Option<&str>,
+    repo_root: &Path,
+    exists: impl Fn(&Path) -> bool,
+    main_checkout: impl FnOnce() -> Option<PathBuf>,
+) -> DataDirChoice {
+    if let Some(v) = env_value.map(str::trim).filter(|v| !v.is_empty()) {
+        let path = PathBuf::from(v);
+        return DataDirChoice { tried: vec![path.clone()], path, origin: DataDirOrigin::Env };
+    }
+    let default = repo_root.join(DEFAULT_DATA_SUBDIR);
+    if exists(&default) {
+        return DataDirChoice { tried: vec![default.clone()], path: default, origin: DataDirOrigin::Default };
+    }
+    let mut tried = vec![default.clone()];
+    if let Some(main) = main_checkout() {
+        let candidate = main.join(DEFAULT_DATA_SUBDIR);
+        if candidate != default {
+            tried.push(candidate.clone());
+            if exists(&candidate) {
+                return DataDirChoice { path: candidate, origin: DataDirOrigin::MainCheckout, tried };
+            }
+        }
+    }
+    DataDirChoice { path: default, origin: DataDirOrigin::Default, tried }
+}
+
+/// データディレクトリが無いときの日本語メッセージ。どの方法で決まったかと、探した場所を併記する
+pub fn missing_dir_message(choice: &DataDirChoice) -> String {
+    let tried = choice
+        .tried
+        .iter()
+        .map(|p| format!("  - {}", p.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "撮影データのフォルダが見つかりません: {}\n決め方: {}\n探した場所:\n{tried}\n\
+         worktree では raw_jsl は複製されません。本体のパスを {DATA_DIR_ENV} に指定してください\n\
+         (撮影ガイドは読み取り専用なので、ファイルを作ったり直したりはしません)",
+        choice.path.display(),
+        choice.origin.label(),
+    )
 }
 
 /// words.tsv の本文を読む(progress.rs の `load_words` の解析部分と同じ規則)
@@ -248,6 +321,14 @@ pub fn summary_text(v: &ProgressView) -> String {
 
 // ===== ディスクからの読み取り(読むだけ)=====
 
+/// 決定結果から進捗を読む。フォルダが無いときは、決め方と探した場所を併記したメッセージにする
+pub fn load_progress_for(choice: &DataDirChoice) -> Result<ProgressView, String> {
+    if !choice.path.is_dir() {
+        return Err(missing_dir_message(choice));
+    }
+    load_progress(&choice.path)
+}
+
 /// データディレクトリから進捗を読む。読めないときは、画面に出す日本語の理由を返す
 pub fn load_progress(data_dir: &Path) -> Result<ProgressView, String> {
     let hint = format!(
@@ -406,11 +487,57 @@ mod tests {
     }
 
     #[test]
-    fn data_dir_resolution() {
+    fn data_dir_env_wins_without_checking_anything() {
         let root = Path::new("/repo");
-        assert_eq!(resolve_data_dir(None, root), PathBuf::from("/repo/transformer_burn/data/raw_jsl"));
-        assert_eq!(resolve_data_dir(Some("  "), root), PathBuf::from("/repo/transformer_burn/data/raw_jsl"));
-        assert_eq!(resolve_data_dir(Some(" /data/x \n"), root), PathBuf::from("/data/x"));
+        let c = choose_data_dir(Some(" /data/x \n"), root, |_| panic!("環境変数指定では存在確認しない"), || panic!("本体も探さない"));
+        assert_eq!(c.path, PathBuf::from("/data/x"));
+        assert_eq!(c.origin, DataDirOrigin::Env);
+    }
+
+    #[test]
+    fn data_dir_default_when_it_exists() {
+        let root = Path::new("/repo");
+        let want = PathBuf::from("/repo/transformer_burn/data/raw_jsl");
+        for env in [None, Some("  ")] {
+            let c = choose_data_dir(env, root, |p| p == want, || panic!("既定があれば本体は探さない"));
+            assert_eq!((c.path.clone(), c.origin), (want.clone(), DataDirOrigin::Default));
+        }
+    }
+
+    #[test]
+    fn data_dir_falls_back_to_main_checkout() {
+        let root = Path::new("/main/.claude/worktrees/w");
+        let main_dir = PathBuf::from("/main/transformer_burn/data/raw_jsl");
+        let c = choose_data_dir(None, root, |p| p == main_dir, || Some(PathBuf::from("/main")));
+        assert_eq!(c.path, main_dir);
+        assert_eq!(c.origin, DataDirOrigin::MainCheckout);
+        assert_eq!(c.tried.len(), 2);
+    }
+
+    #[test]
+    fn data_dir_missing_everywhere_keeps_the_default_for_the_original_error() {
+        let root = Path::new("/repo");
+        // 本体が見つからない / 本体にも無い / 本体が自分自身、のどれでも既定の場所を返す
+        for main in [None, Some(PathBuf::from("/main")), Some(PathBuf::from("/repo"))] {
+            let c = choose_data_dir(None, root, |_| false, || main.clone());
+            assert_eq!(c.path, PathBuf::from("/repo/transformer_burn/data/raw_jsl"));
+            assert_eq!(c.origin, DataDirOrigin::Default);
+        }
+        let c = choose_data_dir(None, root, |_| false, || Some(PathBuf::from("/main")));
+        assert_eq!(c.tried.len(), 2);
+        let msg = missing_dir_message(&c);
+        assert!(msg.contains("撮影データのフォルダが見つかりません: /repo/transformer_burn/data/raw_jsl"), "{msg}");
+        assert!(msg.contains("既定の場所"), "{msg}");
+        assert!(msg.contains("/main/transformer_burn/data/raw_jsl"), "{msg}");
+        assert!(msg.contains("worktree では raw_jsl は複製されません"), "{msg}");
+        assert!(msg.contains(DATA_DIR_ENV), "{msg}");
+    }
+
+    #[test]
+    fn missing_message_names_the_origin() {
+        let env = DataDirChoice { path: PathBuf::from("/e"), origin: DataDirOrigin::Env, tried: vec![PathBuf::from("/e")] };
+        let m = missing_dir_message(&env);
+        assert!(m.contains("決め方: 環境変数") && m.contains("  - /e"), "{m}");
     }
 
     #[test]

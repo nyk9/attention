@@ -1,3 +1,4 @@
+mod live;
 mod progress;
 
 use anyhow::{Context, Result};
@@ -247,6 +248,11 @@ struct TagEntry {
 }
 
 fn main() -> Result<()> {
+    // アプリ専用の内部入口(メニュー・ヘルプには出さない。TTY 不要)。設計: docs/desktop-app-design.md §3.2
+    if std::env::args().nth(1).as_deref() == Some("--engine-json") {
+        return live::run_engine_json();
+    }
+
     let theme = ColorfulTheme::default();
 
     let actions = &[
@@ -256,6 +262,7 @@ fn main() -> Result<()> {
         "撮影テイクを build-dict 用にエクスポート",
         "タグ→ポーズ辞書を構築(build-dict)",
         "動画からタグを認識(推論)",
+        "ライブ認識デモ(カメラ/動画をフレーム入力にして単語を認識)",
         "[dev] ONNXモデルの入出力を調査(inspect)",
         "[dev] ダミー推論で出力shapeを確認(test-infer)",
         "終了",
@@ -274,8 +281,9 @@ fn main() -> Result<()> {
         3 => export_wizard(&theme),
         4 => build_dict_wizard(&theme),
         5 => recognize_wizard(&theme),
-        6 => inspect_wizard(&theme),
-        7 => test_infer_wizard(&theme),
+        6 => live::live_wizard(&theme),
+        7 => inspect_wizard(&theme),
+        8 => test_infer_wizard(&theme),
         _ => {
             println!("終了します");
             Ok(())
@@ -458,18 +466,41 @@ fn recognize_wizard(theme: &ColorfulTheme) -> Result<()> {
     // 2. 認識モデル(model.bin + tag_vocab.json を含むディレクトリ)を選ぶ
     let model_dir = select_model_dir(theme)?;
 
+    // 学習に使った dict の前処理(ROI・フレーム選択)がモデルと一緒に保存されていれば読む。
+    // 合っていないと train/test 不一致になる(中央クロップで学習したモデルに
+    // フレーム全体で抽出した特徴を食わせる、など)
+    let preprocess = load_model_preprocess(&model_dir)?;
+
     // 3. フレーム数(学習時の SEQ_LEN と揃える)と表示件数
     let frames: usize = Input::with_theme(theme)
         .with_prompt("ダウンサンプルするフレーム数(学習時の SEQ_LEN と揃える)")
-        .default(10)
+        .default(preprocess.as_ref().and_then(|p| p.frames).unwrap_or(10))
         .interact_text()?;
     let topk: usize = Input::with_theme(theme)
         .with_prompt("上位何件のタグを表示するか")
         .default(5)
         .interact_text()?;
-    // 学習に使った dict と同じ選び方でないと train/test 不一致になる
-    // (dict の metadata.frame_select に何で作ったかが入っている)
-    let select = select_frame_mode(theme)?;
+    let (roi_mode, select) = match &preprocess {
+        Some(p) => {
+            eprintln!(
+                "モデルの preprocess.json に合わせます: palm_roi={} / frame_select={}",
+                p.roi.label(),
+                p.select.label()
+            );
+            (p.roi, p.select)
+        }
+        None => {
+            // 古いモデル(preprocess.json が無い)は従来どおり: ROI はフレーム全体、
+            // フレームの選び方は人が選ぶ(既定は等間隔)
+            eprintln!(
+                "警告: {} に preprocess.json がありません(前処理が記録されていない古いモデル)。\n\
+                 \x20     従来どおり ROI=フレーム全体で抽出します。学習した dict が中央クロップや\n\
+                 \x20     サイン区間選択で作られていた場合、結果が不安定になります",
+                model_dir.display()
+            );
+            (PalmRoiMode::FullFrame, select_frame_mode(theme)?)
+        }
+    };
 
     // 4. Palm + Hand モデルをロード(build_dict と同じ手順)
     let palm_anchors = load_palm_anchors();
@@ -480,14 +511,24 @@ fn recognize_wizard(theme: &ColorfulTheme) -> Result<()> {
         .commit_from_file(HAND_MODEL)
         .with_context(|| format!("failed to load hand model: {}", HAND_MODEL))?;
 
+    // 人物 ROI のモデルのときだけ人物検出モデルも読む(build_dict_mode と同じ)
+    let mut person: Option<PersonDetector> = if matches!(roi_mode, PalmRoiMode::Person { .. }) {
+        Some(PersonDetector::load(PERSON_MODEL)?)
+    } else {
+        None
+    };
+
     // 5. 動画 → 手ポーズ列(TagEntry)を抽出
     eprintln!("\n=== 抽出: {} ===", video.display());
-    let entry = extract_tag_features(
+    let entry = extract_tag_features_impl(
         &video,
         &mut palm_session,
         &mut hand_session,
         &palm_anchors,
         frames,
+        false,
+        roi_mode,
+        person.as_mut(),
         select,
     )?;
     eprintln!(
@@ -519,6 +560,68 @@ fn recognize_wizard(theme: &ColorfulTheme) -> Result<()> {
     println!("\n注意: 学習に使った動画なら当たって当然(配線確認)。本判定は未見テイクで行うこと。");
 
     Ok(())
+}
+
+/// モデルが学習に使った dict の前処理(preprocess.json)を、pose_extractor の型に直したもの。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ModelPreprocess {
+    roi: PalmRoiMode,
+    select: FrameSelectMode,
+    /// 学習時のフレーム数 T(dict の metadata.frames)。無ければ None
+    frames: Option<usize>,
+}
+
+/// モデルディレクトリの preprocess.json を読む。**ファイルが無ければ None**(古いモデル。
+/// 呼び出し側が警告を出して従来の挙動 = FullFrame + 均等間隔に戻す)。
+/// 読めたが解釈できない値が入っていた場合は警告を出して該当項目だけ従来の値にする。
+fn load_model_preprocess(model_dir: &Path) -> Result<Option<ModelPreprocess>> {
+    let info = transformer_burn::preprocess_info::PreprocessInfo::load(model_dir)
+        .map_err(|e| anyhow::anyhow!("preprocess.json の読み込みに失敗: {}", e))?;
+    Ok(info.map(|info| {
+        let (pre, warnings) = model_preprocess_from_info(&info);
+        for w in warnings {
+            eprintln!("警告: {}", w);
+        }
+        pre
+    }))
+}
+
+/// preprocess.json の中身 → ROI・フレーム選択。キーが無い(null)のは古い dict で、
+/// palm_roi なら FullFrame、frame_select なら Uniform で作られている(それぞれ追加前の挙動)。
+/// 解釈できない文字列は従来の値に戻し、理由を警告として返す。
+// [TEST向き] 純粋関数。キー無し・未知の文字列・正常値
+fn model_preprocess_from_info(
+    info: &transformer_burn::preprocess_info::PreprocessInfo,
+) -> (ModelPreprocess, Vec<String>) {
+    let mut warnings = Vec::new();
+    let roi = match info.palm_roi.as_deref() {
+        None => PalmRoiMode::FullFrame,
+        Some(label) => PalmRoiMode::from_label(label).unwrap_or_else(|| {
+            warnings.push(format!(
+                "preprocess.json の palm_roi '{}' を解釈できません。フレーム全体にします",
+                label
+            ));
+            PalmRoiMode::FullFrame
+        }),
+    };
+    let select = match info.frame_select.as_deref() {
+        None => FrameSelectMode::Uniform,
+        Some(label) => FrameSelectMode::from_label(label).unwrap_or_else(|| {
+            warnings.push(format!(
+                "preprocess.json の frame_select '{}' を解釈できません。等間隔にします",
+                label
+            ));
+            FrameSelectMode::Uniform
+        }),
+    };
+    (
+        ModelPreprocess {
+            roi,
+            select,
+            frames: info.frames,
+        },
+        warnings,
+    )
 }
 
 /// videos/ 内の動画を一覧から選ばせる(無ければ/その他はパス直接入力)
@@ -1056,6 +1159,9 @@ fn build_dict_mode(
 
 /// 1 動画からハンドランドマーク列を抽出し、`target` フレームにダウンサンプルした TagEntry を返す。
 // [評価] 推論依存。出力の良し悪しは coverage 等の指標で評価(テストでなく計測)
+// recognize_wizard が ROI を指定できる extract_tag_features_impl を直接呼ぶようになったため、
+// この FullFrame 固定の薄いラッパーはテストからだけ使う
+#[cfg(test)]
 fn extract_tag_features(
     video: &PathBuf,
     palm_session: &mut Session,
@@ -1828,6 +1934,41 @@ impl PalmRoiMode {
             }
         }
     }
+
+    /// `label()` の逆引き。pose dict の metadata.palm_roi や、モデルディレクトリの
+    /// preprocess.json に入っている文字列から ROI を復元するために使う。
+    /// 解釈できない文字列は None(呼び出し側で警告して既定に戻す)
+    fn from_label(label: &str) -> Option<Self> {
+        let label = label.trim();
+        match label {
+            "full-frame" => return Some(PalmRoiMode::FullFrame),
+            "center-square" => return Some(PalmRoiMode::CenterSquare),
+            _ => {}
+        }
+        // "name(args)" 形式
+        let (name, rest) = label.split_once('(')?;
+        let args = rest.strip_suffix(')')?;
+        let parts: Vec<&str> = args.split(',').map(str::trim).collect();
+        match name {
+            "relative" => {
+                let v: Vec<f32> = parts.iter().filter_map(|p| p.parse().ok()).collect();
+                if v.len() == 4 && parts.len() == 4 {
+                    Some(PalmRoiMode::Relative { x: v[0], y: v[1], w: v[2], h: v[3] })
+                } else {
+                    None
+                }
+            }
+            "tiles" if parts.len() == 1 => parts[0]
+                .parse()
+                .ok()
+                .map(|count| PalmRoiMode::Tiles { count }),
+            "person" if parts.len() == 2 => Some(PalmRoiMode::Person {
+                region: PersonRegion::from_label(parts[0])?,
+                scale: parts[1].parse().ok()?,
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// **実験6**: build-dict / 認識で「動画のどのフレームを T 枚選ぶか」の方式。
@@ -1849,6 +1990,30 @@ impl FrameSelectMode {
                 format!("sign-span(samples={},max_gap={})", samples, max_gap)
             }
         }
+    }
+
+    /// `label()` の逆引き(dict の metadata.frame_select / preprocess.json から復元する)。
+    /// 解釈できない文字列は None
+    fn from_label(label: &str) -> Option<Self> {
+        let label = label.trim();
+        if label == "uniform" {
+            return Some(FrameSelectMode::Uniform);
+        }
+        let args = label.strip_prefix("sign-span(")?.strip_suffix(')')?;
+        let mut samples = None;
+        let mut max_gap = None;
+        for kv in args.split(',') {
+            let (k, v) = kv.split_once('=')?;
+            match k.trim() {
+                "samples" => samples = v.trim().parse().ok(),
+                "max_gap" => max_gap = v.trim().parse().ok(),
+                _ => return None,
+            }
+        }
+        Some(FrameSelectMode::SignSpan {
+            samples: samples?,
+            max_gap: max_gap?,
+        })
     }
 }
 
@@ -2259,6 +2424,16 @@ impl PersonRegion {
             PersonRegion::Bbox => "bbox",
             PersonRegion::FullBody => "fullbody",
             PersonRegion::UpperBody => "upperbody",
+        }
+    }
+
+    /// `label()` の逆引き。未知の名前は None
+    fn from_label(name: &str) -> Option<Self> {
+        match name {
+            "bbox" => Some(PersonRegion::Bbox),
+            "fullbody" => Some(PersonRegion::FullBody),
+            "upperbody" => Some(PersonRegion::UpperBody),
+            _ => None,
         }
     }
 }
@@ -3974,6 +4149,239 @@ mod tests {
                 d.hits, d.misses
             );
         }
+    }
+
+    // === preprocess.json(モデルが学習した dict の前処理)の復元 ===
+
+    // [TEST向き] label() → from_label() で元のモードに戻ること(dict metadata と同じ書式)
+    #[test]
+    fn palm_roi_label_roundtrip() {
+        for mode in [
+            PalmRoiMode::FullFrame,
+            PalmRoiMode::CenterSquare,
+            SIGN_ROI,
+            PalmRoiMode::Tiles { count: 3 },
+            PERSON_ROI,
+            PalmRoiMode::Person { region: PersonRegion::UpperBody, scale: PERSON_ROI_SCALE },
+        ] {
+            assert_eq!(PalmRoiMode::from_label(&mode.label()), Some(mode), "{}", mode.label());
+        }
+        assert_eq!(PalmRoiMode::from_label("nonsense"), None);
+        assert_eq!(PalmRoiMode::from_label("tiles(x)"), None);
+        assert_eq!(PalmRoiMode::from_label("relative(0.1,0.2,0.3)"), None);
+    }
+
+    #[test]
+    fn frame_select_label_roundtrip() {
+        for mode in [FrameSelectMode::Uniform, SIGN_SPAN] {
+            assert_eq!(FrameSelectMode::from_label(&mode.label()), Some(mode), "{}", mode.label());
+        }
+        assert_eq!(
+            FrameSelectMode::from_label("sign-span(samples=16,max_gap=1)"),
+            Some(SIGN_SPAN)
+        );
+        assert_eq!(FrameSelectMode::from_label("sign-span(samples=16)"), None);
+        assert_eq!(FrameSelectMode::from_label("whatever"), None);
+    }
+
+    // [TEST向き] 実 dict の組み合わせ(center + sign-span)/ キー無しの古い dict / 未知の文字列
+    #[test]
+    fn model_preprocess_from_info_cases() {
+        use transformer_burn::preprocess_info::PreprocessInfo;
+        let (p, w) = model_preprocess_from_info(&PreprocessInfo {
+            palm_roi: Some("center-square".into()),
+            frame_select: Some("sign-span(samples=16,max_gap=1)".into()),
+            frames: Some(10),
+        });
+        assert_eq!((p.roi, p.select, p.frames), (PalmRoiMode::CenterSquare, SIGN_SPAN, Some(10)));
+        assert!(w.is_empty());
+
+        // 古い dict: キー無し = full-frame + uniform
+        let (p, w) = model_preprocess_from_info(&PreprocessInfo::default());
+        assert_eq!((p.roi, p.select), (PalmRoiMode::FullFrame, FrameSelectMode::Uniform));
+        assert!(w.is_empty());
+
+        // 解釈できない値は従来値に戻して警告
+        let (p, w) = model_preprocess_from_info(&PreprocessInfo {
+            palm_roi: Some("future-roi".into()),
+            frame_select: Some("future-select".into()),
+            frames: None,
+        });
+        assert_eq!((p.roi, p.select), (PalmRoiMode::FullFrame, FrameSelectMode::Uniform));
+        assert_eq!(w.len(), 2);
+    }
+
+    // === ライブ認識デモ L0: 処理 fps の実測 ===
+
+    /// 昇順ソート済みの値の q 分位点(最近順位法。q=0.5 が中央値、0.9 が 90% 点)
+    // [TEST向き] 純粋関数
+    fn percentile(sorted: &[f64], q: f64) -> f64 {
+        if sorted.is_empty() {
+            return f64::NAN;
+        }
+        let rank = (q * sorted.len() as f64).ceil() as usize;
+        sorted[rank.clamp(1, sorted.len()) - 1]
+    }
+
+    #[test]
+    fn percentile_nearest_rank() {
+        let v = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
+        assert_eq!(percentile(&v, 0.5), 5.0);
+        assert_eq!(percentile(&v, 0.9), 9.0);
+        assert_eq!(percentile(&v, 1.0), 10.0);
+        assert_eq!(percentile(&v, 0.0), 1.0);
+        assert!(percentile(&[], 0.5).is_nan());
+    }
+
+    /// raw_jsl の「ok」テイクを、語彙全体に散らして n 本選ぶ(index.tsv を読むだけで書き込まない)。
+    /// 見つからなければ空。ライブ関連の実データ測定/スモークの共通入口
+    pub(crate) fn sample_raw_jsl_takes(n: usize) -> Vec<PathBuf> {
+        let root = Path::new(RAW_JSL_DIR);
+        let Ok(index) = std::fs::read_to_string(root.join("index.tsv")) else {
+            return Vec::new();
+        };
+        // 列: file_path, word_id, romaji, label_ja, rep_idx, recorded_at, duration_ms, quality_flag, notes
+        let mut ok: Vec<PathBuf> = index
+            .lines()
+            .skip(1)
+            .filter_map(|l| {
+                let c: Vec<&str> = l.split('\t').collect();
+                (c.len() > 7 && c[7] == "ok").then(|| root.join(c[0]))
+            })
+            .filter(|p| p.exists())
+            .collect();
+        ok.sort();
+        let stride = (ok.len() / n.max(1)).max(1);
+        ok.into_iter().step_by(stride).take(n).collect()
+    }
+
+    /// ライブ認識の L0(推論側): フレームあたりの Palm / Hand の所要時間を、
+    /// **Palm が見つけた手の数(0/1/2)別**に実測する。Hand ランドマークは手の数だけ
+    /// 走るので、2 本のフレームが最も遅い。中央値と 90% 点から処理 fps の目安を出す
+    /// (窓あたり 10 枚を確保するには処理 fps ≥ 約 7 が要る。設計書 §3.1)。
+    /// 動画のデコード時間は含まない(ライブでは別スレッド/別プロセスの ffmpeg が担う)が、
+    /// 入力テンソルへの前処理(リサイズ等)は各推論関数に含まれるので計測に入る。
+    ///
+    /// 環境変数:
+    ///   FPS_VIDEOS      対象動画(':' 区切り。既定は raw_jsl の ok テイクから FPS_NUM_VIDEOS 本)
+    ///   FPS_NUM_VIDEOS  既定 6
+    ///   FPS_ROI         full | center(既定。ライブ用モデルの ROI)| tiles3 ...
+    ///
+    /// ffmpeg + Palm/Hand ONNX + raw_jsl 実データに依存するため #[ignore]。
+    /// 手動実行: `cargo test measure_live_fps --release -- --ignored --nocapture`
+    /// (debug ビルドだと桁違いに遅いので必ず --release)
+    #[test]
+    #[ignore]
+    fn measure_live_fps() {
+        for p in [Path::new(PALM_MODEL), Path::new(HAND_MODEL)] {
+            if !p.exists() {
+                eprintln!("skip: fixture not found: {}", p.display());
+                return;
+            }
+        }
+        let mode_name = std::env::var("FPS_ROI").unwrap_or_else(|_| "center".into());
+        let mode = parse_roi_mode(&mode_name);
+        let n: usize = std::env::var("FPS_NUM_VIDEOS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(6);
+        let videos: Vec<PathBuf> = match std::env::var("FPS_VIDEOS") {
+            Ok(v) => v.split(':').map(PathBuf::from).collect(),
+            Err(_) => sample_raw_jsl_takes(n),
+        };
+        if videos.is_empty() {
+            eprintln!("skip: 測定用の動画が無い");
+            return;
+        }
+        eprintln!("roi={} ({}) / {} 本", mode_name, mode.label(), videos.len());
+
+        let anchors = load_palm_anchors();
+        let mut palm = Session::builder().unwrap().commit_from_file(PALM_MODEL).unwrap();
+        let mut hand = Session::builder().unwrap().commit_from_file(HAND_MODEL).unwrap();
+        let mut person: Option<PersonDetector> = if matches!(mode, PalmRoiMode::Person { .. }) {
+            Some(PersonDetector::load(PERSON_MODEL).unwrap())
+        } else {
+            None
+        };
+
+        // (見つかった手の数, Palm ms, Hand 合計 ms)
+        let mut samples: Vec<(usize, f64, f64)> = Vec::new();
+        // ONNX Runtime は最初の数回が遅い(初期化・メモリ確保)ので捨てる
+        let mut warmup_left = 5usize;
+        for video in &videos {
+            let info = probe_video(video).unwrap();
+            let name = video.to_string_lossy().to_string();
+            let before = samples.len();
+            extract_frames(video, info.width, info.height, |_idx, frame| {
+                let t0 = std::time::Instant::now();
+                let palms =
+                    run_palm_detection_mode(&mut palm, &frame, &anchors, mode, person.as_mut())?;
+                let palm_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                let t1 = std::time::Instant::now();
+                for p in &palms {
+                    run_hand_landmark(&mut hand, &frame, p)?;
+                }
+                let hand_ms = t1.elapsed().as_secs_f64() * 1000.0;
+                if warmup_left > 0 {
+                    warmup_left -= 1;
+                } else {
+                    samples.push((palms.len().min(2), palm_ms, hand_ms));
+                }
+                Ok(())
+            })
+            .unwrap();
+            eprintln!("  {} : {} フレーム", name, samples.len() - before);
+        }
+
+        let report = |label: &str, rows: &[&(usize, f64, f64)]| {
+            if rows.is_empty() {
+                eprintln!("{:<16} n=0", label);
+                return;
+            }
+            let sorted = |f: &dyn Fn(&(usize, f64, f64)) -> f64| {
+                let mut v: Vec<f64> = rows.iter().map(|r| f(r)).collect();
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v
+            };
+            let palm_v = sorted(&|r| r.1);
+            let hand_v = sorted(&|r| r.2);
+            let tot_v = sorted(&|r| r.1 + r.2);
+            let (m, p9) = (percentile(&tot_v, 0.5), percentile(&tot_v, 0.9));
+            eprintln!(
+                "{:<16} n={:<5} Palm 中央{:6.1} 90%点{:6.1} | Hand計 中央{:6.1} 90%点{:6.1} | \
+                 合計 中央{:6.1}ms 90%点{:6.1}ms => {:.1} fps (中央) / {:.1} fps (90%点)",
+                label,
+                rows.len(),
+                percentile(&palm_v, 0.5),
+                percentile(&palm_v, 0.9),
+                percentile(&hand_v, 0.5),
+                percentile(&hand_v, 0.9),
+                m,
+                p9,
+                1000.0 / m,
+                1000.0 / p9
+            );
+        };
+        eprintln!("\n--- フレームあたり所要時間 (ms)。手の数 = Palm が見つけた数(Hand 推論の回数) ---");
+        for k in 0..=2usize {
+            let rows: Vec<&(usize, f64, f64)> = samples.iter().filter(|s| s.0 == k).collect();
+            report(&format!("手{}本", k), &rows);
+        }
+        let all: Vec<&(usize, f64, f64)> = samples.iter().collect();
+        report("全フレーム", &all);
+        let with_hand: Vec<&(usize, f64, f64)> = samples.iter().filter(|s| s.0 > 0).collect();
+        report("手あり(1+2本)", &with_hand);
+        let share = |k: usize| {
+            samples.iter().filter(|s| s.0 == k).count() as f64 * 100.0 / samples.len() as f64
+        };
+        eprintln!(
+            "\nフレーム構成: 手0本 {:.0}% / 1本 {:.0}% / 2本 {:.0}% (計 {} フレーム)",
+            share(0),
+            share(1),
+            share(2),
+            samples.len()
+        );
+        eprintln!("目安: 窓あたり 10 枚を確保するには処理 fps >= 約 7");
     }
 
     // === 実験5: 人物検出 ROI の幾何と座標の往復 ===

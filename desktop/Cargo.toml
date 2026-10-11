@@ -1,0 +1,30 @@
+[package]
+name = "attention-app"
+version = "0.1.0"
+edition = "2021"
+description = "手話認識ライブ画面(GPUI)。認識エンジン pose-extract --engine-json を子プロセスとして使う"
+
+# ワークスペースにはしない(リポジトリ直下の他クレートとは独立したパッケージ)
+[workspace]
+
+[dependencies]
+# gpui-component 0.5.1 は gpui ^0.2.2 に依存する。0.6 以降は別名クレート gpui-pre 0.3.x に変わり、
+# runtime_shaders 機能が無いため、この版の組み合わせを使う。
+# ここで gpui 0.2.2 の runtime_shaders を有効にすると、Cargo の feature 統合(同じ版の gpui は 1 つにまとまり、
+# 要求された機能の和集合でビルドされる)により、gpui-component が使う gpui にも効く。
+# runtime_shaders: Metal シェーダをビルド時(xcrun metal = Xcode が必要)ではなく実行時にコンパイルする。
+gpui = { version = "=0.2.2", features = ["runtime_shaders"] }
+gpui-component = "=0.5.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+# JPEG のデコード専用。gpui 側が同じ image 0.25 を使うので版は一致する
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+# gpui の RenderImage::new が SmallVec<[Frame; 1]> を受け取るため
+smallvec = "1"
+anyhow = "1"
+# 終了処理で子プロセスに SIGTERM を送るために使う
+libc = "0.2"
+
+[profile.release]
+# 既定のまま(最適化あり)。ビルド時間が気になる場合は opt-level を下げられる

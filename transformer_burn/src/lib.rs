@@ -17,6 +17,7 @@ pub mod jsl_vocabulary;
 pub mod metrics;
 pub mod model;
 pub mod pose_data;
+pub mod preprocess_info;
 pub mod recognition;
 #[cfg(feature = "wgpu")]
 pub mod recognition_training;

@@ -9,6 +9,7 @@ mod jsl_vocabulary;
 mod metrics;
 mod model;
 mod pose_data;
+mod preprocess_info;
 mod recognition;
 mod recognition_training;
 mod tag_vocabulary;
@@ -432,6 +433,14 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             if let Some(stats) = &stats {
                 stats.save(save_dir)?;
             }
+            // どの ROI・フレーム選択で作った dict で学習したかを残す(推論側が揃えるため)
+            let preprocess = preprocess_info::PreprocessInfo::from_dict_file(dict_path)?;
+            preprocess.save(save_dir)?;
+            println!(
+                "前処理情報を保存: preprocess.json (palm_roi={} / frame_select={})",
+                preprocess.palm_roi.as_deref().unwrap_or("(dict に無し=full-frame)"),
+                preprocess.frame_select.as_deref().unwrap_or("(dict に無し=uniform)")
+            );
         }
         return Ok(());
     }
@@ -516,6 +525,14 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             if let Some(stats) = &stats {
                 stats.save(save_dir)?;
             }
+            // どの ROI・フレーム選択で作った dict で学習したかを残す(推論側が揃えるため)
+            let preprocess = preprocess_info::PreprocessInfo::from_dict_file(dict_path)?;
+            preprocess.save(save_dir)?;
+            println!(
+                "前処理情報を保存: preprocess.json (palm_roi={} / frame_select={})",
+                preprocess.palm_roi.as_deref().unwrap_or("(dict に無し=full-frame)"),
+                preprocess.frame_select.as_deref().unwrap_or("(dict に無し=uniform)")
+            );
         }
         return Ok(());
     }

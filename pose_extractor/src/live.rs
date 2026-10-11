@@ -42,6 +42,12 @@ use std::time::Instant;
 use transformer_burn::config::SEQ_LEN;
 use transformer_burn::recognition::Predictor;
 
+// アプリ専用の内部入口(標準入力/標準出力の JSON 行)。設計: docs/desktop-app-design.md §3.2。
+// live.rs の部品(トレイト・Engine・Labels など)をそのまま使う別実装で、ここの子モジュールに閉じ込める
+// (子モジュールは親の非公開アイテムを参照できるので、可視性は変えない)
+mod json_engine;
+pub use json_engine::run_engine_json;
+
 /// ライブ用の既定モデル(center-square + サイン区間の dict で学習済み。preprocess.json は無い)
 const DEFAULT_MODEL_DIR: &str = "../transformer_burn/models/rec_demo_center_signspan";
 
@@ -273,6 +279,9 @@ struct CameraSource {
     last_seq: u64,
     /// 推論が追いつかず捨てたフレーム数(終了時に表示する)
     dropped: u64,
+    /// `failure_reason` が ffmpeg を回収(wait)する**直前**に呼ぶ処理(ライブ用エンジンの PID 登録解除)。
+    /// 回収した後の PID は別プロセスに使い回されうるので、外から kill される前に登録を外せるようにする
+    before_reap: Option<fn()>,
 }
 
 impl CameraSource {
@@ -308,12 +317,23 @@ impl CameraSource {
             start,
             last_seq: 0,
             dropped: 0,
+            before_reap: None,
         })
+    }
+
+    /// ffmpeg を回収する直前に呼ぶ処理を登録する(json_engine が PID の登録解除に使う)
+    fn set_before_reap(&mut self, f: fn()) {
+        self.before_reap = Some(f);
     }
 
     /// ffmpeg が止まったときの理由(stderr)を取り出す
     fn failure_reason(&mut self) -> String {
+        // kill した直後の ffmpeg は、wait するまでゾンビとして PID を保つ(= 使い回されない)。
+        // その間に登録を外せば、外から見て「回収済みの PID に kill が飛ぶ」瞬間が無くなる
         let _ = self.child.kill();
+        if let Some(f) = self.before_reap {
+            f();
+        }
         let _ = self.child.wait();
         let mut msg = String::new();
         if let Some(mut err) = self.child.stderr.take() {
@@ -1085,6 +1105,11 @@ trait LiveUi {
     fn status(&mut self, s: &StatusLine);
     fn message(&mut self, msg: &str);
     fn result(&mut self, r: &LiveResult);
+    /// 処理済みの 1 フレームを画面のプレビュー用に渡す(`run_session` がフレームごとに呼ぶ)。
+    /// `raw` は認識に使った生フレームの**読み取り専用の参照**で、実装は書き換えない・保持しない
+    /// (必要なら間引いたうえで自分用に縮小・複製する)。
+    /// 既定は何もしない(`TerminalUi` はこれを使わないので挙動は変わらない)
+    fn preview(&mut self, _raw: &Array3<u8>, _frame: &LiveFrame) {}
 }
 
 /// words.tsv の (romaji, label_ja) を表示用に引く
@@ -1374,6 +1399,7 @@ fn run_session(
             right: obs.right,
         };
         let fps = meter.tick(sf.t);
+        lp.ui.preview(&sf.frame, &frame);
         lp.buf.push(frame);
         if !lp.recording {
             lp.buf.keep_last_secs(PRE_ROLL_MAX_SECS);
@@ -1615,6 +1641,54 @@ fn print_vocabulary(tags: &[String], labels: &Labels) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ffmpeg が自分から止まって failure_reason が回収するとき、回収の前に before_reap が呼ばれる
+    // (json_engine が PID の登録を外す。回収済みの PID に kill が飛ばないようにするため)。
+    // カメラは開かず、`sleep` を ffmpeg の代わりの子プロセスにする
+    #[cfg(unix)]
+    #[test]
+    fn camera_failure_reason_calls_before_reap_exactly_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn hook() {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let start = Instant::now();
+        let mut cam = CameraSource {
+            child,
+            // ffmpeg が止まったあとの状態(フレーム無し・closed)
+            shared: Arc::new((
+                Mutex::new(LatestSlot {
+                    seq: 0,
+                    frame: None,
+                    stamp: start,
+                    closed: true,
+                }),
+                Condvar::new(),
+            )),
+            reader: None,
+            start,
+            last_seq: 0,
+            dropped: 0,
+            before_reap: None,
+        };
+        cam.set_before_reap(hook);
+        let err = match cam.next_frame() {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("フレームが返った"),
+        };
+        assert!(err.contains("カメラ入力が止まりました"), "{err}");
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+        // 回収済み(kill されて wait 済み)なので、もう一度 try_wait しても終了済みと返る
+        assert!(cam.child.try_wait().unwrap().is_some());
+    }
 
     /// t = i / fps の時刻列
     fn times(n: usize, fps: f64) -> Vec<f64> {

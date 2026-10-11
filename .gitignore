@@ -34,3 +34,8 @@ transformer_burn/data/pose_dict*.json
 transformer_burn/data/raw_jsl/
 # checkpoint クロスバックエンドテストの一時生成物
 transformer_burn/tests/temp_checkpoint_test*/
+
+# desktop: GUI アプリ(GPUI)。ビルド成果物は追跡しない。
+# 1.0 前の gpui の版を固定するため、ここだけ Cargo.lock を追跡する(上の Cargo.lock の無視を打ち消す)
+desktop/target/
+!desktop/Cargo.lock

@@ -248,6 +248,11 @@ struct TagEntry {
 }
 
 fn main() -> Result<()> {
+    // アプリ専用の内部入口(メニュー・ヘルプには出さない。TTY 不要)。設計: docs/desktop-app-design.md §3.2
+    if std::env::args().nth(1).as_deref() == Some("--engine-json") {
+        return live::run_engine_json();
+    }
+
     let theme = ColorfulTheme::default();
 
     let actions = &[

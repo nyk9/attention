@@ -32,6 +32,8 @@ transformer_burn/models/rec_*/
 transformer_burn/data/pose_dict*.json
 # transformer_burn: 撮影データ・進捗(録画は大きい/index.tsv は再生成可能)
 transformer_burn/data/raw_jsl/
+# pose_extractor: ライブ認識のデバッグ書き出し(LIVE_DEBUG_DUMP_DIR)の映像フレーム。顔が写るため誤コミットを防ぐ
+live_*_frame*_hand-*_palm*.png
 # checkpoint クロスバックエンドテストの一時生成物
 transformer_burn/tests/temp_checkpoint_test*/
 

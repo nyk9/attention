@@ -937,7 +937,8 @@ const DEBUG_DUMP_MAX: usize = 20;
 /// 学習データ・辞書・モデルに誤って映像を混ぜないための安全弁
 fn dump_dir_violation(path: &Path) -> Option<String> {
     for c in path.components() {
-        let name = c.as_os_str().to_string_lossy();
+        // macOS(APFS)は既定で大文字小文字を区別しないので、比較は小文字にそろえる
+        let name = c.as_os_str().to_string_lossy().to_lowercase();
         if name == "raw_jsl" || name == "models" || name.starts_with("pose_dict") {
             return Some(format!("'{}' を含むパス", name));
         }
@@ -965,8 +966,27 @@ fn lexical_absolute(path: &Path) -> PathBuf {
     out
 }
 
-/// 書き出し先を検証して作る。拒否: raw_jsl / models / pose_dict* を含むパス(シンボリックリンクの
-/// 解決後も確認する)、既存の非ディレクトリ
+/// 実在する最も近い祖先を `canonicalize` し、残りの(まだ無い)要素を後ろに足す。
+/// ディレクトリを作る前にシンボリックリンクの実体を判定するために使う
+fn resolve_existing_prefix(path: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut cur = path.to_path_buf();
+    loop {
+        if let Ok(real) = cur.canonicalize() {
+            return rest.iter().rev().fold(real, |acc, c| acc.join(c));
+        }
+        match (cur.file_name().map(|n| n.to_os_string()), cur.parent()) {
+            (Some(name), Some(parent)) => {
+                rest.push(name);
+                cur = parent.to_path_buf();
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// 書き出し先を検証して作る。拒否: raw_jsl / models / pose_dict* を含むパス(大文字小文字は区別しない。
+/// シンボリックリンクの解決後も、ディレクトリを作る**前**に確認する)、既存の非ディレクトリ
 fn prepare_dump_dir(raw: &str) -> Result<PathBuf> {
     let dir = lexical_absolute(Path::new(raw.trim()));
     if let Some(why) = dump_dir_violation(&dir) {
@@ -979,6 +999,17 @@ fn prepare_dump_dir(raw: &str) -> Result<PathBuf> {
     }
     if dir.exists() && !dir.is_dir() {
         anyhow::bail!("{} はディレクトリではありません: {}", DEBUG_DUMP_ENV, dir.display());
+    }
+    // シンボリックリンク経由で禁止領域を指していないか(作る前に、実在する祖先の実体で確認)
+    let resolved = resolve_existing_prefix(&dir);
+    if let Some(why) = dump_dir_violation(&resolved) {
+        anyhow::bail!(
+            "{} の指定先 {} は実体が {} で、使えません({})",
+            DEBUG_DUMP_ENV,
+            dir.display(),
+            resolved.display(),
+            why
+        );
     }
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("書き出し先を作れません: {}", dir.display()))?;
@@ -2209,6 +2240,10 @@ mod tests {
             "/x/data/pose_dict_dump",
             // `..` で禁止領域へ抜ける指定も、畳んだあとで拒否される
             "/x/safe/../transformer_burn/models/y",
+            // 大文字小文字違いもすり抜けない(APFS は既定で区別しない)
+            "/x/Models/y",
+            "/x/RAW_JSL",
+            "/x/Pose_Dict_a",
         ] {
             let abs = lexical_absolute(Path::new(bad));
             assert!(dump_dir_violation(&abs).is_some(), "拒否されるべき: {}", bad);
@@ -2226,6 +2261,23 @@ mod tests {
         let err = prepare_dump_dir(bad.to_str().unwrap()).unwrap_err().to_string();
         assert!(err.contains("使えません"), "{}", err);
         assert!(!bad.exists(), "拒否したディレクトリは作らない");
+    }
+
+    // 禁止領域を指すシンボリックリンク配下は、ディレクトリを作る前に拒否する
+    #[cfg(unix)]
+    #[test]
+    fn prepare_dump_dir_rejects_symlink_to_protected_before_creating() {
+        let base = std::env::temp_dir().join(format!("live_dump_symlink_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let protected = base.join("models");
+        std::fs::create_dir_all(&protected).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&protected, &link).unwrap();
+        let target = link.join("newdir");
+        let err = prepare_dump_dir(target.to_str().unwrap()).unwrap_err().to_string();
+        assert!(err.contains("使えません"), "{}", err);
+        assert!(!protected.join("newdir").exists(), "禁止領域の中にディレクトリを作らない");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // N 枚に 1 枚・最大 20 枚。先頭 1 枚目を含む

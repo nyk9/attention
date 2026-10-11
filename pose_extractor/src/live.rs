@@ -13,9 +13,9 @@
 //!                       KeySource ──▶ Segmenter(いつ録画を始め/止めるか)
 //! ```
 //!
-//! - L1(今回): `ManualSegmenter` = Enter で開始、もう一度 Enter で停止
-//! - L2(未実装): `Segmenter` を実装する状態機械(手の出入りで自動)を足すだけ。
-//!   `Boundary::Start { pre_roll_secs }` で直前の何秒を録画に含めるかを返せる
+//! - L1: `ManualSegmenter` = Enter で開始、もう一度 Enter で停止
+//! - L2: `AutoSegmenter` = 手の出入りで自動的に開始/停止(Enter での手動操作も併用できる)。
+//!   `Boundary::Start { pre_roll_secs }` で直前の何秒を録画に含めるかを返す
 //!
 //! # 守っていること
 //!
@@ -61,8 +61,13 @@ const CAMERA_INPUT_PIXEL_FORMAT: Option<&str> = None;
 const SPAN_GAP_SECS: f64 = 0.23;
 /// サイン区間の前後に付ける余白。学習時は step/2(約 0.1 秒)
 const SPAN_MARGIN_SECS: f64 = 0.10;
-/// 待機中に保持しておく直近のフレーム長(L2 の「記録開始前の余白」用。L1 では使わない)
-const PRE_ROLL_MAX_SECS: f64 = 0.5;
+/// 手が出始めた時点より前に録画へ含める秒数(自動区切りの pre-roll)。
+/// 実動画で、サイン冒頭の短い手検出(0.2 秒)→ 0.23 秒の途切れ → 本体、という並びがあり、
+/// 開始判定(START_HAND_SECS)の後ろから 0.5 秒だけ遡ると冒頭が落ちて別の語になった(kuru → iu)
+const PRE_ROLL_BEFORE_ONSET_SECS: f64 = 0.5;
+/// 待機中に保持しておく直近のフレーム長(L2 の「記録開始前の余白」用。手動開始は 0 秒で使わない)。
+/// 開始判定に AUTO_START_HAND_SECS かかるので、その分を足して「手が出始めた 0.5 秒前」まで遡れるようにする
+const PRE_ROLL_MAX_SECS: f64 = AUTO_START_HAND_SECS + PRE_ROLL_BEFORE_ONSET_SECS;
 /// top-1 の確率がこれ未満なら「自信なし」と添える(補助表示。高確信度の誤りは止められない)
 const LOW_CONFIDENCE: f32 = 0.5;
 /// 結果に表示する候補数
@@ -439,6 +444,8 @@ enum Boundary {
     Start { pre_roll_secs: f64 },
     /// 録画停止 → 認識
     Stop,
+    /// 録画を認識せずに捨てる(自動区切りで、手の出ている時間が短すぎた場合)
+    Discard,
 }
 
 trait Segmenter {
@@ -463,6 +470,229 @@ impl Segmenter for ManualSegmenter {
     }
 }
 
+// ===== L2: 手の出入りによる自動区切り =====
+//
+// 待機 --(手あり が START_HAND_SECS 続く)--> 記録中
+//      --(手なし が STOP_NO_HAND_SECS 続く)--> 確定(手ありの長さが MIN_SIGN_SECS 未満なら破棄)--> 待機
+//      --(記録が MAX_RECORD_SECS を超える)--> 打ち切って確定 --> 待機(再アーム待ち)
+// 数値はすべて仮置き(実機で調整する)。**秒**で持つ: 処理 fps は約 8〜17 で変わるため、
+// フレーム数でなく `LiveFrame::t` の差で判定する。
+
+/// 手あり がこの秒数続いたら記録開始
+const AUTO_START_HAND_SECS: f64 = 0.3;
+/// 手なし がこの秒数続いたら記録終了
+const AUTO_STOP_NO_HAND_SECS: f64 = 0.5;
+/// 記録がこの秒数を超えたら打ち切って確定
+const AUTO_MAX_RECORD_SECS: f64 = 6.0;
+/// 記録中に手が出ていた時間(最初の手あり〜最後の手あり)がこれ未満なら捨てる
+const AUTO_MIN_SIGN_SECS: f64 = 0.4;
+/// 打ち切り(または手動停止)の直後、手なしがこの秒数続くまで次の記録を始めない(再アーム)
+const AUTO_REARM_NO_HAND_SECS: f64 = 0.5;
+/// 記録開始時に含める直前の秒数(待機中のリングバッファ `PRE_ROLL_MAX_SECS` の範囲内)。
+/// 開始判定の分(START_HAND_SECS)を含むので、手が出始めた瞬間より前に含まれるのは 0.5 秒
+const AUTO_PRE_ROLL_SECS: f64 = PRE_ROLL_MAX_SECS;
+/// 時刻差の比較の許容誤差(i/10 のような時刻の引き算で 0.39999.. になるのを吸収する)
+const TIME_EPS: f64 = 1e-9;
+/// 自動区切りが短すぎる記録を捨てたときに画面に出す文(結果行 `→ ...` とは区別する)
+const DISCARD_MESSAGE: &str = "(短すぎる動きを無視しました)";
+
+/// 自動区切りの閾値(テストで固定値を渡せるように struct にしてある)
+#[derive(Debug, Clone, Copy)]
+struct AutoParams {
+    start_hand_secs: f64,
+    stop_no_hand_secs: f64,
+    max_record_secs: f64,
+    min_sign_secs: f64,
+    rearm_no_hand_secs: f64,
+    pre_roll_secs: f64,
+}
+
+impl Default for AutoParams {
+    fn default() -> Self {
+        Self {
+            start_hand_secs: AUTO_START_HAND_SECS,
+            stop_no_hand_secs: AUTO_STOP_NO_HAND_SECS,
+            max_record_secs: AUTO_MAX_RECORD_SECS,
+            min_sign_secs: AUTO_MIN_SIGN_SECS,
+            rearm_no_hand_secs: AUTO_REARM_NO_HAND_SECS,
+            pre_roll_secs: AUTO_PRE_ROLL_SECS,
+        }
+    }
+}
+
+/// `elapsed` が `threshold` 秒に達したか(浮動小数の誤差を許容)
+fn reached(elapsed: f64, threshold: f64) -> bool {
+    elapsed + TIME_EPS >= threshold
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoPhase {
+    /// 待機中(記録していない)
+    Idle,
+    /// 手の出現で自動的に始めた記録。手なし・打ち切りで自動的に止まる
+    Auto,
+    /// Enter で手動に始めた記録。**自動では止めない**(止めるのも Enter)
+    Manual,
+}
+
+/// L2: (時刻, 手あり)を 1 つずつ受け取り、境界(Start/Stop/Discard)を返す純粋な状態機械。
+/// 実時間(Instant)は読まない。時刻はフレームの `t` だけを使うので、テストで時刻を与えて境界を固定できる。
+///
+/// 手あり判定は `LiveFrame::has_hand` 1 か所に集約している(§3.4 のキーボード上の手を
+/// 手なし扱いにする条件を足すなら、そこを差し替える)。
+#[derive(Debug)]
+struct AutoSegmenter {
+    p: AutoParams,
+    phase: AutoPhase,
+    /// 直前に見た時刻(巻き戻りの吸収用)
+    last_t: Option<f64>,
+    /// 待機中: 次の記録を始めてよいか。打ち切り・手動停止の直後は false で、
+    /// 手なしが `rearm_no_hand_secs` 続くまで true にならない
+    rearm_needed: bool,
+    /// 待機中: 手あり が連続している区間の開始時刻
+    hand_since: Option<f64>,
+    /// 手なし が連続している区間の開始時刻(待機中は再アーム判定、自動記録中は停止判定に使う)
+    absent_since: Option<f64>,
+    /// 自動記録: 記録の開始時刻(= 開始フレームの時刻 - pre-roll)
+    rec_start: f64,
+    /// 自動記録: 最初/最後に手が見えた時刻(手ありの長さの判定用)
+    first_hand: Option<f64>,
+    last_hand: Option<f64>,
+}
+
+impl AutoSegmenter {
+    fn new() -> Self {
+        Self::with_params(AutoParams::default())
+    }
+
+    fn with_params(p: AutoParams) -> Self {
+        Self {
+            p,
+            phase: AutoPhase::Idle,
+            last_t: None,
+            rearm_needed: false,
+            hand_since: None,
+            absent_since: None,
+            rec_start: 0.0,
+            first_hand: None,
+            last_hand: None,
+        }
+    }
+
+    /// 待機に戻して追跡状態をリセットする。`rearm` が true なら手なし待ち(再アーム)を要求する
+    fn go_idle(&mut self, rearm: bool) {
+        self.phase = AutoPhase::Idle;
+        self.rearm_needed = rearm;
+        self.hand_since = None;
+        self.absent_since = None;
+        self.first_hand = None;
+        self.last_hand = None;
+    }
+
+    /// 1 フレーム進める。非有限の時刻は無視し、時刻の巻き戻りは直前の時刻に丸める
+    /// (同時刻のフレームは経過 0 秒として扱うので、閾値を誤って超えない)
+    fn step(&mut self, t: f64, hand: bool) -> Option<Boundary> {
+        if !t.is_finite() {
+            return None;
+        }
+        let t = self.last_t.map_or(t, |l| t.max(l));
+        self.last_t = Some(t);
+        match self.phase {
+            AutoPhase::Idle => self.step_idle(t, hand),
+            AutoPhase::Auto => self.step_auto(t, hand),
+            // 手動で始めた記録は手なしでも打ち切りでも止めない(止めるのは Enter)
+            AutoPhase::Manual => None,
+        }
+    }
+
+    fn step_idle(&mut self, t: f64, hand: bool) -> Option<Boundary> {
+        if hand {
+            self.absent_since = None;
+            if self.rearm_needed {
+                // 打ち切り/手動停止の直後に手が写り続けている: 一度手なしになるまで始めない。
+                // (再アームが無いと、6 秒打ち切りの直後に次の記録が即始まって同じ動きを二重に認識する)
+                return None;
+            }
+            let since = *self.hand_since.get_or_insert(t);
+            if reached(t - since, self.p.start_hand_secs) {
+                self.phase = AutoPhase::Auto;
+                self.rec_start = t - self.p.pre_roll_secs;
+                self.first_hand = Some(since); // 手が出始めた時刻(判定待ちの間のフレームも手あり)
+                self.last_hand = Some(t);
+                self.absent_since = None;
+                self.hand_since = None;
+                return Some(Boundary::Start {
+                    pre_roll_secs: self.p.pre_roll_secs,
+                });
+            }
+        } else {
+            self.hand_since = None; // 開始判定は手あり連続のみ。1 フレームの途切れでやり直し
+            if self.rearm_needed {
+                let since = *self.absent_since.get_or_insert(t);
+                if reached(t - since, self.p.rearm_no_hand_secs) {
+                    self.rearm_needed = false;
+                }
+            }
+        }
+        None
+    }
+
+    fn step_auto(&mut self, t: f64, hand: bool) -> Option<Boundary> {
+        if hand {
+            self.absent_since = None;
+            self.first_hand.get_or_insert(t);
+            self.last_hand = Some(t);
+        } else {
+            let since = *self.absent_since.get_or_insert(t);
+            if reached(t - since, self.p.stop_no_hand_secs) {
+                let sign_secs = match (self.first_hand, self.last_hand) {
+                    (Some(a), Some(b)) => b - a,
+                    _ => 0.0,
+                };
+                let short = !reached(sign_secs, self.p.min_sign_secs);
+                self.go_idle(false); // すでに手なしが続いているので再アーム不要
+                return Some(if short {
+                    Boundary::Discard
+                } else {
+                    Boundary::Stop
+                });
+            }
+        }
+        if t - self.rec_start > self.p.max_record_secs + TIME_EPS {
+            self.go_idle(true); // 手が写り続けていても、一度手なしになるまで再開しない
+            return Some(Boundary::Stop);
+        }
+        None
+    }
+}
+
+impl Segmenter for AutoSegmenter {
+    /// 自動モードでも Enter で手動の開始/停止ができる。
+    /// - 手動で始めた記録(Manual)は手の出入りでは止まらない(止めるのも Enter)。L1 と同じ操作感
+    /// - 自動で始めた記録中に Enter を押すと、その場で停止して認識する(短さによる破棄はしない)
+    /// - 停止後は、手が写り続けていても即再開しないよう再アームを要求する
+    fn on_toggle(&mut self, recording: bool) -> Option<Boundary> {
+        if recording {
+            self.go_idle(true);
+            Some(Boundary::Stop)
+        } else {
+            self.go_idle(false);
+            self.phase = AutoPhase::Manual;
+            Some(Boundary::Start { pre_roll_secs: 0.0 })
+        }
+    }
+
+    fn on_frame(&mut self, frame: &LiveFrame, recording: bool) -> Option<Boundary> {
+        // ループ側の録画状態とずれていたらループ側に合わせる(通常は起きない保険)
+        if recording && self.phase == AutoPhase::Idle {
+            self.phase = AutoPhase::Manual;
+        } else if !recording && self.phase != AutoPhase::Idle {
+            self.go_idle(false);
+        }
+        self.step(frame.t, frame.has_hand())
+    }
+}
+
 // ===== バッファと 10 枚の選択(純粋な部分)=====
 
 /// 処理済みの 1 フレーム(特徴量だけ。映像そのものは持たない)
@@ -475,6 +705,9 @@ struct LiveFrame {
 }
 
 impl LiveFrame {
+    /// 「このフレームに手があるか」の判定。自動区切り(`AutoSegmenter`)と最終的な区間選択
+    /// (`finalize` の hits)の両方がここを通る。設計書 §3.4 のキーボード上の手を手なし扱いに
+    /// する条件(手首の y が下端付近なら手なし、等)を足すなら、この 1 か所を差し替える
     fn has_hand(&self) -> bool {
         self.left || self.right
     }
@@ -1041,7 +1274,12 @@ impl LiveLoop<'_> {
                 self.recording = true;
             }
             (Boundary::Stop, true) => self.finalize(),
-            // 録画中の Start / 待機中の Stop は無視
+            (Boundary::Discard, true) => {
+                self.recording = false;
+                self.buf.clear();
+                self.ui.message(DISCARD_MESSAGE);
+            }
+            // 録画中の Start / 待機中の Stop・Discard は無視
             _ => {}
         }
     }
@@ -1160,14 +1398,58 @@ fn run_session(
 
 // ===== ウィザード =====
 
+/// 区切り方
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentMode {
+    /// 手の出入りで自動的に区切る(L2)。カメラでは Enter での手動操作も併用できる
+    Auto,
+    /// Enter で開始/停止(L1)。動画では「動画全体を 1 回の録画にする」
+    Manual,
+}
+
+/// 区切り方を選ぶ(1 つ目 = 自動 = 既定)
+fn choose_segment_mode(theme: &ColorfulTheme, items: &[&str; 2]) -> Result<SegmentMode> {
+    let idx = Select::with_theme(theme)
+        .with_prompt("区切り方")
+        .items(items)
+        .default(0)
+        .interact()?;
+    Ok(if idx == 0 {
+        SegmentMode::Auto
+    } else {
+        SegmentMode::Manual
+    })
+}
+
+fn make_segmenter(mode: SegmentMode) -> Box<dyn Segmenter> {
+    match mode {
+        SegmentMode::Auto => Box::new(AutoSegmenter::new()),
+        SegmentMode::Manual => Box::new(ManualSegmenter),
+    }
+}
+
+/// カメラ入力で最初に出す操作説明
+fn camera_usage(mode: SegmentMode) -> &'static str {
+    match mode {
+        SegmentMode::Auto => {
+            "操作: 手を出すと自動で記録開始 / 手を下げると自動で停止して認識\n\
+             \x20     Enter = 手動で開始/停止も可(手動で始めた記録は手を下げても止まらず、Enter で止める)\n\
+             \x20     q + Enter = 終了"
+        }
+        SegmentMode::Manual => {
+            "操作: Enter = 記録開始 / もう一度 Enter = 停止して認識 / q + Enter = 終了"
+        }
+    }
+}
+
 /// メニュー「ライブ認識デモ」。TTY 必須(対話入力)。
 pub fn live_wizard(theme: &ColorfulTheme) -> Result<()> {
     // 1. フレームの入力元
     let src_idx = Select::with_theme(theme)
         .with_prompt("フレームの入力元")
         .items(&[
-            "カメラ(Mac 内蔵カメラ。Enter で録画開始/停止)",
-            "動画ファイル(カメラの代わり。再生開始と同時に録画し、終端で認識)",
+            "カメラ(Mac 内蔵カメラ)",
+            "動画ファイル(カメラの代わり。カメラ無しで区切りの経路を試せる)",
         ])
         .default(0)
         .interact()?;
@@ -1241,6 +1523,13 @@ pub fn live_wizard(theme: &ColorfulTheme) -> Result<()> {
 
     match src_idx {
         0 => {
+            let mode = choose_segment_mode(
+                theme,
+                &[
+                    "自動(手の出入りで区切る。Enter で手動も可)",
+                    "手動(Enter で開始/停止)",
+                ],
+            )?;
             let device: String = Input::with_theme(theme)
                 .with_prompt("カメラのデバイス番号(avfoundation。FaceTime HD カメラは通常 0)")
                 .default("0".into())
@@ -1250,16 +1539,14 @@ pub fn live_wizard(theme: &ColorfulTheme) -> Result<()> {
                  拒否した場合は システム設定 → プライバシーとセキュリティ → カメラ で許可)。"
             );
             let mut source = CameraSource::open(device.trim())?;
-            println!(
-                "操作: Enter = 記録開始 / もう一度 Enter = 停止して認識 / q + Enter = 終了\n\
-                 (カメラ映像・特徴量は保存しません)\n"
-            );
+            println!("{}\n(カメラ映像・特徴量は保存しません)\n", camera_usage(mode));
             let mut keys = StdinKeys::spawn();
+            let mut segmenter = make_segmenter(mode);
             run_session(
                 &mut engine,
                 &mut source,
                 &mut keys,
-                &mut ManualSegmenter,
+                segmenter.as_mut(),
                 &mut ui,
                 &settings,
             )?;
@@ -1269,18 +1556,30 @@ pub fn live_wizard(theme: &ColorfulTheme) -> Result<()> {
             );
         }
         _ => {
+            let mode = choose_segment_mode(
+                theme,
+                &[
+                    "自動(手の出入りで区切る。動画の中に複数のサインがあれば複数件出る)",
+                    "動画全体を 1 回の録画にする(再生開始と同時に録画し、終端で認識)",
+                ],
+            )?;
             let video = select_video(theme)?;
             let mut source = VideoFileSource::open(&video, 1)?;
-            // 再生開始と同時に録画を始める(Toggle を 1 回押した扱い)。終端で認識される
+            // 自動: 手の出入りで区切るので Toggle は押さない。全体: 再生開始と同時に録画を始める
+            // (Toggle を 1 回押した扱い)。どちらも終端で録画中なら認識される
             let mut keys = ScriptedKeys {
-                queue: VecDeque::from([Key::Toggle]),
+                queue: match mode {
+                    SegmentMode::Auto => VecDeque::new(),
+                    SegmentMode::Manual => VecDeque::from([Key::Toggle]),
+                },
             };
+            let mut segmenter = make_segmenter(mode);
             println!("\n動画を流します: {}\n", video.display());
             run_session(
                 &mut engine,
                 &mut source,
                 &mut keys,
-                &mut ManualSegmenter,
+                segmenter.as_mut(),
                 &mut ui,
                 &settings,
             )?;
@@ -1509,6 +1808,259 @@ mod tests {
         // 閾値ちょうど(0.5)は自信あり扱い
         let r = vec![("arigatou".to_string(), 0.5)];
         assert_eq!(format_result(&r, &l), "→ ありがとう (arigatou) 0.50");
+    }
+
+    // ===== L2: AutoSegmenter(状態機械)=====
+
+    /// テストで使う閾値。定数 AUTO_* を調整しても境界テストが壊れないよう、値を固定して渡す
+    fn test_params() -> AutoParams {
+        AutoParams {
+            start_hand_secs: 0.3,
+            stop_no_hand_secs: 0.5,
+            max_record_secs: 6.0,
+            min_sign_secs: 0.4,
+            rearm_no_hand_secs: 0.5,
+            pre_roll_secs: 0.5,
+        }
+    }
+
+    /// 手あり(true)/なし(false)の列を 10fps(t = (offset + i) / 10)で流し、
+    /// (フレーム番号 i, 境界) の一覧を返す
+    fn drive(seg: &mut AutoSegmenter, offset: usize, pattern: &[bool]) -> Vec<(usize, Boundary)> {
+        let mut out = Vec::new();
+        for (i, &h) in pattern.iter().enumerate() {
+            if let Some(b) = seg.step((offset + i) as f64 / 10.0, h) {
+                out.push((i, b));
+            }
+        }
+        out
+    }
+
+    /// `n` フレームぶんの true / false
+    fn run(hand: bool, n: usize) -> Vec<bool> {
+        vec![hand; n]
+    }
+
+    fn cat(parts: &[Vec<bool>]) -> Vec<bool> {
+        parts.concat()
+    }
+
+    const START_PRE: Boundary = Boundary::Start { pre_roll_secs: 0.5 };
+
+    // 開始: 手あり が 0.3 秒連続したフレームで Start(10fps なら 4 枚目)。それ未満では開始しない
+    #[test]
+    fn auto_starts_after_continuous_hand() {
+        let mut s = AutoSegmenter::with_params(test_params());
+        // 3 枚(経過 0.2 秒)では開始しない
+        assert!(drive(&mut s, 0, &cat(&[run(true, 3), run(false, 3)])).is_empty());
+
+        let mut s = AutoSegmenter::with_params(test_params());
+        let b = drive(&mut s, 0, &run(true, 6));
+        assert_eq!(b, vec![(3, START_PRE)]);
+    }
+
+    // 開始判定は連続のみ: 途中の手なし 1 枚でやり直しになる
+    #[test]
+    fn auto_start_run_resets_on_gap() {
+        let mut s = AutoSegmenter::with_params(test_params());
+        let b = drive(
+            &mut s,
+            0,
+            &cat(&[run(true, 3), run(false, 1), run(true, 3)]), // 3 + 途切れ + 3(どちらも 0.2 秒)
+        );
+        assert!(b.is_empty(), "{:?}", b);
+        // 途切れの後にあらためて 0.3 秒続けば開始
+        let mut s = AutoSegmenter::with_params(test_params());
+        let b = drive(&mut s, 0, &cat(&[run(true, 3), run(false, 1), run(true, 4)]));
+        assert_eq!(b, vec![(7, START_PRE)]);
+    }
+
+    // 確定: 手なし が 0.5 秒続いたフレームで Stop(最初の手なしから 5 フレーム後)
+    #[test]
+    fn auto_stops_after_continuous_absence() {
+        let mut s = AutoSegmenter::with_params(test_params());
+        // 手あり 10 枚(i=0..=9)→ 手なし(i=10 が最初)。10 + 5 = 15 枚目で 0.5 秒
+        let b = drive(&mut s, 0, &cat(&[run(true, 10), run(false, 8)]));
+        assert_eq!(b, vec![(3, START_PRE), (15, Boundary::Stop)]);
+    }
+
+    // 瞬断: 手なしが 0.5 秒未満で手が戻れば確定しない。戻った後は手なしの数え直し
+    #[test]
+    fn auto_does_not_stop_on_brief_dropout() {
+        let mut s = AutoSegmenter::with_params(test_params());
+        let b = drive(
+            &mut s,
+            0,
+            &cat(&[run(true, 8), run(false, 4), run(true, 3), run(false, 4), run(true, 3)]),
+        );
+        assert_eq!(b, vec![(3, START_PRE)], "0.4 秒の手なしが 2 回あっても止まらない");
+    }
+
+    // 6 秒打ち切り: 記録時間(開始フレームの時刻 - pre-roll から)が 6 秒を超えたフレームで Stop
+    #[test]
+    fn auto_cap_stops_after_max_record_secs() {
+        let mut s = AutoSegmenter::with_params(test_params());
+        let b = drive(&mut s, 0, &run(true, 100));
+        // Start は i=3(t=0.3)。記録開始 = 0.3 - 0.5 = -0.2。t - (-0.2) > 6.0 は t=5.9(i=59)から
+        assert_eq!(b, vec![(3, START_PRE), (59, Boundary::Stop)]);
+    }
+
+    // 再アーム: 打ち切り後に手が写り続けても次の記録は始まらない。手なし 0.5 秒で解除され、
+    // その後 0.3 秒の手あり で再び始まる
+    #[test]
+    fn auto_rearms_only_after_hand_disappears() {
+        let mut s = AutoSegmenter::with_params(test_params());
+        let pattern = cat(&[
+            run(true, 60),  // i=3 Start, i=59 打ち切り(Stop)。i=59 以降も手が写り続ける
+            run(true, 20),  // 写り続けても再開しない
+            run(false, 4),  // 手なし 0.3 秒(0.5 秒未満)→ まだ再アームしない
+            run(true, 10),  // 手が戻っても再開しない
+            run(false, 6),  // 手なし 0.5 秒以上 → 再アーム
+            run(true, 5),   // 0.3 秒の手あり → Start
+        ]);
+        let b = drive(&mut s, 0, &pattern);
+        let restart = 60 + 20 + 4 + 10 + 6 + 3;
+        assert_eq!(
+            b,
+            vec![(3, START_PRE), (59, Boundary::Stop), (restart, START_PRE)]
+        );
+    }
+
+    // 短すぎる区間の破棄: 手が出ていたのが 0.4 秒未満なら Discard、ちょうど 0.4 秒なら Stop
+    #[test]
+    fn auto_discards_too_short_sign() {
+        // 手あり 4 枚(0.0〜0.3 = 0.3 秒)→ 開始はするが、確定時に 0.4 秒未満で破棄
+        let mut s = AutoSegmenter::with_params(test_params());
+        let b = drive(&mut s, 0, &cat(&[run(true, 4), run(false, 8)]));
+        assert_eq!(b, vec![(3, START_PRE), (9, Boundary::Discard)]);
+
+        // 手あり 5 枚(0.0〜0.4 = 0.4 秒)→ 確定
+        let mut s = AutoSegmenter::with_params(test_params());
+        let b = drive(&mut s, 0, &cat(&[run(true, 5), run(false, 8)]));
+        assert_eq!(b, vec![(3, START_PRE), (10, Boundary::Stop)]);
+
+        // 浮動小数の誤差: 0.7 - 0.3 = 0.39999999999999997 でも 0.4 秒として扱う
+        let mut s = AutoSegmenter::with_params(test_params());
+        let b = drive(&mut s, 3, &cat(&[run(true, 5), run(false, 8)]));
+        assert_eq!(b[1].1, Boundary::Stop, "{:?}", b);
+    }
+
+    // 破棄・通常停止の後は、手なしが続いていた(0.5 秒)ので再アーム不要: すぐ次を始められる
+    #[test]
+    fn auto_can_restart_right_after_stop() {
+        let mut s = AutoSegmenter::with_params(test_params());
+        let pattern = cat(&[run(true, 10), run(false, 6), run(true, 4)]);
+        let b = drive(&mut s, 0, &pattern);
+        assert_eq!(
+            b,
+            vec![(3, START_PRE), (15, Boundary::Stop), (19, START_PRE)]
+        );
+    }
+
+    // 手が一度も見えなければ何も起きない
+    #[test]
+    fn augo_idle_without_hands_does_nothing() {
+        let mut s = AutoSegmenter::with_params(test_params());
+        assert!(drive(&mut s, 0, &run(false, 100)).is_empty());
+    }
+
+    // pre-roll の秒数は Start に載る(既定値は PRE_ROLL_MAX_SECS = リングバッファの長さ以内)
+    #[test]
+    fn auto_start_carries_pre_roll_within_ring_buffer() {
+        let mut s = AutoSegmenter::new();
+        let b = drive(&mut s, 0, &run(true, 40));
+        let Some((_, Boundary::Start { pre_roll_secs })) = b.first().copied() else {
+            panic!("Start が出ない: {:?}", b);
+        };
+        assert!((pre_roll_secs - AUTO_PRE_ROLL_SECS).abs() < 1e-12);
+        assert!(pre_roll_secs <= PRE_ROLL_MAX_SECS);
+    }
+
+    // 手動 Enter: 手動で始めた記録は、手なしが長く続いても・6 秒を超えても自動では止まらず、
+    // Enter で止まる。停止後は手が写り続けていても即再開しない
+    #[test]
+    fn manual_enter_recording_is_not_auto_stopped() {
+        let mut s = AutoSegmenter::with_params(test_params());
+        assert_eq!(s.on_toggle(false), Some(Boundary::Start { pre_roll_secs: 0.0 }));
+        let b = drive(&mut s, 0, &cat(&[run(true, 5), run(false, 100)]));
+        assert!(b.is_empty(), "手動記録は自動停止しない: {:?}", b);
+        let b = drive(&mut s, 105, &run(true, 100)); // 10 秒以上たっても打ち切らない
+        assert!(b.is_empty(), "{:?}", b);
+        assert_eq!(s.on_toggle(true), Some(Boundary::Stop));
+        // 手が写り続けている → 再アーム待ち
+        let b = drive(&mut s, 205, &run(true, 30));
+        assert!(b.is_empty(), "{:?}", b);
+        // 手なし 0.5 秒 → 手あり 0.3 秒で再び自動開始
+        let b = drive(&mut s, 235, &cat(&[run(false, 6), run(true, 4)]));
+        assert_eq!(b, vec![(9, START_PRE)]);
+    }
+
+    // 自動で始めた記録中に Enter を押すとその場で停止(破棄ではなく Stop)し、再アームを要求する
+    #[test]
+    fn enter_during_auto_recording_stops_and_requires_rearm() {
+        let mut s = AutoSegmenter::with_params(test_params());
+        let b = drive(&mut s, 0, &run(true, 6));
+        assert_eq!(b, vec![(3, START_PRE)]);
+        assert_eq!(s.on_toggle(true), Some(Boundary::Stop));
+        let b = drive(&mut s, 6, &run(true, 20));
+        assert!(b.is_empty(), "手が写り続けている間は再開しない: {:?}", b);
+    }
+
+    // 時刻の巻き戻り・同時刻・非有限値で壊れない
+    #[test]
+    fn auto_tolerates_odd_timestamps() {
+        // 同時刻のフレームを何枚流しても経過 0 秒なので開始しない
+        let mut s = AutoSegmenter::with_params(test_params());
+        for _ in 0..50 {
+            assert_eq!(s.step(1.0, true), None);
+        }
+        // 巻き戻った時刻は直前の時刻に丸められる(0.2 → 0.05 は 0.2 として扱う)
+        let mut s = AutoSegmenter::with_params(test_params());
+        assert_eq!(s.step(0.0, true), None);
+        assert_eq!(s.step(0.1, true), None);
+        assert_eq!(s.step(0.2, true), None);
+        assert_eq!(s.step(0.05, true), None);
+        assert_eq!(s.step(0.3, true), Some(START_PRE));
+        // 非有限の時刻は無視する(状態も進めない)
+        assert_eq!(s.step(f64::NAN, false), None);
+        assert_eq!(s.step(f64::INFINITY, false), None);
+        // 記録中の巻き戻りで手なし時間が負になって壊れない: 手なし開始 0.5 → 巻き戻し → 1.0 で確定
+        assert_eq!(s.step(0.4, true), None); // 手ありの長さ 0.0〜0.4 = 0.4 秒(破棄されない長さ)
+        assert_eq!(s.step(0.5, false), None);
+        assert_eq!(s.step(0.1, false), None);
+        assert_eq!(s.step(0.9, false), None);
+        assert_eq!(s.step(1.0, false), Some(Boundary::Stop));
+    }
+
+    // 閾値は秒で決まる: 処理 fps が違っても(約 8 / 17 fps)同じ秒数で開始・確定する
+    #[test]
+    fn auto_thresholds_are_in_seconds_not_frames() {
+        for fps in [8.0f64, 17.0] {
+            let mut s = AutoSegmenter::with_params(test_params());
+            let mut starts = Vec::new();
+            let mut stops = Vec::new();
+            // 手あり 0.0〜2.0 秒、その後 手なし
+            for i in 0..((4.0 * fps) as usize) {
+                let t = i as f64 / fps;
+                match s.step(t, t <= 2.0) {
+                    Some(Boundary::Start { .. }) => starts.push(t),
+                    Some(Boundary::Stop) => stops.push(t),
+                    _ => {}
+                }
+            }
+            assert_eq!(starts.len(), 1, "fps={}", fps);
+            assert_eq!(stops.len(), 1, "fps={}", fps);
+            // 開始は手が出て 0.3 秒以上・1 フレーム以内、確定は最初の手なしから 0.5 秒以上・1 フレーム以内
+            assert!(starts[0] >= 0.3 - 1e-9 && starts[0] < 0.3 + 1.0 / fps + 1e-9, "fps={} {:?}", fps, starts);
+            let first_absent = (2.0 * fps).floor() / fps + 1.0 / fps;
+            assert!(
+                stops[0] >= first_absent + 0.5 - 1e-9 && stops[0] < first_absent + 0.5 + 1.0 / fps + 1e-9,
+                "fps={} stop={:?} first_absent={}",
+                fps,
+                stops,
+                first_absent
+            );
+        }
     }
 
     // ===== カメラ読み取りスレッド(byte 列を流して検証。カメラは開かない)=====
@@ -1805,6 +2357,159 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    // ===== L2: run_session に自動セグメンタを通す(偽の認識器・偽の入力元)=====
+
+    /// 手あり(1)/なし(0)のフレーム列を FakeSource の値にする
+    fn frames_from(parts: &[(u8, usize)]) -> Vec<u8> {
+        parts.iter().flat_map(|&(v, n)| vec![v; n]).collect()
+    }
+
+    /// 流し終えたあとの結果と CollectUi を返す
+    fn run_auto(
+        values: Vec<u8>,
+        keys: &mut dyn KeySource,
+    ) -> (Vec<LiveResult>, CollectUi) {
+        let mut source = FakeSource {
+            values: values.into(),
+            idx: 0,
+        };
+        let mut ui = CollectUi::default();
+        let mut seg = AutoSegmenter::with_params(test_params());
+        let results = run_session(
+            &mut FakeRecognizer,
+            &mut source,
+            keys,
+            &mut seg,
+            &mut ui,
+            &settings(),
+        )
+        .unwrap();
+        (results, ui)
+    }
+
+    fn no_keys() -> ScriptedKeys {
+        ScriptedKeys {
+            queue: VecDeque::new(),
+        }
+    }
+
+    /// i 回目のフレームを取る直前に Enter(Toggle)を押す。`poll` が None を返すたびに 1 フレーム進んだとみなす
+    struct KeysAtFrames {
+        schedule: VecDeque<(usize, Key)>,
+        frame: usize,
+    }
+    impl KeySource for KeysAtFrames {
+        fn poll(&mut self) -> Option<Key> {
+            if self.schedule.front().is_some_and(|(f, _)| *f == self.frame) {
+                return self.schedule.pop_front().map(|(_, k)| k);
+            }
+            self.frame += 1;
+            None
+        }
+    }
+
+    // 手あり/なしのフレーム列 → 結果が 1 件。pre-roll と余白込みの録画長・区間も確かめる
+    #[test]
+    fn auto_session_yields_one_result_per_sign() {
+        // 手あり idx 20..=34 → Start は idx 23(t=2.3)、手なし idx 35 から 0.5 秒後の idx 40(t=4.0)で確定
+        let values = frames_from(&[(0, 20), (1, 15), (0, 25)]);
+        let (results, ui) = run_auto(values, &mut no_keys());
+        assert_eq!(results.len(), 1);
+        assert_eq!(ui.results, 1);
+        assert!(ui.messages.is_empty(), "{:?}", ui.messages);
+        let r = &results[0];
+        // 録画 = pre-roll 0.5 秒前(idx 18)〜確定フレーム(idx 40)の 23 枚
+        assert_eq!(r.buffered, 23);
+        assert!((r.duration_secs - 2.2).abs() < 1e-6, "{}", r.duration_secs);
+        // 手あり 15 枚(録画内の添字 2..=16)+ 余白 1 枚ずつ
+        assert_eq!(r.selection.span, Some((1, 17)));
+        assert!(r.selected_with_hand >= 8, "{}", r.selected_with_hand);
+    }
+
+    // 2 つのサイン(間に 1 秒の手なし)→ 2 件
+    #[test]
+    fn auto_session_yields_two_results_for_two_signs() {
+        let values = frames_from(&[(0, 10), (1, 12), (0, 10), (1, 12), (0, 10)]);
+        let (results, ui) = run_auto(values, &mut no_keys());
+        assert_eq!(results.len(), 2);
+        assert!(ui.messages.is_empty(), "{:?}", ui.messages);
+    }
+
+    // 手がかすめただけ(短すぎる)→ 結果なし、破棄メッセージだけ(結果行とは別)
+    #[test]
+    fn auto_session_discards_short_blip_with_message() {
+        let values = frames_from(&[(0, 10), (1, 4), (0, 20)]);
+        let (results, ui) = run_auto(values, &mut no_keys());
+        assert!(results.is_empty());
+        assert_eq!(ui.results, 0);
+        assert_eq!(ui.messages, vec![DISCARD_MESSAGE.to_string()]);
+        assert!(!DISCARD_MESSAGE.starts_with('→'));
+    }
+
+    // 破棄した後でも次のサインはちゃんと認識される(録画状態・バッファが戻っている)
+    #[test]
+    fn auto_session_recovers_after_discard() {
+        let values = frames_from(&[(0, 10), (1, 4), (0, 10), (1, 12), (0, 10)]);
+        let (results, ui) = run_auto(values, &mut no_keys());
+        assert_eq!(results.len(), 1);
+        assert_eq!(ui.messages, vec![DISCARD_MESSAGE.to_string()]);
+    }
+
+    // 手が一度も写らなければ推論しない・メッセージも出ない
+    #[test]
+    fn auto_session_without_hands_is_silent() {
+        let (results, ui) = run_auto(vec![0u8; 80], &mut no_keys());
+        assert!(results.is_empty());
+        assert!(ui.messages.is_empty());
+    }
+
+    // 入力(動画)の終端で記録中なら、そこで確定して認識する(既存の挙動を維持)
+    #[test]
+    fn auto_session_finalizes_when_input_ends_while_recording() {
+        let values = frames_from(&[(0, 10), (1, 15)]);
+        let (results, _) = run_auto(values, &mut no_keys());
+        assert_eq!(results.len(), 1);
+    }
+
+    // 6 秒打ち切りでも結果は出て、写り続けている手では二重に認識されない(再アーム)
+    #[test]
+    fn auto_session_cap_does_not_double_fire() {
+        // 手あり 10 秒(100 枚)→ 手なし 1 秒。打ち切りで 1 件、再アームのため残りの手あり区間は始まらない
+        let values = frames_from(&[(1, 100), (0, 10)]);
+        let (results, ui) = run_auto(values, &mut no_keys());
+        assert_eq!(results.len(), 1);
+        assert!(ui.messages.is_empty(), "{:?}", ui.messages);
+    }
+
+    // 自動モード中の Enter(手動): 手動で始めた記録は、手が消えても止まらず Enter で止まる
+    #[test]
+    fn auto_session_manual_enter_records_until_enter() {
+        // 手あり idx 8..=15、あとは手なし 40 枚まで。idx 5 の前で Enter(開始)、idx 35 の前で Enter(停止)
+        let values = frames_from(&[(0, 8), (1, 8), (0, 24)]);
+        let mut keys = KeysAtFrames {
+            schedule: VecDeque::from([(5, Key::Toggle), (35, Key::Toggle)]),
+            frame: 0,
+        };
+        let (results, ui) = run_auto(values, &mut keys);
+        assert_eq!(results.len(), 1);
+        assert!(ui.messages.is_empty(), "{:?}", ui.messages);
+        // 録画 = idx 5..=34 の 30 枚(手が消えてから 1.9 秒たっても自動では止まらない)
+        assert_eq!(results[0].buffered, 30);
+    }
+
+    // 自動で始めた記録中の Enter で停止し、手が写り続けていても即再開しない
+    #[test]
+    fn auto_session_enter_stops_auto_recording_without_restart() {
+        let values = frames_from(&[(0, 5), (1, 35)]);
+        // idx 5 から手あり。Start は idx 8。idx 12 の前で Enter(停止)
+        let mut keys = KeysAtFrames {
+            schedule: VecDeque::from([(12, Key::Toggle)]),
+            frame: 0,
+        };
+        let (results, _) = run_auto(values, &mut keys);
+        assert_eq!(results.len(), 1, "停止後は手が写り続けても再開しない");
+    }
+
     // ===== 実モデル + 実動画のスモーク(#[ignore])=====
 
     /// 動画ファイルを「カメラの代わり」にライブ経路へ流し、同じモデル・同じ動画を既存の
@@ -1955,6 +2660,171 @@ mod tests {
         }
         eprintln!("\ntop-1 一致: {}/{}", agree, videos.len());
     }
+
+    /// L2(自動区切り)の動画ファイルスモーク。raw_jsl の動画を「カメラの代わり」に自動区切りで流し、
+    /// 1 本につき結果が概ね 1 件出るか、top-1 が既存の認識経路(extract_tag_features_impl → Predictor)と
+    /// 大きく食い違わないかを見る。件数が 1 以外の動画は閾値との関係を数値付きで出力する
+    /// (件数は assert せず報告のみ。top-1 の食い違いだけ assert)。
+    ///
+    /// 環境変数: LIVE_SMOKE_VIDEOS / LIVE_SMOKE_MODEL / LIVE_SMOKE_STRIDE(live_file_smoke と同じ)、
+    ///   LIVE_SMOKE_AUTO_N  対象動画の本数(既定 8。LIVE_SMOKE_VIDEOS 未指定時)
+    /// カメラは使わない。手動実行:
+    ///   `cargo test live_file_auto_smoke --release -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_file_auto_smoke() {
+        let model_dir = PathBuf::from(
+            std::env::var("LIVE_SMOKE_MODEL").unwrap_or_else(|_| DEFAULT_MODEL_DIR.into()),
+        );
+        for p in [model_dir.as_path(), Path::new(PALM_MODEL), Path::new(HAND_MODEL)] {
+            if !p.exists() {
+                eprintln!("skip: fixture not found: {}", p.display());
+                return;
+            }
+        }
+        let n: usize = std::env::var("LIVE_SMOKE_AUTO_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8);
+        let videos: Vec<PathBuf> = match std::env::var("LIVE_SMOKE_VIDEOS") {
+            Ok(v) => v.split(':').map(PathBuf::from).collect(),
+            Err(_) => crate::tests::sample_raw_jsl_takes(n),
+        };
+        if videos.is_empty() {
+            eprintln!("skip: raw_jsl の動画が無い");
+            return;
+        }
+        let stride: usize = std::env::var("LIVE_SMOKE_STRIDE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        let (roi, select, frames) = match load_model_preprocess(&model_dir).unwrap() {
+            Some(p) => (p.roi, p.select, p.frames.unwrap_or(SEQ_LEN)),
+            None => (PalmRoiMode::CenterSquare, SIGN_SPAN, SEQ_LEN),
+        };
+        eprintln!(
+            "model={} roi={} select={} stride={} auto: start={}s stop={}s max={}s min_sign={}s",
+            model_dir.display(),
+            roi.label(),
+            select.label(),
+            stride,
+            AUTO_START_HAND_SECS,
+            AUTO_STOP_NO_HAND_SECS,
+            AUTO_MAX_RECORD_SECS,
+            AUTO_MIN_SIGN_SECS
+        );
+        let mut engine = Engine::load(&model_dir, roi).unwrap();
+        let labels = load_labels();
+        let mut offline_palm = Session::builder().unwrap().commit_from_file(PALM_MODEL).unwrap();
+        let mut offline_hand = Session::builder().unwrap().commit_from_file(HAND_MODEL).unwrap();
+        let anchors = load_palm_anchors();
+
+        let (mut one, mut agree, mut cmp) = (0usize, 0usize, 0usize);
+        for video in &videos {
+            let name = format!(
+                "{}/{}",
+                video.parent().and_then(|p| p.file_name()).unwrap_or_default().to_string_lossy(),
+                video.file_name().unwrap_or_default().to_string_lossy()
+            );
+            let mut source = VideoFileSource::open(video, stride).unwrap();
+            let mut keys = no_keys();
+            let mut ui = CollectUi::default();
+            let mut seg = AutoSegmenter::new();
+            let t0 = Instant::now();
+            let results = run_session(
+                &mut engine,
+                &mut source,
+                &mut keys,
+                &mut seg,
+                &mut ui,
+                &Settings {
+                    select,
+                    frames,
+                    topk: 5,
+                },
+            )
+            .unwrap();
+            let live_secs = t0.elapsed().as_secs_f64();
+
+            let mut person = if matches!(roi, PalmRoiMode::Person { .. }) {
+                Some(PersonDetector::load(PERSON_MODEL).unwrap())
+            } else {
+                None
+            };
+            let entry = crate::extract_tag_features_impl(
+                video,
+                &mut offline_palm,
+                &mut offline_hand,
+                &anchors,
+                frames,
+                false,
+                roi,
+                person.as_mut(),
+                select,
+            )
+            .unwrap();
+            let flat: Vec<f32> = entry.sequence.iter().flatten().copied().collect();
+            let offline = engine.predict(&flat, frames, 5);
+            let off_top = &offline[0].0;
+
+            let fmt = |r: &[(String, f32)]| {
+                r.iter()
+                    .take(3)
+                    .map(|(t, p)| format!("{} {:.2}", t, p))
+                    .collect::<Vec<_>>()
+                    .join(" / ")
+            };
+            eprintln!("\n=== {} ===  結果 {} 件 / 破棄 {} 件 ({:.1}s)", name, results.len(), ui.messages.len(), live_secs);
+            for (i, r) in results.iter().enumerate() {
+                eprintln!(
+                    "  [{}] 録画{}枚 {:.2}s 推定{:.1}fps 区間{:?} 手あり{}/{}  {}",
+                    i,
+                    r.buffered,
+                    r.duration_secs,
+                    r.selection.fps,
+                    r.selection.span,
+                    r.selected_with_hand,
+                    r.selection.indices.len(),
+                    fmt(&r.ranked)
+                );
+                eprintln!("      表示: {}", format_result(&r.ranked, &labels));
+            }
+            for m in &ui.messages {
+                eprintln!("  message: {}", m);
+            }
+            eprintln!("  offline: {}", fmt(&offline));
+            match results.len() {
+                1 => one += 1,
+                0 => eprintln!("  !! 結果 0 件: 手の出ている時間・開始/破棄の閾値との関係を確認 (offline coverage L={:.0}% R={:.0}%)",
+                    entry.left_hand_coverage * 100.0, entry.right_hand_coverage * 100.0),
+                k => eprintln!("  !! 結果 {} 件に分割された: 手なし {}s 以上の途切れがサイン中にあるか、手の検出の途切れ", k, AUTO_STOP_NO_HAND_SECS),
+            }
+            if let Some(first) = results.first() {
+                // 結果のうち、既存経路と最も合うものを見る(分割された場合に備え全件を対象)
+                cmp += 1;
+                let ok = results.iter().any(|r| {
+                    r.ranked.iter().any(|(t, _)| t == off_top)
+                        || offline.iter().any(|(t, _)| t == &r.ranked[0].0)
+                });
+                if first.ranked[0].0 == *off_top {
+                    agree += 1;
+                }
+                assert!(
+                    ok,
+                    "{}: 自動区切りの結果が既存経路と大きく食い違う (offline top1={})",
+                    name, off_top
+                );
+            }
+        }
+        eprintln!(
+            "\n結果がちょうど 1 件: {}/{} 本 / 先頭結果の top-1 が既存経路と一致: {}/{} 本",
+            one,
+            videos.len(),
+            agree,
+            cmp
+        );
+    }
+
 
     // ===== カメラ読み取りスレッドの再生テスト(#[ignore])=====
 

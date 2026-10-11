@@ -281,6 +281,103 @@ pub struct HoldoutSplit {
     pub per_label: Vec<(String, usize, usize)>,
     /// テイク不足で held-out を作れず train のみに入れたラベル
     pub train_only: Vec<String>,
+    /// 手の不一致: held-out テイクのうち、同ラベルの train テイクに「同じ使用手(L/R/LR)」が
+    /// 1 つも無いもの。(held-out の stem, その使用手)。学習=右手のみ/未見=左手のみのような
+    /// 系統的ズレで評価が歪んでいる度合いの直接指標
+    pub hand_mismatch: Vec<(String, &'static str)>,
+}
+
+/// held-out テイクの選び方
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldoutSplitMode {
+    /// ラベルごとにテイク番号昇順の後ろ N 件(従来の既定)
+    Last,
+    /// ラベルごとに擬似乱数で N 件(`seed` と ラベル名から決定的に決まる)
+    Random { seed: u64 },
+    /// ラベルごとにテイク番号昇順の `fold` 番目から連続 N 件(循環)。
+    /// fold を 0..max_takes で回せば、各テイクがちょうど 1 回 held-out になる(全ラベルが同数テイクのとき)
+    Rotate { fold: usize },
+}
+
+impl HoldoutSplitMode {
+    /// CLI 文字列から解決する。`seed` は random、`fold` は rotate で使う
+    pub fn parse(name: &str, seed: u64, fold: usize) -> Result<Self, String> {
+        match name {
+            "last" => Ok(Self::Last),
+            "random" => Ok(Self::Random { seed }),
+            "rotate" => Ok(Self::Rotate { fold }),
+            _ => Err(format!(
+                "未知の分割方法です: \"{}\"(last / random / rotate から選んでください)",
+                name
+            )),
+        }
+    }
+
+    pub fn label(self) -> String {
+        match self {
+            Self::Last => "last".to_string(),
+            Self::Random { seed } => format!("random(seed={})", seed),
+            Self::Rotate { fold } => format!("rotate(fold={})", fold),
+        }
+    }
+}
+
+/// xorshift64*。依存を増やさず分割用の決定的な擬似乱数を得るだけの用途
+struct SplitRng(u64);
+
+impl SplitRng {
+    /// seed とラベル名(FNV-1a)から初期状態を作る。0 は xorshift の不動点なので避ける
+    fn new(seed: u64, label: &str) -> Self {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in label.bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        let mut x = h ^ seed.wrapping_mul(0x9E3779B97F4A7C15);
+        if x == 0 {
+            x = 0x9E3779B97F4A7C15;
+        }
+        let mut r = Self(x);
+        // 初期の相関を捨てる
+        for _ in 0..4 {
+            r.next();
+        }
+        r
+    }
+
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545F4914F6CDD1D)
+    }
+}
+
+/// 番号付きテイク `count` 個(昇順)のうち held-out にする位置の集合を返す
+// [TEST向き] 純粋関数。last の不変・random の決定性と件数・rotate の循環
+fn held_out_positions(
+    mode: HoldoutSplitMode,
+    label: &str,
+    count: usize,
+    n: usize,
+) -> std::collections::BTreeSet<usize> {
+    let n = n.min(count);
+    match mode {
+        HoldoutSplitMode::Last => (count - n..count).collect(),
+        HoldoutSplitMode::Rotate { fold } => (0..n).map(|j| (fold + j) % count).collect(),
+        HoldoutSplitMode::Random { seed } => {
+            let mut rng = SplitRng::new(seed, label);
+            let mut idx: Vec<usize> = (0..count).collect();
+            // 先頭 n 個だけ部分 Fisher-Yates
+            for i in 0..n {
+                let j = i + (rng.next() % (count - i) as u64) as usize;
+                idx.swap(i, j);
+            }
+            idx[..n].iter().copied().collect()
+        }
+    }
 }
 
 impl PoseTrainingData {
@@ -317,6 +414,15 @@ impl PoseTrainingData {
         path: &Path,
         held_out_per_label: usize,
     ) -> Result<HoldoutSplit, Box<dyn std::error::Error>> {
+        Self::load_holdout_split_with(path, held_out_per_label, HoldoutSplitMode::Last)
+    }
+
+    /// `load_holdout_split` の分割方法指定版。`Last` は従来と完全に同一
+    pub fn load_holdout_split_with(
+        path: &Path,
+        held_out_per_label: usize,
+        mode: HoldoutSplitMode,
+    ) -> Result<HoldoutSplit, Box<dyn std::error::Error>> {
         if held_out_per_label == 0 {
             return Err("holdout_per_label は 1 以上が必要です".into());
         }
@@ -332,6 +438,7 @@ impl PoseTrainingData {
         let mut test_samples = Vec::new();
         let mut per_label = Vec::new();
         let mut train_only = Vec::new();
+        let mut hand_mismatch = Vec::new();
 
         for (label, group) in by_label {
             // held-out 候補はテイク番号付きのみ。番号なし(「最後のテイク」が定義できない)は
@@ -343,7 +450,9 @@ impl PoseTrainingData {
             let unnumbered_count = unnumbered.len();
 
             // 番号なしは無条件で train
+            let mut train_hands: Vec<&'static str> = Vec::new();
             for e in unnumbered {
+                train_hands.push(used_hands(e.left_cov, e.right_cov));
                 train_samples.push(PoseSample {
                     features: e.features,
                     label: label.clone(),
@@ -363,20 +472,29 @@ impl PoseTrainingData {
                 continue;
             }
 
-            // テイク番号昇順の後ろ held_out_per_label 件を held-out にする
-            let split_at = numbered_count - held_out_per_label;
+            // 分割方法に従って held-out の位置を決める
+            let held = held_out_positions(mode, &label, numbered_count, held_out_per_label);
+            let mut held_entries: Vec<(String, &'static str)> = Vec::new();
             for (i, e) in numbered.into_iter().enumerate() {
+                let hands = used_hands(e.left_cov, e.right_cov);
                 let sample = PoseSample {
                     features: e.features,
                     label: label.clone(),
                 };
-                if i < split_at {
-                    train_samples.push(sample);
-                } else {
+                if held.contains(&i) {
+                    held_entries.push((e.stem, hands));
                     test_samples.push(sample);
+                } else {
+                    train_hands.push(hands);
+                    train_samples.push(sample);
                 }
             }
-            per_label.push((label, split_at + unnumbered_count, held_out_per_label));
+            for (stem, hands) in held_entries {
+                if !train_hands.contains(&hands) {
+                    hand_mismatch.push((stem, hands));
+                }
+            }
+            per_label.push((label, numbered_count - held.len() + unnumbered_count, held.len()));
         }
 
         if test_samples.is_empty() {
@@ -401,6 +519,7 @@ impl PoseTrainingData {
             },
             per_label,
             train_only,
+            hand_mismatch,
         })
     }
 
@@ -707,6 +826,166 @@ mod tests {
         assert!(!split.train_only.contains(&"word".to_string()));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// (stem, 左カバレッジ, 右カバレッジ) から最小 dict(frames=1)を一時ファイルに書いて返す
+    fn write_hand_dict(tag: &str, rows: &[(&str, f32, f32)]) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::io::Write;
+        let row = vec![0.0f32; POSE_FEATURE_DIM];
+        let mut tags = serde_json::Map::new();
+        for (stem, l, r) in rows {
+            tags.insert(
+                stem.to_string(),
+                serde_json::json!({
+                    "sequence": [row.clone()],
+                    "left_hand_coverage": l,
+                    "right_hand_coverage": r,
+                    "source": "x"
+                }),
+            );
+        }
+        let dict = serde_json::json!({
+            "metadata": {
+                "frames": 1,
+                "feature_dim": POSE_FEATURE_DIM,
+                "feature_layout": "",
+                "normalization": "",
+                "tag_count": rows.len()
+            },
+            "tags": tags
+        });
+        let dir = std::env::temp_dir().join(format!("pose_split_{}_{}", tag, std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dict.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(dict.to_string().as_bytes())
+            .unwrap();
+        (dir, path)
+    }
+
+    /// 3 ラベル × 3 テイク(撮影癖の再現: テイク1・2 = 右手、テイク3 = 左手)
+    fn habit_rows() -> Vec<(&'static str, f32, f32)> {
+        vec![
+            ("a-01", 0.0, 1.0), ("a-02", 0.0, 1.0), ("a-03", 1.0, 0.0),
+            ("b-01", 0.0, 1.0), ("b-02", 0.0, 1.0), ("b-03", 1.0, 0.0),
+            ("c-01", 1.0, 1.0), ("c-02", 1.0, 1.0), ("c-03", 1.0, 1.0),
+        ]
+    }
+
+    #[test]
+    fn split_last_via_with_equals_legacy() {
+        let (dir, path) = write_hand_dict("last", &habit_rows());
+        let legacy = PoseTrainingData::load_holdout_split(&path, 1).unwrap();
+        let with = PoseTrainingData::load_holdout_split_with(&path, 1, HoldoutSplitMode::Last)
+            .unwrap();
+        assert_eq!(legacy.per_label, with.per_label);
+        assert_eq!(legacy.train.len(), with.train.len());
+        assert_eq!(legacy.test.len(), with.test.len());
+        // last は各ラベルのテイク3 が未見 = a, b は左手のみで train(右手)と食い違う
+        assert_eq!(with.test.len(), 3);
+        let stems: Vec<&str> = with.hand_mismatch.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(stems, vec!["a-03", "b-03"], "c は LR 同士で一致");
+        assert!(with.hand_mismatch.iter().all(|(_, h)| *h == "L"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn held_out_positions_random_is_deterministic_and_sized() {
+        let m = HoldoutSplitMode::Random { seed: 7 };
+        let a = held_out_positions(m, "x", 10, 3);
+        let b = held_out_positions(m, "x", 10, 3);
+        assert_eq!(a, b, "同 seed・同ラベルは同結果");
+        assert_eq!(a.len(), 3, "重複なしで N 件");
+        assert!(a.iter().all(|&i| i < 10));
+        // seed またはラベルが違えば(ほぼ確実に)違う選び方になる。全 seed で同一なら乱数が効いていない
+        let distinct: std::collections::BTreeSet<Vec<usize>> = (0..20u64)
+            .map(|sd| {
+                held_out_positions(HoldoutSplitMode::Random { seed: sd }, "x", 10, 1)
+                    .into_iter()
+                    .collect()
+            })
+            .collect();
+        assert!(distinct.len() > 3, "seed を変えると選ばれる位置が変わる");
+    }
+
+    #[test]
+    fn split_random_holds_out_n_per_label_without_overlap() {
+        let (dir, path) = write_hand_dict("random", &habit_rows());
+        for seed in 0..10u64 {
+            let sp = PoseTrainingData::load_holdout_split_with(
+                &path,
+                1,
+                HoldoutSplitMode::Random { seed },
+            )
+            .unwrap();
+            assert_eq!(sp.test.len(), 3, "3 ラベル × 1 件");
+            assert_eq!(sp.train.len(), 6);
+            for (_, tr, te) in &sp.per_label {
+                assert_eq!((*tr, *te), (2, 1));
+            }
+        }
+        // 同 seed なら held-out の stem(= hand_mismatch の出方)も再現する
+        let m = HoldoutSplitMode::Random { seed: 3 };
+        let x = PoseTrainingData::load_holdout_split_with(&path, 1, m).unwrap();
+        let y = PoseTrainingData::load_holdout_split_with(&path, 1, m).unwrap();
+        assert_eq!(x.hand_mismatch, y.hand_mismatch);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rotate_holds_out_each_take_exactly_once_over_all_folds() {
+        for n in [1usize, 2] {
+            let mut count = [0usize; 3];
+            for fold in 0..3 {
+                for p in held_out_positions(HoldoutSplitMode::Rotate { fold }, "x", 3, n) {
+                    count[p] += 1;
+                }
+            }
+            assert_eq!(count, [n; 3], "N={} で全 fold を回すと各テイクがちょうど N 回", n);
+        }
+        // 循環: fold=2, N=2, 3テイク → 位置 2 と 0
+        let p: Vec<usize> = held_out_positions(HoldoutSplitMode::Rotate { fold: 2 }, "x", 3, 2)
+            .into_iter()
+            .collect();
+        assert_eq!(p, vec![0, 2]);
+    }
+
+    #[test]
+    fn rotate_split_hand_mismatch_oracle() {
+        // a, b: 右,右,左 / c: LR×3。fold 別の手計算:
+        //  fold0 = テイク1 を未見 → a-01,b-01 は R。train に R(02)がある → 不一致 0
+        //  fold1 = テイク2 → 同様に 0
+        //  fold2 = テイク3 → a-03,b-03 は L。train は R のみ → 不一致 2
+        let (dir, path) = write_hand_dict("rotate", &habit_rows());
+        let counts: Vec<usize> = (0..3)
+            .map(|fold| {
+                PoseTrainingData::load_holdout_split_with(
+                    &path,
+                    1,
+                    HoldoutSplitMode::Rotate { fold },
+                )
+                .unwrap()
+                .hand_mismatch
+                .len()
+            })
+            .collect();
+        assert_eq!(counts, vec![0, 0, 2]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn holdout_split_mode_parse() {
+        assert_eq!(HoldoutSplitMode::parse("last", 1, 2).unwrap(), HoldoutSplitMode::Last);
+        assert_eq!(
+            HoldoutSplitMode::parse("random", 5, 2).unwrap(),
+            HoldoutSplitMode::Random { seed: 5 }
+        );
+        assert_eq!(
+            HoldoutSplitMode::parse("rotate", 5, 2).unwrap(),
+            HoldoutSplitMode::Rotate { fold: 2 }
+        );
+        assert!(HoldoutSplitMode::parse("x", 0, 0).is_err());
     }
 
     // [TEST向き] ミラー反転の核。境界(両手・片手のみ・両手ゼロ・複数フレーム)

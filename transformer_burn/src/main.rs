@@ -78,6 +78,16 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     holdout_per_label: usize,
 
+    /// held-out テイクの選び方: last(従来。ラベルごとにテイク番号の後ろ N 件)/ random(--seed と
+    /// ラベル名から決定的に選ぶ)/ rotate(--holdout-fold 番目から連続 N 件を未見にする)。
+    /// --eval-holdout 用。撮影癖(テイク3=左手が多い)と last が噛み合う問題への対策
+    #[arg(long, default_value = "last")]
+    holdout_split: String,
+
+    /// --holdout-split rotate で、ラベルごとにテイク番号昇順の何番目(0 始まり)から未見にするか
+    #[arg(long, default_value_t = 0)]
+    holdout_fold: usize,
+
     /// ミラー拡張: 学習データに左右反転コピーを追加する(--train-pose / --eval-holdout の train 側のみ。
     /// held-out の未見テイクには適用しない)
     #[arg(long)]
@@ -340,9 +350,18 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         println!("\n===== 未見テイク評価(手ポーズ列→タグ) =====");
         println!("pose dict: {}", dict_path.display());
         println!("holdout_per_label: {}", args.holdout_per_label);
+        let split_mode = pose_data::HoldoutSplitMode::parse(
+            &args.holdout_split,
+            args.seed,
+            args.holdout_fold,
+        )?;
+        println!("holdout_split: {}", split_mode.label());
 
-        let split =
-            pose_data::PoseTrainingData::load_holdout_split(dict_path, args.holdout_per_label)?;
+        let split = pose_data::PoseTrainingData::load_holdout_split_with(
+            dict_path,
+            args.holdout_per_label,
+            split_mode,
+        )?;
 
         println!("\n--- テイク単位の分割 ---");
         for (label, tr, te) in &split.per_label {
@@ -357,6 +376,12 @@ fn run_recognition(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "学習サンプル {} 件 / 未見テイク {} 件",
             split.train.len(),
+            split.test.len()
+        );
+        // 評価の歪みの直接指標: 未見テイクの使用手が、同ラベルの学習テイクに1つも無い件数
+        println!(
+            "手の不一致: {}/{} 件(未見テイクの使用手が同ラベルの学習テイクに無い)",
+            split.hand_mismatch.len(),
             split.test.len()
         );
 
@@ -591,6 +616,8 @@ mod tests {
             eval_holdout: None,
             inspect_dict: None,
             holdout_per_label: 1,
+            holdout_split: "last".to_string(),
+            holdout_fold: 0,
             mirror_augment: false,
             seed: 42,
             model_size: None,

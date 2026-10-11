@@ -152,14 +152,46 @@ pub(super) fn measure_fps(arrivals: &[f64]) -> Option<f64> {
     fps_from_arrivals(&steady)
 }
 
-/// フレーム到着時刻(秒)の列から fps を出す。サンプルが少なければ None
-// [TEST向き] 純粋関数
+/// フレーム到着時刻(秒)の列から fps を出す。サンプルが少なければ None。
+/// 到着間隔の**中央値**から求める(平均だと、処理が一瞬詰まったあとに溜まったコマが一気に届く「追い付き」で
+/// 実際より速く測れ、録画の再生が速くなってしまう。動画ファイル入力で 33〜35 fps と測れた)
+// [TEST向き] 純粋関数。30fps / 14.87fps / 追い付きの一気読み / 一瞬の停止
 pub(super) fn fps_from_arrivals(times: &[f64]) -> Option<f64> {
     if times.len() < MIN_FPS_SAMPLES {
         return None;
     }
-    let fps = processed_fps(times);
+    let mut dts: Vec<f64> = times.windows(2).map(|w| w[1] - w[0]).filter(|d| *d > 1e-6).collect();
+    if dts.len() + 1 < MIN_FPS_SAMPLES {
+        return None;
+    }
+    dts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = dts[dts.len() / 2];
+    let fps = 1.0 / median;
     (fps.is_finite() && fps > 0.0).then_some(fps)
+}
+
+/// 録画中に実際に届いたコマの平均 fps(最初と最後のコマの間隔から)。2 コマ未満・時間が進んでいなければ None
+// [TEST向き] 純粋関数
+pub(super) fn observed_fps(frames: u64, first_ns: u64, last_ns: u64) -> Option<f64> {
+    if frames < 2 || last_ns <= first_ns {
+        return None;
+    }
+    Some((frames - 1) as f64 / ((last_ns - first_ns) as f64 / 1e9))
+}
+
+/// 動画に宣言した fps と、録画中に実際に届いた平均 fps が 5% 以上ずれていたときの注意。
+/// 動画は一定フレームレートで書くので、ずれていると再生の速さが実際の動きとずれる
+// [TEST向き] 純粋関数。境界(ちょうど 5% はずれとしない)
+pub(super) fn fps_mismatch_note(declared: f64, observed: Option<f64>) -> Option<String> {
+    let obs = observed?;
+    if !(declared > 0.0) || ((obs - declared).abs() / declared) <= 0.05 {
+        return None;
+    }
+    Some(format!(
+        "録画中のコマの到着は平均 {:.1} fps でした(動画には {:.1} fps として記録しています)。\
+         動きの速さが実際と少しずれている可能性があるので、気になる場合は撮り直してください",
+        obs, declared
+    ))
 }
 
 fn format_fps(fps: f64) -> String {
@@ -238,12 +270,28 @@ pub(super) struct TeeStats {
     capped: AtomicBool,
     /// 録画用エンコーダが落ちて、流し込めなくなった
     closed: AtomicBool,
+    /// 最初・最後に録画へ入れたコマの到着時刻(録画の開始からのナノ秒)。実際の平均 fps の算出用
+    first_ns: AtomicU64,
+    last_ns: AtomicU64,
+}
+
+impl TeeStats {
+    /// 録画中に実際に届いたコマの平均 fps
+    fn observed_fps(&self) -> Option<f64> {
+        observed_fps(
+            self.sent.load(Ordering::SeqCst),
+            self.first_ns.load(Ordering::SeqCst),
+            self.last_ns.load(Ordering::SeqCst),
+        )
+    }
 }
 
 struct Tee {
     tx: SyncSender<Vec<u8>>,
     max_frames: u64,
     stats: Arc<TeeStats>,
+    /// 録画を始めた時刻(到着時刻の基準)
+    started: Instant,
 }
 
 /// 読み取りスレッドとメインスレッドで共有する「録画に流すか」の置き場。
@@ -270,7 +318,12 @@ impl TeeSlot {
         };
         match t.tx.try_send(frame.to_vec()) {
             Ok(()) => {
+                let now_ns = t.started.elapsed().as_nanos() as u64;
                 let n = t.stats.sent.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == 1 {
+                    t.stats.first_ns.store(now_ns, Ordering::SeqCst);
+                }
+                t.stats.last_ns.store(now_ns, Ordering::SeqCst);
                 if n >= t.max_frames {
                     t.stats.capped.store(true, Ordering::SeqCst);
                     g.take();
@@ -619,6 +672,8 @@ struct Recording {
 struct RecordOutcome {
     frames: u64,
     dropped: u64,
+    /// 録画中に実際に届いたコマの平均 fps
+    observed_fps: Option<f64>,
 }
 
 /// 書き込みスレッド: キューのフレームをエンコーダへ書き、入力の終わり(送り口が全て閉じた)で後始末する。
@@ -653,6 +708,7 @@ fn start_recording(tee: &TeeSlot, factory: &EncoderFactory, spec: &EncoderSpec) 
         tx,
         max_frames: max_frames_for(spec.fps),
         stats: Arc::clone(&stats),
+        started: Instant::now(),
     });
     Ok(Recording {
         out: spec.out.clone(),
@@ -680,11 +736,16 @@ impl Recording {
     fn finish(mut self, tee: &TeeSlot) -> std::result::Result<RecordOutcome, String> {
         tee.detach();
         let dropped = self.stats.dropped.load(Ordering::SeqCst);
+        let observed_fps = self.stats.observed_fps();
         let frames = match self.writer.take() {
             Some(h) => h.join().unwrap_or_else(|_| Err("録画スレッドが異常終了しました".into()))?,
             None => 0,
         };
-        Ok(RecordOutcome { frames, dropped })
+        Ok(RecordOutcome {
+            frames,
+            dropped,
+            observed_fps,
+        })
     }
 }
 
@@ -1542,6 +1603,9 @@ impl<'a> CaptureSession<'a> {
                         MAX_RECORD_SECS
                     ));
                 }
+                if let Some(n) = self.rec_fps.and_then(|f| fps_mismatch_note(f, o.observed_fps)) {
+                    self.notes.push(n);
+                }
                 if o.dropped > 0 {
                     self.notes.push(format!(
                         "録画が間に合わず {} コマを捨てました(動きが少し速く記録されます)。負荷を下げて撮り直すことをお勧めします",
@@ -1754,6 +1818,10 @@ pub(super) fn config_from_start(start: &StartCmd) -> Result<CaptureConfig> {
         .filter(|d| !d.is_empty())
         .context("撮影モードには登録先(data_dir)の指定が必要です")?;
     let data_dir = PathBuf::from(dir);
+    // 相対パスは、画面とエンジンで基準のフォルダが違う(エンジンは pose_extractor/ で動く)ので、別の場所を指してしまう
+    if !data_dir.is_absolute() {
+        anyhow::bail!("登録先(data_dir)は絶対パスで指定してください: {}", data_dir.display());
+    }
     if !data_dir.is_dir() {
         anyhow::bail!("登録先がフォルダではありません(または見つかりません): {}", data_dir.display());
     }
@@ -1964,6 +2032,13 @@ mod tests {
         assert!((fps_from_arrivals(&t30).unwrap() - 30.0).abs() < 1e-9);
         let t15: Vec<f64> = (0..30).map(|i| 1.0 + i as f64 / 14.87).collect();
         assert!((fps_from_arrivals(&t15).unwrap() - 14.87).abs() < 1e-6);
+        // 追い付き(処理が詰まったあとに溜まったコマが一気に届く)や一瞬の停止があっても、中央値なので 30 のまま
+        let mut catchup: Vec<f64> = (0..30).map(|i| i as f64 / 30.0).collect(); // 0〜0.97 秒
+        catchup.extend((0..30).map(|i| 1.5 + i as f64 / 120.0)); // 停止のあと 4 倍速で追い付き
+        catchup.extend((0..30).map(|i| 1.75 + i as f64 / 30.0));
+        let mean = (catchup.len() - 1) as f64 / (catchup.last().unwrap() - catchup[0]);
+        assert!(mean > 31.5 || mean < 28.5, "前提: 平均だとずれる: {mean}");
+        assert!((fps_from_arrivals(&catchup).unwrap() - 30.0).abs() < 1e-6, "{:?}", fps_from_arrivals(&catchup));
         assert_eq!(fps_from_arrivals(&t30[..MIN_FPS_SAMPLES - 1]), None, "サンプルが少なすぎる");
         assert_eq!(fps_from_arrivals(&[]), None);
         assert_eq!(fps_from_arrivals(&[1.0; 20]), None, "時間が進んでいない");
@@ -1974,10 +2049,26 @@ mod tests {
         // 起動直後の 0.9 秒に 40 枚が届き(44 fps 相当)、そのあとは 30fps
         let mut t: Vec<f64> = (0..40).map(|i| i as f64 * 0.9 / 40.0).collect();
         t.extend((0..60).map(|i| 1.0 + i as f64 / 30.0));
-        assert!(fps_from_arrivals(&t).unwrap() > 31.5, "起動直後を含めると速く測れてしまう");
         assert!((measure_fps(&t).unwrap() - 30.0).abs() < 1e-9);
+        // 起動直後だけの列は、中央値が 44fps になるが、測らない(None)
+        assert!(fps_from_arrivals(&t[..40]).unwrap() > 40.0);
         // 起動直後のものしか無ければ測れない
         assert_eq!(measure_fps(&t[..40]), None);
+    }
+
+    #[test]
+    fn observed_fps_and_mismatch_note() {
+        // 31 コマが 1.0 秒に届いた = 30 fps
+        assert!((observed_fps(31, 0, 1_000_000_000).unwrap() - 30.0).abs() < 1e-9);
+        assert_eq!(observed_fps(1, 0, 10), None);
+        assert_eq!(observed_fps(10, 5, 5), None);
+        // 5% 以内は注意なし(ちょうど 5% も含む)、超えたら注意
+        assert_eq!(fps_mismatch_note(30.0, Some(31.5)), None);
+        assert_eq!(fps_mismatch_note(30.0, Some(28.5)), None);
+        assert_eq!(fps_mismatch_note(30.0, None), None);
+        let n = fps_mismatch_note(30.0, Some(33.6)).unwrap();
+        assert!(n.contains("33.6 fps") && n.contains("30.0 fps"), "{n}");
+        assert!(fps_mismatch_note(30.0, Some(26.0)).is_some());
     }
 
     #[test]
@@ -2018,6 +2109,7 @@ mod tests {
             tx,
             max_frames,
             stats: Arc::clone(&stats),
+            started: Instant::now(),
         });
         (slot, rx, stats)
     }
@@ -2923,6 +3015,8 @@ mod tests {
         assert!(format!("{e:#}").contains("data_dir"), "{e:#}");
         assert!(config_from_start(&start_with(Some("  "))).is_err());
         let root = scratch("config");
+        let e = config_from_start(&start_with(Some("relative/raw_jsl"))).unwrap_err();
+        assert!(format!("{e:#}").contains("絶対パス"), "{e:#}");
         let missing = root.join("nothing-here");
         let e = config_from_start(&start_with(Some(missing.to_str().unwrap()))).unwrap_err();
         assert!(format!("{e:#}").contains("見つかりません"), "{e:#}");

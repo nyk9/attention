@@ -200,7 +200,9 @@ impl LiveApp {
             let mut h = EngineHandle::spawn_with(&loc, kind)?;
             // 区切り方は、開始前に選んでおいた値(model.segmenter)をそのまま送る。
             // 撮影(録画)では、登録先(R0 で解決したデータの場所)を付けた撮影モードの start を送る
-            h.send(&self.model.start_command(source, &self.guide.data_dir))?;
+            // 登録先は絶対パスにして送る(エンジンは別の作業フォルダで動くので、相対パスだと別の場所を指す)
+            let data_dir = std::path::absolute(&self.guide.data_dir).unwrap_or_else(|_| self.guide.data_dir.clone());
+            h.send(&self.model.start_command(source, &data_dir))?;
             Ok(h)
         });
         match result {

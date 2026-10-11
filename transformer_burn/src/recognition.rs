@@ -456,8 +456,82 @@ pub fn load_recognition_model<B: Backend>(
 /// 固定して、呼び出し側(pose_extractor)が Burn の型を意識しなくて済むようにする。
 pub type InferenceBackend = burn::backend::NdArray<f32>;
 
+/// 保存済み認識モデルを CPU(NdArray)で**1回だけ読み込んで使い回す**推論器。
+/// ライブ認識のように同じモデルで何度も推論する用途向け(`predict_from_features` は
+/// 呼ぶたびにモデルを読み直すので、1回きりの判定専用)。
+///
+/// 読み込み時に次の3つを固めておき、`predict_topk` では毎回同じ前処理を通す:
+/// - 入力表現(生ポーズ / 手形記述子)= `model_config.json`
+/// - 標準化の統計量 = `feature_stats.json`(あれば)
+/// - 語彙 = `tag_vocab.json`
+// pose_extractor(lib 経由)から使う。transformer_burn の bin は mod を重複宣言していて
+// bin 内では呼ばれないため、未使用警告を抑える(predict_from_features と同じ事情)
+#[allow(dead_code)]
+pub struct Predictor {
+    model: RecognitionModel<InferenceBackend>,
+    vocab: TagVocabulary,
+    config: RecognitionModelConfig,
+    stats: Option<crate::feature_stats::FeatureStats>,
+    device: <InferenceBackend as Backend>::Device,
+}
+
+#[allow(dead_code)]
+impl Predictor {
+    /// `load_dir`: model.bin + tag_vocab.json を含むディレクトリ
+    pub fn load(load_dir: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let device = <InferenceBackend as Backend>::Device::default();
+        let config = load_recognition_config(load_dir)?;
+        let stats = crate::feature_stats::FeatureStats::load(load_dir)?;
+        let (model, vocab) = load_recognition_model::<InferenceBackend>(load_dir, &device)?;
+        Ok(Self {
+            model,
+            vocab,
+            config,
+            stats,
+            device,
+        })
+    }
+
+    /// 認識できるタグの一覧(語彙。SOS/EOS/PAD を含まない)
+    pub fn tags(&self) -> &[String] {
+        &self.vocab.tags
+    }
+
+    /// 保存済みモデルの寸法設定(入力表現など)
+    pub fn config(&self) -> &RecognitionModelConfig {
+        &self.config
+    }
+
+    /// 標準化(feature_stats.json)を使うモデルか
+    pub fn uses_standardization(&self) -> bool {
+        self.stats.is_some()
+    }
+
+    /// 生の 126 次元ポーズ列(フラット)から、確率上位 k 個のタグを返す。
+    /// 学習時と同じ前処理を必ず通す。順番は「生ポーズ → 入力表現の変換 → 標準化」
+    pub fn predict_topk(&self, features: &[f32], frames: usize, k: usize) -> Vec<(String, f32)> {
+        let features = if self.config.input_features.is_raw() {
+            features.to_vec()
+        } else {
+            crate::handshape_features::handshape_sequence(
+                features,
+                frames,
+                self.config.input_features,
+            )
+        };
+        let features = match &self.stats {
+            Some(stats) => stats.apply(&features),
+            None => features,
+        };
+        self.model
+            .predict_topk(&features, frames, &self.vocab, k, &self.device)
+    }
+}
+
 /// 保存済み認識モデルを CPU(NdArray)で読み込み、手ポーズ列(フラット)から
 /// 上位 k タグを返す。`動画→タグ直結パス`(pose_extractor 側)の推論入口。
+/// 呼ぶたびにモデルを読み込む1回きり用。繰り返し使うなら `Predictor` を使うこと
+/// (中身はこの関数も `Predictor` に委譲している)。
 ///
 /// 保存済みモデルが手形記述子で学習されていれば `handshape_sequence` を、
 /// `feature_stats.json` があれば標準化を、この関数の中で自動的に適用する。
@@ -473,20 +547,7 @@ pub fn predict_from_features(
     frames: usize,
     k: usize,
 ) -> Result<Vec<(String, f32)>, Box<dyn std::error::Error>> {
-    let device = <InferenceBackend as Backend>::Device::default();
-    // 学習時と同じ前処理を必ず通す。順番は「生ポーズ → 入力表現の変換 → 標準化」
-    let config = load_recognition_config(load_dir)?;
-    let features = if config.input_features.is_raw() {
-        features.to_vec()
-    } else {
-        crate::handshape_features::handshape_sequence(features, frames, config.input_features)
-    };
-    let features = match crate::feature_stats::FeatureStats::load(load_dir)? {
-        Some(stats) => stats.apply(&features),
-        None => features,
-    };
-    let (model, vocab) = load_recognition_model::<InferenceBackend>(load_dir, &device)?;
-    Ok(model.predict_topk(&features, frames, &vocab, k, &device))
+    Ok(Predictor::load(load_dir)?.predict_topk(features, frames, k))
 }
 
 // ===== テスト =====
@@ -603,6 +664,42 @@ mod tests {
         let fallback = load_recognition_config(&dir).expect("設定の読み込みに失敗");
         assert_eq!(fallback.input_dim, POSE_FEATURE_DIM);
         assert!(fallback.input_features.is_raw());
+
+        cleanup(&dir);
+    }
+
+    // [TEST向き] Predictor が (1) 手形記述子モデルに生 126 次元を渡しても変換して通ること、
+    // (2) 互換関数 predict_from_features と同じ結果を返すこと、(3) 使い回して同じ入力に同じ出力を返すこと
+    #[test]
+    fn predictor_matches_predict_from_features_and_is_reusable() {
+        let device = <TestBackend as Backend>::Device::default();
+        let dir = test_dir("predictor");
+
+        let vocab = TagVocabulary::from_labels(vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        let config = RecognitionModelConfig::preset("tiny")
+            .unwrap()
+            .with_input_features(InputFeatures::Handshape);
+        let model =
+            RecognitionModel::<TestBackend>::new_with_config(vocab.vocab_size(), &config, &device);
+        save_recognition_model(&model, &vocab, &config, &dir).expect("保存に失敗");
+
+        let frames = 10;
+        // 0 以外の値を入れて記述子変換を実際に通す(全ゼロだと変換の有無で差が出にくい)
+        let features: Vec<f32> = (0..frames * POSE_FEATURE_DIM)
+            .map(|i| ((i % 37) as f32) / 37.0)
+            .collect();
+
+        let predictor = Predictor::load(&dir).expect("Predictor の読み込みに失敗");
+        assert_eq!(predictor.tags(), vocab.tags.as_slice());
+        assert!(!predictor.uses_standardization());
+
+        let first = predictor.predict_topk(&features, frames, 3);
+        let second = predictor.predict_topk(&features, frames, 3);
+        assert_eq!(first.len(), 3);
+        assert_eq!(first, second, "同じ入力で結果が変わった(使い回しで状態が残っている)");
+
+        let via_fn = predict_from_features(&dir, &features, frames, 3).expect("互換関数が失敗");
+        assert_eq!(first, via_fn);
 
         cleanup(&dir);
     }

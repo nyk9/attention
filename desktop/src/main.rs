@@ -12,12 +12,16 @@
 //! - 非同期の処理(`cx.spawn_in`)は UI スレッド上で動く。重い処理や待ち受けは別スレッド(engine.rs)で行い、
 //!   ここでは一定間隔で結果を取り出すだけにして、UI を止めない。
 
+mod capture_guide;
+#[cfg(test)]
+mod capture_guide_tests;
 mod engine;
 mod overlay;
 mod protocol;
 mod state;
 
-use engine::{AppInbox, EngineHandle, EngineLocation, Incoming};
+use capture_guide::{hand_run, progress as guide_progress, GuideState};
+use engine::{AppInbox, EngineHandle, EngineLocation, Incoming, OverlayKind};
 use gpui::{
     actions, div, img, prelude::*, px, rgb, size, App, Application, Bounds, Context, FocusHandle,
     Focusable, FontWeight, IntoElement, KeyBinding, ObjectFit, Render, RenderImage, SharedString,
@@ -30,9 +34,9 @@ use gpui_component::{
     v_flex, ActiveTheme, Disableable, Root, Sizable, Theme, ThemeMode,
 };
 use protocol::{Command, SegmenterMode, SourceSpec};
-use state::{format_secs, hands_text, percent, AppModel, LogLevel, Phase, Recognized};
+use state::{format_secs, hands_text, percent, AppMode, AppModel, LogLevel, Phase, Recognized};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // キー操作・メニューの動作(アクション)。スペース = 手動の開始/停止、cmd-q = 終了
 actions!(attention_app, [ToggleRecording, QuitApp]);
@@ -91,6 +95,10 @@ struct LiveApp {
     focus_handle: FocusHandle,
     /// 診断用: 表示したプレビューの枚数
     frames_shown: u64,
+    /// 撮影ガイドの状態(手の連続検出・縁の判定・お題と進捗)。ライブ認識では使わない
+    guide: GuideState,
+    /// 診断用: 前回ログに出した撮影ガイドの表示内容(変化したときだけ出す)
+    last_guide_log: String,
 }
 
 impl LiveApp {
@@ -118,6 +126,16 @@ impl LiveApp {
             .detach();
         }
 
+        // 撮影ガイドのデータディレクトリ: ATTENTION_DATA_DIR、無ければ <リポジトリ>/transformer_burn/data/raw_jsl
+        let root = engine::resolve_root(
+            std::env::var("ATTENTION_ROOT").ok().as_deref(),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+        );
+        let data_dir = guide_progress::resolve_data_dir(
+            std::env::var(guide_progress::DATA_DIR_ENV).ok().as_deref(),
+            &root,
+        );
+
         let mut app = Self {
             model: AppModel::new(),
             engine: None,
@@ -125,7 +143,14 @@ impl LiveApp {
             image: None,
             focus_handle,
             frames_shown: 0,
+            guide: GuideState::new(data_dir),
+            last_guide_log: String::new(),
         };
+
+        // 開発・検証用: ATTENTION_APP_MODE=capture-guide で撮影ガイドモードから始める
+        if std::env::var("ATTENTION_APP_MODE").is_ok_and(|v| v.trim() == "capture-guide") {
+            app.model.mode = AppMode::CaptureGuide;
+        }
 
         // 開発・検証用: 動画ファイルがあれば、カメラを使わずに自動で開始する
         if let Ok(path) = std::env::var("ATTENTION_APP_VIDEO") {
@@ -142,8 +167,13 @@ impl LiveApp {
             return;
         }
         self.model.begin_session();
+        self.guide.reset_session();
+        let kind = match self.model.mode {
+            AppMode::Live => OverlayKind::Live,
+            AppMode::CaptureGuide => OverlayKind::CaptureGuide,
+        };
         let result: Result<EngineHandle, String> = engine::locate().and_then(|loc: EngineLocation| {
-            let mut h = EngineHandle::spawn(&loc)?;
+            let mut h = EngineHandle::spawn_with(&loc, kind)?;
             // 区切り方は、開始前に選んでおいた値(model.segmenter)をそのまま送る
             h.send(&self.model.start_command(source))?;
             Ok(h)
@@ -178,13 +208,24 @@ impl LiveApp {
     }
 
     fn toggle(&mut self, cx: &mut Context<Self>) {
-        if self.model.phase == Phase::Running {
+        // 撮影ガイドでは送らない(スペースキーで届いても何もしない)
+        if self.model.toggle_allowed() {
             if let Some(e) = self.engine.as_mut() {
                 if let Err(err) = e.send(&Command::Toggle) {
                     self.model.push_log(LogLevel::Warn, err);
                 }
             }
         }
+        cx.notify();
+    }
+
+    /// 画面のモードを切り替える(待機中だけ)
+    fn set_mode(&mut self, mode: AppMode, cx: &mut Context<Self>) {
+        if !self.model.mode_selectable() || self.model.mode == mode {
+            return;
+        }
+        self.model.mode = mode;
+        self.guide.reset_session();
         cx.notify();
     }
 
@@ -216,12 +257,29 @@ impl LiveApp {
 
     /// Inbox から最新の状態を取り出して反映する(UI スレッドで定期的に呼ばれる)
     fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(inbox) = self.inbox.clone() else { return };
+        // 撮影ガイド: お題と進捗を定期的に読み直す(読むだけ。エンジンが動いていなくても表示する)
+        if self.model.mode == AppMode::CaptureGuide && self.guide.reload_due(Instant::now()) {
+            self.guide.reload_progress(Instant::now());
+            cx.notify();
+        }
+        let Some(inbox) = self.inbox.clone() else {
+            self.log_guide();
+            return;
+        };
         let d = inbox.drain();
         let mut changed = false;
 
         if let Some(ev) = d.status {
             self.model.apply(&ev);
+            changed = true;
+        }
+        // 撮影ガイド用(エンジンを撮影ガイドで起動したときだけ入っている)
+        for s in &d.hand_samples {
+            self.guide.push_sample(s);
+            changed = true;
+        }
+        if let Some(e) = d.edge {
+            self.guide.edge = e;
             changed = true;
         }
         for item in d.events {
@@ -253,6 +311,7 @@ impl LiveApp {
                         self.model.error = Some(format!("認識エンジンが異常終了しました。\n{detail}"));
                     }
                     self.model.engine_exited();
+                    self.guide.reset_session();
                     self.drop_image(window, cx);
                 }
             }
@@ -277,6 +336,37 @@ impl LiveApp {
         }
         if changed {
             cx.notify();
+        }
+        self.log_guide();
+    }
+
+    /// 診断用(ATTENTION_APP_DEBUG): 撮影ガイドの画面に渡す文字・色の判定を、変わったときだけ標準エラーへ出す。
+    /// 画面のスクリーンショットが撮れない環境で、描画に渡る状態を確かめるため。映像・座標の生データは出さない
+    fn log_guide(&mut self) {
+        if !debug_enabled() || self.model.mode != AppMode::CaptureGuide {
+            return;
+        }
+        let g = &self.guide;
+        let cur = g.runs.current_best();
+        let last = g.runs.last_ended_best();
+        let progress = match &g.progress {
+            Some(Ok(v)) => guide_progress::next_word_text(v),
+            Some(Err(e)) => format!("読めない: {}", e.lines().next().unwrap_or("")),
+            None => "未読み込み".into(),
+        };
+        let text = format!(
+            "hands={} run={} pass={} last={} edge={:?} crop_red={} progress={}",
+            capture_guide::hands_big_text(g.hands.as_deref()),
+            capture_guide::run_text(cur),
+            hand_run::passes(cur),
+            last.map(capture_guide::run_text).unwrap_or_else(|| "-".into()),
+            g.edge.message(),
+            g.edge.any(),
+            progress
+        );
+        if text != self.last_guide_log {
+            eprintln!("[guide] {text}");
+            self.last_guide_log = text;
         }
     }
 
@@ -342,9 +432,9 @@ impl Render for LiveApp {
                             .child(self.render_status(cx))
                             .child(self.render_controls(running, busy, cx)),
                     )
-                    // ===== 右: 認識結果・履歴・語彙 =====
-                    .child(
-                        v_flex()
+                    // ===== 右: 認識結果・履歴・語彙(撮影ガイドでは、お題・手の検出・検出範囲)=====
+                    .child(match self.model.mode {
+                        AppMode::Live => v_flex()
                             .w(px(420.))
                             .h_full()
                             .min_h_0()
@@ -354,8 +444,25 @@ impl Render for LiveApp {
                             .child(self.render_result(cx))
                             .child(self.render_history(cx))
                             .child(self.render_log(cx))
-                            .child(self.render_vocab(border, muted, cx)),
-                    ),
+                            .child(self.render_vocab(border, muted, cx))
+                            .into_any_element(),
+                        AppMode::CaptureGuide => v_flex()
+                            // on_children_prepainted は id を付ける前(Div)にしか呼べない
+                            .when(dbg, |d| d.on_children_prepainted(|b, _, _| log_bounds("right(guide)", &b)))
+                            .id("guide-column")
+                            .w(px(420.))
+                            .h_full()
+                            .min_h_0()
+                            .flex_shrink_0()
+                            .gap_3()
+                            .overflow_y_scroll()
+                            .child(self.render_guide_topic(cx))
+                            .child(self.render_guide_hands(cx))
+                            .child(self.render_guide_edge(cx))
+                            .child(self.render_guide_legend(cx))
+                            .child(self.render_log(cx))
+                            .into_any_element(),
+                    }),
             )
     }
 }
@@ -405,6 +512,10 @@ impl LiveApp {
             (Phase::Starting, _) => ("起動中".into(), rgb(0x90a4ae).into()),
             (Phase::Stopping, _) => ("停止中".into(), rgb(0x90a4ae).into()),
             (Phase::Idle, _) => ("停止".into(), rgb(0x90a4ae).into()),
+            // 撮影ガイドは記録しないので「待機中/記録中」ではなく、録画しないことを明示する
+            (Phase::Running, _) if self.model.mode == AppMode::CaptureGuide => {
+                ("撮影ガイド中(録画しません)".into(), rgb(0x80deea).into())
+            }
             (Phase::Running, Some(s)) if s.recording => {
                 (format!("記録中 {}", format_secs(s.rec_secs)).into(), rgb(0xff5252).into())
             }
@@ -448,6 +559,7 @@ impl LiveApp {
         let recording = self.model.status.as_ref().is_some_and(|s| s.recording);
         let toggle_label = if recording { "手動で停止(スペース)" } else { "手動で開始(スペース)" };
 
+        let guide_mode = self.model.mode == AppMode::CaptureGuide;
         let mut start = Button::new("start")
             .primary()
             .large()
@@ -457,8 +569,24 @@ impl LiveApp {
         if busy {
             start = start.outline();
         }
+        let mode_ok = self.model.mode_selectable();
         v_flex()
             .gap_2()
+            .child(
+                // モード切替(待機中だけ押せる)
+                h_flex()
+                    .gap_3()
+                    .items_center()
+                    .child(div().text_size(px(16.)).child("モード"))
+                    .child(mode_button("mode-live", "ライブ認識", !guide_mode, AppMode::Live, mode_ok, cx))
+                    .child(mode_button("mode-guide", "撮影ガイド", guide_mode, AppMode::CaptureGuide, mode_ok, cx))
+                    .child(
+                        div()
+                            .text_size(px(14.))
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if mode_ok { "停止中に切り替えられます" } else { "切り替えるには先に停止してください" }),
+                    ),
+            )
             .child(
                 h_flex()
                     .gap_3()
@@ -472,16 +600,25 @@ impl LiveApp {
                             .disabled(!matches!(self.model.phase, Phase::Starting | Phase::Running))
                             .on_click(cx.listener(|this, _, _w, cx| this.stop(cx))),
                     )
-                    .child(
-                        Button::new("toggle")
-                            .large()
-                            .outline()
-                            .label(toggle_label)
-                            .disabled(!running)
-                            .on_click(cx.listener(|this, _, _w, cx| this.toggle(cx))),
-                    ),
+                    // 撮影ガイドでは手動の開始/停止を出さない(語の認識をしない)
+                    .when(!guide_mode, |d| {
+                        d.child(
+                            Button::new("toggle")
+                                .large()
+                                .outline()
+                                .label(toggle_label)
+                                .disabled(!running)
+                                .on_click(cx.listener(|this, _, _w, cx| this.toggle(cx))),
+                        )
+                    }),
             )
-            .child(
+            .child(if guide_mode {
+                div()
+                    .text_size(px(16.))
+                    .text_color(cx.theme().muted_foreground)
+                    .child("撮影ガイド: 録画・保存はしません。語の認識もしません。撮影は Photo Booth などで続けてください")
+                    .into_any_element()
+            } else {
                 h_flex()
                     .gap_3()
                     .items_center()
@@ -493,8 +630,9 @@ impl LiveApp {
                             .text_size(px(14.))
                             .text_color(cx.theme().muted_foreground)
                             .child("自動: 手の出入りで区切る / 手動: スペースキーで開始・停止"),
-                    ),
-            )
+                    )
+                    .into_any_element()
+            })
             .children(self.model.error.as_ref().map(|e| {
                 div()
                     .p_3()
@@ -662,6 +800,200 @@ impl LiveApp {
                         })),
                     ),
             )
+    }
+}
+
+// ===== 撮影ガイドの右列 =====
+
+/// 合格ライン以上 = 緑、未満 = 琥珀色。色だけに頼らないよう、文字でも「合格ライン以上/未満」を出す
+fn run_colors(pass: bool) -> (gpui::Hsla, gpui::Hsla) {
+    if pass {
+        (rgb(0x00c853).into(), rgb(0x0b0b0b).into())
+    } else {
+        (rgb(0xffb300).into(), rgb(0x0b0b0b).into())
+    }
+}
+
+fn guide_card(cx: &mut Context<LiveApp>) -> gpui::Div {
+    v_flex()
+        .p_4()
+        .gap_2()
+        .rounded_lg()
+        .border_1()
+        .border_color(cx.theme().border)
+        .bg(cx.theme().secondary)
+}
+
+impl LiveApp {
+    /// お題と進捗(読み取りのみ)
+    fn render_guide_topic(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
+        let card = guide_card(cx).child(div().text_size(px(16.)).text_color(muted).child("次の語(進捗は読み取りのみ)"));
+        match &self.guide.progress {
+            None => card.child(div().text_size(px(20.)).child("読み込み中")),
+            Some(Err(e)) => card.child(
+                div()
+                    .p_3()
+                    .rounded_md()
+                    .bg(rgb(0x5d1a1a))
+                    .border_1()
+                    .border_color(rgb(0xff5252))
+                    .text_size(px(16.))
+                    .text_color(rgb(0xffffff))
+                    .child(SharedString::from(format!("お題と進捗を読めません。他の機能は使えます。\n{e}"))),
+            ),
+            Some(Ok(v)) => {
+                let card = match guide_progress::next_word_parts(v) {
+                    Some((word, take)) => card
+                        .child(
+                            div()
+                                .text_size(px(48.))
+                                .line_height(px(58.))
+                                .font_weight(FontWeight::BOLD)
+                                .child(SharedString::from(word)),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(32.))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(rgb(0x80deea))
+                                .child(SharedString::from(take)),
+                        ),
+                    None => card.child(
+                        div()
+                            .text_size(px(26.))
+                            .font_weight(FontWeight::BOLD)
+                            .child(SharedString::from(guide_progress::next_word_text(v))),
+                    ),
+                };
+                card.child(div().text_size(px(16.)).text_color(muted).child(SharedString::from(guide_progress::summary_text(v))))
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(muted)
+                            .child(SharedString::from(format!("データ: {}", self.guide.data_dir.display()))),
+                    )
+            }
+        }
+    }
+
+    /// 左右どちらの手が見えているか、連続して検出できている秒数
+    fn render_guide_hands(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
+        let running = self.model.phase == Phase::Running;
+        let hands = if running { self.guide.hands.as_deref() } else { None };
+        let hands_color: gpui::Hsla = match hands {
+            Some("L") | Some("R") | Some("LR") => rgb(0xffffff).into(),
+            _ => rgb(0x90a4ae).into(),
+        };
+        let cur = if running { self.guide.runs.current_best() } else { 0.0 };
+        let pass = hand_run::passes(cur);
+        let (bg, fg) = run_colors(pass);
+        let last = if running { self.guide.runs.last_ended_best() } else { None };
+        guide_card(cx)
+            .child(div().text_size(px(16.)).text_color(muted).child("手の検出"))
+            .child(
+                div()
+                    .text_size(px(56.))
+                    .line_height(px(64.))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(hands_color)
+                    .child(capture_guide::hands_big_text(hands)),
+            )
+            .child(
+                h_flex()
+                    .gap_3()
+                    .items_center()
+                    .child(div().text_size(px(18.)).child("連続"))
+                    .child(
+                        div()
+                            .px_4()
+                            .py_1()
+                            .rounded_lg()
+                            .bg(bg)
+                            .text_color(fg)
+                            .text_size(px(40.))
+                            .font_weight(FontWeight::BOLD)
+                            .child(SharedString::from(capture_guide::run_text(cur))),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(18.))
+                            .font_weight(FontWeight::BOLD)
+                            .child(if pass { "合格ライン以上" } else { "1.0 秒未満" }),
+                    ),
+            )
+            .child(div().text_size(px(16.)).child(SharedString::from(match last {
+                Some(s) => format!(
+                    "直前の連続区間: {}({})",
+                    capture_guide::run_text(s),
+                    if hand_run::passes(s) { "合格ライン以上" } else { "1.0 秒未満" }
+                ),
+                None => "直前の連続区間: -".to_string(),
+            })))
+            .child(
+                div()
+                    .text_size(px(14.))
+                    .text_color(muted)
+                    .child("合格ラインは 1.0 秒(撮影後の手検出チェックと同じ基準。瞬断 1 回までは続いているとみなす)"),
+            )
+    }
+
+    /// 検出範囲(黄色の枠)の縁に手が近づいたか
+    fn render_guide_edge(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
+        let running = self.model.phase == Phase::Running;
+        let msg = if running { self.guide.edge.message() } else { None };
+        let card = guide_card(cx).child(div().text_size(px(16.)).text_color(muted).child("検出範囲"));
+        match msg {
+            Some(m) => card.bg(rgb(0x7f0000)).border_color(rgb(0xff5252)).child(
+                div()
+                    .text_size(px(24.))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(0xffffff))
+                    .child(SharedString::from(format!("{m}。枠の内側へ"))),
+            ),
+            None => card.child(div().text_size(px(20.)).child(if !running {
+                "-"
+            } else if self.guide.hands.as_deref().is_some_and(|h| h != "none") {
+                "手は検出範囲の内側です"
+            } else {
+                "手が見えたら判定します"
+            })),
+        }
+    }
+
+    fn render_guide_legend(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
+        v_flex()
+            .gap_1()
+            .child(div().text_size(px(14.)).text_color(muted).child(capture_guide::silhouette::GUIDE_LEGEND))
+            .child(
+                div()
+                    .text_size(px(14.))
+                    .text_color(muted)
+                    .child("黄色の枠: 手を検出する範囲。手が縁に近づくと赤く太くなります"),
+            )
+            .child(div().text_size(px(14.)).text_color(muted).child(capture_guide::HANDS_NOTE))
+    }
+}
+
+fn mode_button(
+    id: &'static str,
+    label: &'static str,
+    selected: bool,
+    mode: AppMode,
+    enabled: bool,
+    cx: &mut Context<LiveApp>,
+) -> Button {
+    let b = Button::new(id)
+        .label(label)
+        .disabled(!enabled)
+        .on_click(cx.listener(move |this, _, _w, cx| this.set_mode(mode, cx)));
+    if selected {
+        b.primary()
+    } else {
+        b.outline()
     }
 }
 

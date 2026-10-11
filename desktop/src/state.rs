@@ -1,7 +1,9 @@
 //! 画面に出す状態(UI 非依存)。エンジンからのイベントを `apply` で畳み込む。
 //! GPUI に触れないので、ユニットテストで挙動を確かめられる。
 
-use crate::protocol::{Command, EngineEvent, RankedItem, SegmenterMode, SourceSpec, VocabEntry};
+use crate::protocol::{Command, EngineEvent, RankedItem, SegmenterMode, SourceSpec, Verdict, VocabEntry};
+use crate::protocol::CaptureWord;
+use std::path::Path;
 use std::collections::VecDeque;
 
 /// 履歴に残す件数(直近 5 件)
@@ -29,6 +31,67 @@ pub enum AppMode {
     Live,
     /// 撮影ガイド(R0)。区切り方「手動」で起動し、開始操作は送らない = 語の認識はしない。録画・保存もしない
     CaptureGuide,
+    /// 撮影(R1)。撮影ガイドの表示に加えて、エンジンが録画・判定・登録をする。
+    /// エンジンを撮影モード(`mode: "capture"`)で起動する = **このモードだけが、書き込みうるエンジンを起動する**
+    Capture,
+}
+
+impl AppMode {
+    /// 撮影ガイドの表示(立ち位置の枠・手の連続秒数・縁の警告・お題)を使うモードか
+    pub fn shows_guide(self) -> bool {
+        matches!(self, AppMode::CaptureGuide | AppMode::Capture)
+    }
+}
+
+/// 撮影の段階(エンジンの `capture_state.phase`)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CapturePhase {
+    #[default]
+    Idle,
+    Countdown,
+    Recording,
+    Judging,
+    Judged,
+}
+
+impl CapturePhase {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "idle" => Some(Self::Idle),
+            "countdown" => Some(Self::Countdown),
+            "recording" => Some(Self::Recording),
+            "judging" => Some(Self::Judging),
+            "judged" => Some(Self::Judged),
+            _ => None,
+        }
+    }
+}
+
+/// 直近に登録したテイク(画面の「登録しました」表示)
+#[derive(Debug, Clone, PartialEq)]
+pub struct SavedView {
+    pub file_path: String,
+    pub label: String,
+    pub rep_idx: u32,
+    pub quality_flag: String,
+    pub usable: bool,
+}
+
+/// 撮影モードの画面の状態(エンジンの `capture_state` / `capture_saved` を畳み込んだもの)
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CaptureView {
+    pub phase: CapturePhase,
+    pub countdown_left: f64,
+    pub rec_secs: f64,
+    pub max_secs: f64,
+    pub fps: Option<f64>,
+    pub dropped: u64,
+    pub word: Option<CaptureWord>,
+    /// エンジンが実際に書き込む先(まだ `capture_state` が来ていなければ空)
+    pub data_dir: String,
+    pub verdict: Option<Verdict>,
+    pub notes: Vec<String>,
+    pub last_saved: Option<SavedView>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -76,6 +139,8 @@ pub struct AppModel {
     /// 撮影ガイドのセッション中は、エンジンからの値で上書きしない(ライブ認識に戻ったときに選択を保つ)
     pub segmenter: SegmenterMode,
     pub mode: AppMode,
+    /// 撮影モード(`AppMode::Capture`)の状態。ほかのモードでは使わない
+    pub capture: CaptureView,
 }
 
 impl AppModel {
@@ -90,6 +155,7 @@ impl AppModel {
             error: None,
             segmenter: SegmenterMode::Auto,
             mode: AppMode::Live,
+            capture: CaptureView::default(),
         }
     }
 
@@ -100,6 +166,7 @@ impl AppModel {
         self.current = None;
         self.history.clear();
         self.error = None;
+        self.capture = CaptureView::default();
     }
 
     pub fn push_log(&mut self, level: LogLevel, text: impl Into<String>) {
@@ -113,6 +180,9 @@ impl AppModel {
     pub fn engine_exited(&mut self) {
         self.phase = Phase::Idle;
         self.status = None;
+        // 録画の途中状態は引きずらない(直近の登録結果だけ残す)
+        let last_saved = self.capture.last_saved.take();
+        self.capture = CaptureView { last_saved, ..CaptureView::default() };
     }
 
     /// プレビューと status 以外のイベントの反映(status は `set_status`、preview は画面側で扱う)
@@ -141,7 +211,7 @@ impl AppModel {
             EngineEvent::Preview { .. } => {}
             // 撮影ガイドでは認識結果を出さない(開始操作を送らないので、カメラでは来ない。
             // 動画入力 + 手動では、エンジンが再生開始と同時に記録し終端で認識するので来ることがある)
-            EngineEvent::Result { .. } if self.mode == AppMode::CaptureGuide => {}
+            EngineEvent::Result { .. } if self.mode != AppMode::Live => {}
             EngineEvent::Result { tag, label, p, ranked, low_confidence, .. } => {
                 let r = Recognized {
                     tag: tag.clone(),
@@ -174,6 +244,47 @@ impl AppModel {
                     }
                 }
             }
+            EngineEvent::CaptureState {
+                phase,
+                countdown_left,
+                rec_secs,
+                max_secs,
+                fps,
+                dropped,
+                word,
+                data_dir,
+                verdict,
+                notes,
+            } => {
+                // 知らない段階名は無視する(エンジンの方が新しいとき)
+                if let Some(p) = CapturePhase::parse(phase) {
+                    let last_saved = self.capture.last_saved.take();
+                    self.capture = CaptureView {
+                        phase: p,
+                        countdown_left: *countdown_left,
+                        rec_secs: *rec_secs,
+                        max_secs: *max_secs,
+                        fps: *fps,
+                        dropped: *dropped,
+                        word: word.clone(),
+                        data_dir: data_dir.clone(),
+                        verdict: verdict.clone(),
+                        notes: notes.clone(),
+                        last_saved,
+                    };
+                }
+            }
+            EngineEvent::CaptureSaved { file_path, label, rep_idx, quality_flag, usable, .. } => {
+                self.capture.last_saved = Some(SavedView {
+                    file_path: file_path.clone(),
+                    label: label.clone(),
+                    rep_idx: *rep_idx,
+                    quality_flag: quality_flag.clone(),
+                    usable: *usable,
+                });
+                let flag_text = quality_flag_text(quality_flag);
+                self.push_log(LogLevel::Info, format!("登録しました: {file_path}({flag_text})"));
+            }
             // 知らない種類のイベントは何もしない(読み捨て)
             EngineEvent::Unknown => {}
         }
@@ -198,13 +309,89 @@ impl AppModel {
 
     /// `start` コマンドを作る。ライブ認識では、区切り方は開始前に選んでおいた値(`self.segmenter`)をそのまま送る
     /// (「カメラで開始」が選択を自動に戻してしまわないように、組み立てをここに集めてある)。
-    /// 撮影ガイドでは常に「手動」(開始操作を送らないので記録も認識も始まらない)。`self.segmenter` は変えない
-    pub fn start_command(&self, source: SourceSpec) -> Command {
+    /// 撮影ガイドでは常に「手動」(開始操作を送らないので記録も認識も始まらない)。`self.segmenter` は変えない。
+    /// 撮影(録画)では、撮影モードの start に登録先 `data_dir` を付ける(エンジンが書き込むのはここだけ)
+    pub fn start_command(&self, source: SourceSpec, data_dir: &Path) -> Command {
         let segmenter = match self.mode {
             AppMode::Live => self.segmenter,
             AppMode::CaptureGuide => SegmenterMode::Manual,
+            AppMode::Capture => {
+                return Command::StartCapture {
+                    source,
+                    data_dir: data_dir.to_string_lossy().to_string(),
+                    countdown_secs: None,
+                }
+            }
         };
         Command::Start { source, segmenter }
+    }
+
+    // ----- 撮影(録画)の操作。送ってよいときだけ Some(コマンド)を返す(送る側は判断しない)-----
+
+    fn capture_running(&self) -> bool {
+        self.mode == AppMode::Capture && self.phase == Phase::Running
+    }
+
+    /// 録画開始。待機中で、画面にお題の語が出ているときだけ。語は画面が出しているもの(エンジンはそれを録画する)
+    pub fn record_command(&self, displayed_word_id: Option<&str>) -> Option<Command> {
+        (self.capture_running() && self.capture.phase == CapturePhase::Idle)
+            .then(|| displayed_word_id.map(|w| Command::CaptureRecord { word_id: Some(w.to_string()) }))
+            .flatten()
+    }
+
+    /// 停止(録画中)/ 取り消し(カウントダウン中)
+    pub fn stop_command(&self) -> Option<Command> {
+        (self.capture_running() && matches!(self.capture.phase, CapturePhase::Countdown | CapturePhase::Recording))
+            .then_some(Command::CaptureStop)
+    }
+
+    /// 採用。判定済みのときだけ。使えないと判定されたテイクは、「NG として記録」を押したときの意味で confirm_ng=true
+    pub fn accept_command(&self) -> Option<Command> {
+        if !(self.capture_running() && self.capture.phase == CapturePhase::Judged) {
+            return None;
+        }
+        let usable = self.capture.verdict.as_ref().is_some_and(|v| v.usable);
+        Some(Command::CaptureAccept { confirm_ng: !usable })
+    }
+
+    /// 破棄。カウントダウン・録画中・判定済みのとき(判定中は、判定が終わるまで破棄できない)
+    pub fn discard_command(&self) -> Option<Command> {
+        (self.capture_running()
+            && matches!(
+                self.capture.phase,
+                CapturePhase::Countdown | CapturePhase::Recording | CapturePhase::Judged
+            ))
+        .then_some(Command::CaptureDiscard)
+    }
+
+    /// 撮り直し = 破棄して、同じお題でもう一度録画。判定済みのときだけ
+    pub fn retake_commands(&self, displayed_word_id: Option<&str>) -> Vec<Command> {
+        let (Some(word), true) = (displayed_word_id, self.capture_running() && self.capture.phase == CapturePhase::Judged)
+        else {
+            return Vec::new();
+        };
+        vec![Command::CaptureDiscard, Command::CaptureRecord { word_id: Some(word.to_string()) }]
+    }
+
+    /// スペースキー: 待機中は録画開始、カウントダウン/録画中は停止(取り消し)。判定中・判定済みでは何もしない
+    /// (判定済みで押して、うっかり採用や撮り直しにならないように)
+    pub fn space_command(&self, displayed_word_id: Option<&str>) -> Option<Command> {
+        match self.capture.phase {
+            CapturePhase::Idle => self.record_command(displayed_word_id),
+            CapturePhase::Countdown | CapturePhase::Recording => self.stop_command(),
+            CapturePhase::Judging | CapturePhase::Judged => None,
+        }
+    }
+}
+
+/// index.tsv に書かれる quality_flag の説明(画面用)
+pub fn quality_flag_text(flag: &str) -> &'static str {
+    match flag {
+        "ok" => "有効なテイク",
+        "ng_hands" => "NG: 手の検出が足りない",
+        "ng_duration" => "NG: 長さが範囲外",
+        "" => "判定なし",
+        _ => "NG",
     }
 }
 
@@ -355,19 +542,19 @@ mod tests {
         let mut m = AppModel::new();
         // 既定は自動
         assert_eq!(
-            m.start_command(camera()),
+            m.start_command(camera(), Path::new("/d")),
             Command::Start { source: camera(), segmenter: SegmenterMode::Auto }
         );
         // 待機中に手動を選ぶ → begin_session を挟んでも保たれ、start の行に "manual" が出る
         m.segmenter = SegmenterMode::Manual;
         m.begin_session();
-        let line = m.start_command(camera()).to_line();
+        let line = m.start_command(camera(), Path::new("/d")).to_line();
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["segmenter"], "manual", "{line}");
         assert_eq!(v["source"]["kind"], "camera");
         // 動画ファイルでも同じ
         let v: serde_json::Value = serde_json::from_str(
-            &m.start_command(SourceSpec::File { path: "/a.mp4".into() }).to_line(),
+            &m.start_command(SourceSpec::File { path: "/a.mp4".into() }, Path::new("/d")).to_line(),
         )
         .unwrap();
         assert_eq!(v["segmenter"], "manual");
@@ -398,7 +585,7 @@ mod tests {
         assert!(m.mode_selectable());
         m.mode = AppMode::CaptureGuide;
         assert_eq!(
-            m.start_command(camera()),
+            m.start_command(camera(), Path::new("/d")),
             Command::Start { source: camera(), segmenter: SegmenterMode::Manual }
         );
         assert_eq!(m.segmenter, SegmenterMode::Auto, "ライブ認識の選択は変えない");
@@ -419,6 +606,175 @@ mod tests {
         assert!(m.toggle_allowed());
         m.apply(&result_ev("こんにちは", 0.99, false));
         assert_eq!(m.current.as_ref().unwrap().label, "こんにちは");
+    }
+
+    // ===== 撮影(録画あり)=====
+
+    fn cap_state(phase: &str, usable: Option<bool>) -> EngineEvent {
+        parse_event(
+            &serde_json::json!({
+                "type": "capture_state", "phase": phase, "countdown_left": 2.0, "rec_secs": 1.5, "max_secs": 10.0,
+                "fps": 30.0, "dropped": 0,
+                "word": {"word_id": "011", "romaji": "kare", "label": "かれ", "rep_idx": 4},
+                "data_dir": "/data/raw_jsl",
+                "verdict": usable.map(|u| serde_json::json!({
+                    "usable": u, "reasons": [], "summary": "判定", "longest_run_secs": 1.0, "left_run_secs": 0.0,
+                    "right_run_secs": 1.0, "duration_secs": 4.0, "quality_flag": if u { "ok" } else { "ng_hands" }
+                })),
+                "notes": ["注意"],
+            })
+            .to_string(),
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    fn running_capture_model() -> AppModel {
+        let mut m = AppModel::new();
+        m.mode = AppMode::Capture;
+        m.begin_session();
+        m.apply(&parse_event(r#"{"type":"ready","vocab":[],"segmenter":"manual"}"#).unwrap().unwrap());
+        assert_eq!(m.phase, Phase::Running);
+        m
+    }
+
+    // 撮影(録画): start は登録先つきの撮影モード。ライブ認識の選択は変えない。認識結果は出さない
+    #[test]
+    fn capture_mode_starts_in_capture_mode_with_the_data_dir() {
+        let camera = || SourceSpec::Camera { device: "0".into() };
+        let mut m = AppModel::new();
+        m.mode = AppMode::Capture;
+        assert!(m.mode.shows_guide());
+        assert!(AppMode::CaptureGuide.shows_guide() && !AppMode::Live.shows_guide());
+        assert_eq!(
+            m.start_command(camera(), Path::new("/a b/raw_jsl")),
+            Command::StartCapture { source: camera(), data_dir: "/a b/raw_jsl".into(), countdown_secs: None }
+        );
+        assert_eq!(m.segmenter, SegmenterMode::Auto, "ライブ認識の選択は変えない");
+        // ライブ認識・撮影ガイドの start には data_dir が付かない(書き込みうるエンジンを起動するのは撮影だけ)
+        for mode in [AppMode::Live, AppMode::CaptureGuide] {
+            m.mode = mode;
+            assert!(matches!(m.start_command(camera(), Path::new("/d")), Command::Start { .. }), "{mode:?}");
+        }
+        m.mode = AppMode::Capture;
+        m.begin_session();
+        m.apply(&parse_event(r#"{"type":"ready","vocab":[],"segmenter":"manual"}"#).unwrap().unwrap());
+        assert!(!m.toggle_allowed(), "撮影では toggle を送らない");
+        assert!(!m.segmenter_selectable());
+        m.apply(&result_ev("こんにちは", 0.99, false));
+        assert!(m.current.is_none() && m.history.is_empty(), "撮影では認識結果を出さない");
+    }
+
+    #[test]
+    fn capture_state_is_folded_and_phase_gates_the_commands() {
+        let mut m = running_capture_model();
+        let word = Some("011");
+        // 待機: 録画開始だけ。お題が出ていなければ開始できない
+        m.apply(&cap_state("idle", None));
+        assert_eq!(m.capture.phase, CapturePhase::Idle);
+        assert_eq!(m.record_command(word), Some(Command::CaptureRecord { word_id: Some("011".into()) }));
+        assert_eq!(m.record_command(None), None, "お題の語が読めていなければ録画しない");
+        assert_eq!(m.stop_command(), None);
+        assert_eq!(m.accept_command(), None);
+        assert_eq!(m.discard_command(), None);
+        assert!(m.retake_commands(word).is_empty());
+        assert_eq!(m.space_command(word), m.record_command(word));
+        // カウントダウン: 取り消し(停止・破棄)だけ
+        m.apply(&cap_state("countdown", None));
+        assert_eq!(m.capture.countdown_left, 2.0);
+        assert_eq!(m.record_command(word), None, "二重の開始はしない");
+        assert_eq!(m.stop_command(), Some(Command::CaptureStop));
+        assert_eq!(m.discard_command(), Some(Command::CaptureDiscard));
+        assert_eq!(m.space_command(word), Some(Command::CaptureStop));
+        // 録画中
+        m.apply(&cap_state("recording", None));
+        assert_eq!(m.capture.rec_secs, 1.5);
+        assert_eq!(m.capture.word.as_ref().unwrap().label, "かれ");
+        assert_eq!(m.capture.notes, vec!["注意"]);
+        assert_eq!(m.stop_command(), Some(Command::CaptureStop));
+        assert_eq!(m.accept_command(), None, "録画中は採用できない");
+        assert_eq!(m.space_command(word), Some(Command::CaptureStop));
+        // 判定中: 何もできない(スペースも効かない)
+        m.apply(&cap_state("judging", None));
+        assert_eq!(m.stop_command(), None);
+        assert_eq!(m.discard_command(), None);
+        assert_eq!(m.accept_command(), None);
+        assert_eq!(m.space_command(word), None);
+        // 判定済み(使える): 採用 / 撮り直し / 破棄。スペースは何もしない
+        m.apply(&cap_state("judged", Some(true)));
+        assert_eq!(m.accept_command(), Some(Command::CaptureAccept { confirm_ng: false }));
+        assert_eq!(m.discard_command(), Some(Command::CaptureDiscard));
+        assert_eq!(
+            m.retake_commands(word),
+            vec![Command::CaptureDiscard, Command::CaptureRecord { word_id: Some("011".into()) }]
+        );
+        assert!(m.retake_commands(None).is_empty());
+        assert_eq!(m.space_command(word), None, "判定済みでスペースを押しても、採用も撮り直しもしない");
+        // 判定済み(使えない): 採用は NG の確認つき
+        m.apply(&cap_state("judged", Some(false)));
+        assert_eq!(m.accept_command(), Some(Command::CaptureAccept { confirm_ng: true }));
+        // 知らない段階名は無視(直前の状態のまま)
+        m.apply(&cap_state("future_phase", None));
+        assert_eq!(m.capture.phase, CapturePhase::Judged);
+    }
+
+    #[test]
+    fn capture_commands_are_unavailable_outside_a_running_capture_session() {
+        let mut m = AppModel::new();
+        m.capture.phase = CapturePhase::Judged;
+        // ライブ認識・撮影ガイドでは撮影のコマンドは作らない
+        for mode in [AppMode::Live, AppMode::CaptureGuide] {
+            m.mode = mode;
+            m.phase = Phase::Running;
+            assert_eq!(m.accept_command(), None, "{mode:?}");
+            assert_eq!(m.record_command(Some("011")), None);
+            assert_eq!(m.space_command(Some("011")), None);
+        }
+        // 撮影でも、エンジンが動いていない・起動中・停止中は作らない
+        m.mode = AppMode::Capture;
+        for phase in [Phase::Idle, Phase::Starting, Phase::Stopping] {
+            m.phase = phase;
+            assert_eq!(m.accept_command(), None, "{phase:?}");
+            assert_eq!(m.discard_command(), None);
+        }
+    }
+
+    #[test]
+    fn capture_saved_is_remembered_and_logged_and_exit_resets_the_rest() {
+        let mut m = running_capture_model();
+        m.apply(&cap_state("recording", None));
+        m.apply(
+            &parse_event(
+                r#"{"type":"capture_saved","file_path":"011_kare/04.mp4","label":"かれ","rep_idx":4,"quality_flag":"ng_hands","usable":false,"data_dir":"/d"}"#,
+            )
+            .unwrap()
+            .unwrap(),
+        );
+        let saved = m.capture.last_saved.clone().unwrap();
+        assert_eq!((saved.file_path.as_str(), saved.rep_idx, saved.usable), ("011_kare/04.mp4", 4, false));
+        assert!(m.log[0].text.contains("011_kare/04.mp4") && m.log[0].text.contains("NG"), "{:?}", m.log[0]);
+        // 次の capture_state が来ても、直近の登録結果は残る
+        m.apply(&cap_state("idle", None));
+        assert!(m.capture.last_saved.is_some());
+        // エンジンが終わったら録画の途中状態は消え、登録結果だけ残る
+        m.apply(&cap_state("recording", None));
+        m.engine_exited();
+        assert_eq!(m.capture.phase, CapturePhase::Idle);
+        assert!(m.capture.word.is_none() && m.capture.notes.is_empty());
+        assert!(m.capture.last_saved.is_some());
+        // 次のセッション開始で全部消える
+        m.begin_session();
+        assert_eq!(m.capture, CaptureView::default());
+    }
+
+    #[test]
+    fn quality_flag_texts() {
+        assert_eq!(quality_flag_text("ok"), "有効なテイク");
+        assert!(quality_flag_text("ng_hands").starts_with("NG"));
+        assert!(quality_flag_text("ng_duration").starts_with("NG"));
+        assert_eq!(quality_flag_text(""), "判定なし");
+        assert_eq!(CapturePhase::parse("judging"), Some(CapturePhase::Judging));
+        assert_eq!(CapturePhase::parse("x"), None);
     }
 
     // 知らない種類のイベントは何も変えない

@@ -71,6 +71,51 @@ fn capture_guide_sources_have_no_write_apis() {
     }
 }
 
+/// R1 で追加した、撮影(録画あり)の**画面側**のソース。ここも書き込み・作成・削除・外部コマンド起動の API を
+/// 呼ばない。録画・判定・登録・一時ファイルの削除は、すべてエンジン側(pose_extractor/src/live/capture.rs)が
+/// 行い、画面は JSON のコマンド(`protocol.rs`)を送るだけ。
+/// - `capture_rec.rs`: 文字と色の判断(純関数)
+/// - `state.rs`: 画面の状態と、送ってよいコマンドの判断
+/// - `protocol.rs`: JSON の読み書き
+/// `capture_guide/` だけだった検査対象を、録画に関わる画面側のソースに広げた理由: R0 の意図
+/// (撮影ガイドの表示部分は読み取り専用)は R1 でも変わらず、画面側は書かない。
+/// `main.rs` / `engine.rs` はエンジンの子プロセスを起動する(`Command::new` を使う)ので対象外
+#[test]
+fn capture_recording_view_sources_have_no_write_apis() {
+    for name in ["capture_rec.rs", "state.rs", "protocol.rs"] {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join(name);
+        let full = std::fs::read_to_string(&path).unwrap();
+        // 各ファイル内のユニットテストは対象外(テストの準備で一時ファイルを作ることがあるため)
+        let text = match full.find("\n#[cfg(test)]\nmod tests {") {
+            Some(i) => &full[..i],
+            None => full.as_str(),
+        };
+        for bad in FORBIDDEN {
+            assert!(!text.contains(bad), "{} に書き込み系の API `{bad}` がある", path.display());
+        }
+        for (i, _) in text.match_indices("fs::") {
+            let rest = &text[i + 4..];
+            let n: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+            assert!(ALLOWED_FS.contains(&n.as_str()), "{} に読み取り以外の fs:: の使い方がある: fs::{n}", path.display());
+        }
+    }
+}
+
+/// 画面側が撮影(録画)を頼む唯一の手段は、エンジンへ JSON の 1 行を送ること
+#[test]
+fn recording_is_only_requested_through_engine_commands() {
+    use crate::protocol::Command;
+    let lines = [
+        Command::CaptureRecord { word_id: Some("001".into()) }.to_line(),
+        Command::CaptureStop.to_line(),
+        Command::CaptureAccept { confirm_ng: false }.to_line(),
+        Command::CaptureDiscard.to_line(),
+    ];
+    for l in lines {
+        assert!(l.starts_with('{') && l.ends_with('}') && !l.contains('\n'), "{l}");
+    }
+}
+
 /// ディレクトリの中身のスナップショット(相対パス → (大きさ, 更新時刻, 内容))
 fn snapshot(root: &Path) -> BTreeMap<String, (u64, std::time::SystemTime, Vec<u8>)> {
     fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, (u64, std::time::SystemTime, Vec<u8>)>) {

@@ -144,6 +144,11 @@ impl GuideState {
         }
     }
 
+    /// 次の `poll` ですぐ読み直させる(登録できた直後に、次の語・本数を更新するため)
+    pub fn force_reload(&mut self) {
+        self.last_reload = None;
+    }
+
     /// 進捗を読み直す(読むだけ)
     pub fn reload_progress(&mut self, now: Instant) {
         self.progress = Some(progress::load_progress_for(&self.data_dir_choice));

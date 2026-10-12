@@ -151,7 +151,7 @@ pub(super) enum StartMode {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub(super) struct StartCmd {
     pub(super) source: SourceSpec,
-    /// 省略時は既定のデモ用モデル
+    /// 省略時は環境変数 ATTENTION_MODEL_DIR、それも無ければ既定モデル(DEFAULT_MODEL_DIR = rec_t10_full)
     #[serde(default)]
     pub(super) model_dir: Option<String>,
     #[serde(default)]
@@ -1280,7 +1280,9 @@ impl std::error::Error for StopRequested {}
 /// `stop` は終了要求の旗。モデル読み込みには時間がかかるので、その間に quit などが来ていたら、
 /// カメラを起動する前に引き返す。`emitter` は画面への告知(warn)用
 fn build_real(start: &StartCmd, stop: &StopFlag, emitter: &Emitter) -> Result<Built> {
-    let model_dir = PathBuf::from(start.model_dir.as_deref().unwrap_or(DEFAULT_MODEL_DIR));
+    // 優先順位: start の model_dir > 環境変数 ATTENTION_MODEL_DIR > コード内の既定
+    let (model_dir, model_src) = resolve_model_dir(start.model_dir.as_deref());
+    ensure_model_dir(&model_dir, model_src)?;
     // 前処理(ROI・フレーム選択)は preprocess.json が最優先、無ければ live_wizard と同じ既定
     let (roi, select, frames, from_model) = match load_model_preprocess(&model_dir)? {
         Some(p) => (p.roi, p.select, p.frames.unwrap_or(SEQ_LEN), true),
@@ -3125,7 +3127,7 @@ mod tests {
         v[v.len() / 2]
     }
 
-    /// 実モデル(rec_demo_center_signspan)+ raw_jsl の動画で `serve` を通し、受け取った JSON 行の種類と件数、
+    /// 実モデル(既定の DEFAULT_MODEL_DIR = rec_t10_full)+ raw_jsl の動画で `serve` を通し、受け取った JSON 行の種類と件数、
     /// result の top-1、プレビュー無し/有りの処理 fps を出す(カメラは使わない)。
     /// 環境変数: ENGINE_JSON_VIDEOS(':' 区切り。既定は raw_jsl から 2 本)/ ENGINE_JSON_ROUNDS(既定 3)
     /// 手動実行: `cargo test engine_json_smoke --release -- --ignored --nocapture`

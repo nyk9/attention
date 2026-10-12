@@ -53,8 +53,78 @@ pub use json_engine::run_engine_json;
 // 設計: docs/desktop-capture-design.md
 mod capture;
 
-/// ライブ用の既定モデル(center-square + サイン区間の dict で学習済み。preprocess.json は無い)
-const DEFAULT_MODEL_DIR: &str = "../transformer_burn/models/rec_demo_center_signspan";
+/// ライブ用の既定モデル(51語 510テイク・handshape+標準化。preprocess.json を持つので、前処理は
+/// そこから決まる = full-frame + uniform)。旧既定の暫定デモ用モデル `rec_demo_center_signspan` は
+/// preprocess.json が無く、center-square + サイン区間のフォールバックで動く(モデルを直接指定した場合)
+const DEFAULT_MODEL_DIR: &str = "../transformer_burn/models/rec_t10_full";
+
+/// 既定モデルを実行時に差し替える環境変数。空文字なら無視してコード内の既定(`DEFAULT_MODEL_DIR`)。
+/// ウィザードでの入力や start コマンドの `model_dir` で明示された値が、これより優先される
+const MODEL_DIR_ENV: &str = "ATTENTION_MODEL_DIR";
+
+/// モデルのディレクトリがどこから決まったか(見つからないときの案内に使う)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelDirSource {
+    /// ウィザードの入力 / start コマンドの `model_dir`
+    Explicit,
+    /// 環境変数 `ATTENTION_MODEL_DIR`
+    Env,
+    /// コード内の既定 `DEFAULT_MODEL_DIR`
+    Default,
+}
+
+impl ModelDirSource {
+    fn describe(self) -> &'static str {
+        match self {
+            ModelDirSource::Explicit => "明示的な指定(ウィザードの入力 / start コマンドの model_dir)",
+            ModelDirSource::Env => "環境変数 ATTENTION_MODEL_DIR",
+            ModelDirSource::Default => "コード内の既定(DEFAULT_MODEL_DIR)",
+        }
+    }
+}
+
+/// モデルのディレクトリの優先順位: 明示 > 環境変数 > コード内の既定。
+/// 純関数(環境変数は読まない)。空文字・空白だけの値は「指定なし」として扱う
+// [TEST向き] 優先順位・空文字
+fn pick_model_dir(explicit: Option<&str>, env: Option<&str>) -> (String, ModelDirSource) {
+    let nonempty = |s: Option<&str>| s.map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+    if let Some(d) = nonempty(explicit) {
+        (d, ModelDirSource::Explicit)
+    } else if let Some(d) = nonempty(env) {
+        (d, ModelDirSource::Env)
+    } else {
+        (DEFAULT_MODEL_DIR.to_owned(), ModelDirSource::Default)
+    }
+}
+
+/// `pick_model_dir` に環境変数 `ATTENTION_MODEL_DIR` を渡して決める(環境変数を読むのはここだけ)
+fn resolve_model_dir(explicit: Option<&str>) -> (PathBuf, ModelDirSource) {
+    let env = std::env::var(MODEL_DIR_ENV).ok();
+    let (dir, src) = pick_model_dir(explicit, env.as_deref());
+    (PathBuf::from(dir), src)
+}
+
+/// モデルが見つからないときのエラー文言: 探した絶対パス・どこから決まったか・変え方
+// [TEST向き] 文言に 3 点が入る
+fn model_not_found_message(dir: &Path, src: ModelDirSource) -> String {
+    let abs = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+    format!(
+        "認識モデルが見つかりません(model.bin): {}\n  探した場所の決まり方: {}\n  変えるには: 環境変数 {} にモデルのディレクトリを指定するか、\
+         ウィザード / start コマンドの model_dir で指定してください(相対パスは作業ディレクトリ、通常は pose_extractor/ から)",
+        abs.join("model.bin").display(),
+        src.describe(),
+        MODEL_DIR_ENV
+    )
+}
+
+/// モデルのディレクトリに model.bin があることを確かめる。無ければ `model_not_found_message` のエラー
+fn ensure_model_dir(dir: &Path, src: ModelDirSource) -> Result<()> {
+    if dir.join("model.bin").is_file() {
+        Ok(())
+    } else {
+        anyhow::bail!("{}", model_not_found_message(dir, src))
+    }
+}
 
 /// カメラの取り込みサイズ。学習データ(1620x1080)と同じにするため、
 /// 1920x1080 で取って中央を 1620 幅に切る(座標は幅・高さで正規化され、手首の画像内座標が
@@ -1516,12 +1586,21 @@ pub fn live_wizard(theme: &ColorfulTheme) -> Result<()> {
         .default(0)
         .interact()?;
 
-    // 2. 認識モデル(既定: デモ用)
+    // 2. 認識モデル(既定: rec_t10_full)
+    //    入力欄の初期値は「環境変数 ATTENTION_MODEL_DIR > コード内の既定」。入力が初期値のままなら由来はそのまま、
+    //    書き換えられていたら明示扱い
+    let (default_dir, default_src) = resolve_model_dir(None);
+    let default_dir = default_dir.to_string_lossy().into_owned();
     let model_dir: String = Input::with_theme(theme)
         .with_prompt("認識モデルのディレクトリ")
-        .default(DEFAULT_MODEL_DIR.into())
+        .default(default_dir.clone())
         .interact_text()?;
-    let model_dir = PathBuf::from(model_dir.trim());
+    let (model_dir, model_src) = if model_dir.trim() == default_dir {
+        (PathBuf::from(default_dir), default_src)
+    } else {
+        resolve_model_dir(Some(&model_dir))
+    };
+    ensure_model_dir(&model_dir, model_src)?;
 
     // 3. 前処理(ROI・フレーム選択・フレーム数)。モデルの preprocess.json が最優先
     let (roi, select, frames) = match load_model_preprocess(&model_dir)? {
@@ -1543,7 +1622,7 @@ pub fn live_wizard(theme: &ColorfulTheme) -> Result<()> {
             let idx = Select::with_theme(theme)
                 .with_prompt("前処理")
                 .items(&[
-                    "中央正方クロップ + サイン区間(デモ用モデル rec_demo_center_signspan の学習時と同じ)",
+                    "中央正方クロップ + サイン区間(preprocess.json の無い暫定モデル rec_demo_center_signspan の学習時と同じ)",
                     "手動で選ぶ(ROI・フレームの選び方)",
                 ])
                 .default(0)
@@ -1677,6 +1756,62 @@ fn print_vocabulary(tags: &[String], labels: &Labels) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ===== モデルのディレクトリの決め方(優先順位・見つからないときの文言)=====
+
+    #[test]
+    fn model_dir_explicit_beats_env_and_default() {
+        let (d, s) = pick_model_dir(Some("/x/explicit"), Some("/x/env"));
+        assert_eq!((d.as_str(), s), ("/x/explicit", ModelDirSource::Explicit));
+    }
+
+    #[test]
+    fn model_dir_env_beats_default() {
+        let (d, s) = pick_model_dir(None, Some("/x/env"));
+        assert_eq!((d.as_str(), s), ("/x/env", ModelDirSource::Env));
+    }
+
+    #[test]
+    fn model_dir_falls_back_to_default() {
+        let (d, s) = pick_model_dir(None, None);
+        assert_eq!((d.as_str(), s), (DEFAULT_MODEL_DIR, ModelDirSource::Default));
+    }
+
+    #[test]
+    fn model_dir_empty_values_are_ignored() {
+        // 環境変数が空文字・空白だけ → 既定
+        assert_eq!(pick_model_dir(None, Some("")).1, ModelDirSource::Default);
+        assert_eq!(pick_model_dir(None, Some("  ")).1, ModelDirSource::Default);
+        // 明示が空 → 環境変数、環境変数も空 → 既定
+        assert_eq!(pick_model_dir(Some(""), Some("/x/env")).1, ModelDirSource::Env);
+        assert_eq!(pick_model_dir(Some(" "), Some("")).1, ModelDirSource::Default);
+        // 前後の空白は取る
+        assert_eq!(pick_model_dir(Some(" /a "), None).0, "/a");
+    }
+
+    #[test]
+    fn model_not_found_message_has_abs_path_source_and_env_name() {
+        for src in [ModelDirSource::Explicit, ModelDirSource::Env, ModelDirSource::Default] {
+            let msg = model_not_found_message(Path::new("no_such_dir/rec_x"), src);
+            let abs = std::path::absolute("no_such_dir/rec_x").unwrap();
+            assert!(msg.contains(abs.to_str().unwrap()), "絶対パス: {msg}");
+            assert!(msg.contains(src.describe()), "由来: {msg}");
+            assert!(msg.contains("ATTENTION_MODEL_DIR"), "変え方: {msg}");
+        }
+        assert!(model_not_found_message(Path::new("a"), ModelDirSource::Env).contains("環境変数 ATTENTION_MODEL_DIR"));
+    }
+
+    #[test]
+    fn ensure_model_dir_errors_when_model_bin_missing() {
+        let err = ensure_model_dir(Path::new("/nonexistent/rec_x"), ModelDirSource::Explicit).unwrap_err();
+        assert!(err.to_string().contains("/nonexistent/rec_x/model.bin"), "{err}");
+        // model.bin があれば通る(一時ディレクトリに空ファイルを置く)
+        let dir = std::env::temp_dir().join(format!("model_dir_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model.bin"), b"").unwrap();
+        assert!(ensure_model_dir(&dir, ModelDirSource::Default).is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     // ffmpeg が自分から止まって failure_reason が回収するとき、回収の前に before_reap が呼ばれる
     // (json_engine が PID の登録を外す。回収済みの PID に kill が飛ばないようにするため)。

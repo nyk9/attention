@@ -861,7 +861,10 @@ impl Verdict {
 
 /// 判定の材料から結論を出す。手が連続して検出できた最長区間は `progress::quality_flag_for_run`
 /// (撮影セッションの取り込みと同じ規則)、長さは `DURATION_MIN_MS` / `DURATION_MAX_MS`。
-/// quality_flag は、手が足りなければ "ng_hands"、手は足りていて長さだけ範囲外なら "ng_duration"(どちらも目標数に数えない)
+/// quality_flag は判定結果の種別: 手が足りなければ "ng_hands"、手は足りていて長さだけ範囲外なら "ng_duration"。
+/// **使えない判定のテイクは採用できない(破棄か撮り直しだけ。ユーザー決定 2026-10-12)ので、
+/// "ng_hands" / "ng_duration" が index.tsv に書かれる経路は撮影モードには無い**(画面に判定の理由を出すための種別)。
+/// index.tsv に書かれるのは、使える判定の "ok" だけ
 // [TEST向き] 純粋関数。手の境界(ちょうど 1.0 秒)・長さの境界(2 秒 / 10 秒)・理由の組み合わせ・コマ落ち
 pub(super) fn evaluate(outcome: &JudgeOutcome, dropped: u64) -> Verdict {
     let longest = outcome.left_secs.max(outcome.right_secs);
@@ -926,7 +929,7 @@ pub(super) fn evaluate(outcome: &JudgeOutcome, dropped: u64) -> Verdict {
 }
 
 /// 判定そのものができなかったとき(モデルが読めない・ffprobe の失敗など)。
-/// 撮影セッションの取り込みと同じく quality_flag は空にする(採用するなら、確認を求める)
+/// 使えるかどうか分からないので「使えない」扱い(= 採用できない。破棄か撮り直しだけ)。quality_flag は空
 pub(super) fn evaluate_failed(why: &str) -> Verdict {
     Verdict {
         usable: false,
@@ -1218,12 +1221,18 @@ pub(super) struct Registered {
 /// 2. 動画を移す(`rename`。別ボリュームならコピーして元を消す)。失敗したら一時 index を捨てて何も変えずに終わる
 /// 3. 一時 index を `rename` で本物に置き換える。失敗したら動画を元の場所に戻す
 /// `<NN>.mp4` が既にあれば番号を進める(上書きしない)
+///
+/// **使えない判定のテイクは登録しない**(何も変えずにエラーを返す)。呼び出し側(`cmd_accept`)も先に断るが、
+/// ここでも守る = 撮影モードから `ng_*` を index.tsv に書く経路を、部品の側でも作らない
 pub(super) fn register_take(
     data_dir: &Path,
     src: &Path,
     word_id: &str,
     verdict: &Verdict,
 ) -> Result<Registered> {
+    if !verdict.usable {
+        anyhow::bail!("使えないと判定されたテイクは登録しません(破棄か撮り直しを選んでください)");
+    }
     let words = progress::read_words(data_dir)?;
     let word = words
         .iter()
@@ -1415,7 +1424,7 @@ impl<'a> CaptureSession<'a> {
         match cmd {
             EngineCommand::CaptureRecord { word_id } => self.cmd_record(word_id),
             EngineCommand::CaptureStop => self.cmd_stop(),
-            EngineCommand::CaptureAccept { confirm_ng } => self.cmd_accept(confirm_ng),
+            EngineCommand::CaptureAccept => self.cmd_accept(),
             EngineCommand::CaptureDiscard => self.cmd_discard(),
             EngineCommand::Start(_) => self
                 .emitter
@@ -1497,7 +1506,9 @@ impl<'a> CaptureSession<'a> {
         }
     }
 
-    fn cmd_accept(&mut self, confirm_ng: bool) {
+    /// 採用。使えると判定されたテイクだけ。使えない(判定できなかった場合を含む)テイクは、
+    /// 警告を返して何も変えない(状態は判定済みのまま。破棄か撮り直しを選んでもらう)
+    fn cmd_accept(&mut self) {
         if let Err(why) = self.machine.can_accept() {
             self.warn(why);
             return;
@@ -1508,8 +1519,8 @@ impl<'a> CaptureSession<'a> {
             self.warn("採用する録画がありません");
             return;
         };
-        if !verdict.usable && !confirm_ng {
-            self.warn("使えないと判定されたテイクです。NG フラグ付きで記録するには、確認のうえで採用してください");
+        if !verdict.usable {
+            self.warn("使えないと判定されたテイクは採用できません。破棄するか、撮り直してください");
             return;
         }
         match register_take(&self.cfg.data_dir, &src, &word.word_id, &verdict) {
@@ -1521,7 +1532,6 @@ impl<'a> CaptureSession<'a> {
                     label: reg.word.label_ja.clone(),
                     rep_idx: reg.rep_idx,
                     quality_flag: reg.quality_flag.clone(),
-                    usable: verdict.usable,
                     longest_run_secs: round_to(verdict.longest() as f64, 2),
                     duration_secs: round_to(verdict.duration_ms as f64 / 1000.0, 2),
                     data_dir: self.data_dir_text.clone(),
@@ -2426,24 +2436,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    // 使えない判定のテイク(手が足りない・長さが範囲外・判定できなかった)は登録を拒み、何も変えない。
+    // 番号も進まず(次に使える録画が登録されたら、その番号は 02)、index.tsv に ng の跡も残らない
     #[test]
-    fn register_take_records_ng_flag_and_advances_the_number() {
+    fn register_take_refuses_unusable_verdicts_and_changes_nothing() {
         let root = scratch("registerng");
         let data = make_data_dir(&root);
+        let before = snapshot(&data);
         let src = root.join("take-1.mp4");
         std::fs::write(&src, b"bad").unwrap();
-        let bad = evaluate(&outcome(0.33, 0.0, 4000), 0);
-        let reg = register_take(&data, &src, "001", &bad).unwrap();
-        assert_eq!(reg.quality_flag, "ng_hands");
-        let index = std::fs::read_to_string(data.join("index.tsv")).unwrap();
-        assert!(index.lines().last().unwrap().contains("\tng_hands\t"), "{index}");
-        // 番号は進む(撮影セッションの ng の扱いと同じ)。ng は目標数に数えない
+        for bad in [
+            evaluate(&outcome(0.33, 0.0, 4000), 0), // ng_hands
+            evaluate(&outcome(2.0, 0.0, 1999), 0),  // ng_duration
+            evaluate_failed("モデルが読めません"),  // 判定できなかった
+        ] {
+            assert!(!bad.usable);
+            let e = register_take(&data, &src, "001", &bad).unwrap_err();
+            assert!(format!("{e:#}").contains("使えないと判定"), "{e:#}");
+            assert_eq!(snapshot(&data), before, "登録先は 1 バイトも変わらない");
+            assert!(src.exists(), "録画は元の場所に残る(破棄は呼び出し側)");
+        }
         let src2 = root.join("take-2.mp4");
         std::fs::write(&src2, b"good").unwrap();
-        assert_eq!(register_take(&data, &src2, "001", &verdict_ok()).unwrap().rep_idx, 3);
+        let reg = register_take(&data, &src2, "001", &verdict_ok()).unwrap();
+        assert_eq!(reg.rep_idx, 2, "ng を拒んだので番号は進んでいない");
+        let index = std::fs::read_to_string(data.join("index.tsv")).unwrap();
+        assert!(!index.contains("ng_"), "ng の跡は残らない: {index}");
         let rows = progress::load_index(&data.join("index.tsv")).unwrap();
-        let counts = progress::take_counts(&rows);
-        assert_eq!(counts["001"], (2, 1), "有効 2(01 と 03)、NG 1(02)");
+        assert_eq!(progress::take_counts(&rows)["001"], (2, 0));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2726,12 +2746,11 @@ mod tests {
         assert_eq!(judged["verdict"]["quality_flag"], "ok");
         assert_eq!(judged["word"]["label"], "かれ");
 
-        h.send(EngineCommand::CaptureAccept { confirm_ng: false });
+        h.send(EngineCommand::CaptureAccept);
         let saved = h.wait("capture_saved", |e| e["type"] == "capture_saved");
         assert_eq!(saved["file_path"], "011_kare/01.mp4");
         assert_eq!(saved["rep_idx"], 1);
         assert_eq!(saved["quality_flag"], "ok");
-        assert_eq!(saved["usable"], true);
         assert_eq!(saved["data_dir"], h.data.to_string_lossy().as_ref());
         h.wait_phase("idle");
         assert!(h.data.join("011_kare/01.mp4").is_file());
@@ -2813,47 +2832,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    // 使えないテイク: 確認なしでは記録しない。確認つきなら ng 付きで記録し、番号は進む
+    // 使えないテイクは採用を拒否される(ユーザー決定 2026-10-12)。登録先も一時領域も、
+    // index.tsv も 1 バイトも変わらず、判定済みのまま。破棄か撮り直しなら選べて、番号は進まない
     #[test]
-    fn unusable_take_needs_confirmation_and_is_recorded_as_ng() {
+    fn unusable_take_cannot_be_accepted_only_discarded_or_retaken() {
         let h = Harness::start(Opts {
             judge: Ok(outcome(0.0, 0.33, 4000)),
             ..Opts::default()
         });
         h.wait_phase("idle");
+        let data_before = words_dir_state_after(&h);
         h.record("001");
         h.wait_phase("recording");
         h.send(EngineCommand::CaptureStop);
         let judged = h.wait_phase("judged");
         assert_eq!(judged["verdict"]["usable"], false);
         assert_eq!(judged["verdict"]["reasons"][0], "hands_short");
-        assert_eq!(judged["verdict"]["quality_flag"], "ng_hands");
+        assert_eq!(judged["verdict"]["quality_flag"], "ng_hands", "判定の種別としては残る(理由の表示用)");
         assert!(judged["verdict"]["summary"].as_str().unwrap().starts_with("使えない"));
-        let before = words_dir_state_after(&h);
-        // 確認なしの採用は断られ、何も書かれない(判定済みのまま)
-        h.send(EngineCommand::CaptureAccept { confirm_ng: false });
-        h.wait("断りの警告", |e| e["type"] == "message" && e["level"] == "warn" && e["text"].as_str().unwrap().contains("使えないと判定"));
-        assert_eq!(words_dir_state_after(&h), before);
+        let everything_before = snapshot(&h.root);
+        // 採用は断られる。何度送っても同じ。登録先・一時領域・index.tsv のどれも変わらない
+        for _ in 0..2 {
+            h.send(EngineCommand::CaptureAccept);
+        }
+        h.wait("断りの警告", |e| e["type"] == "message" && e["level"] == "warn" && e["text"].as_str().unwrap().contains("採用できません"));
+        // 警告が 2 件届いてから確かめる
+        h.wait("2 件目の断り", |_| h.buf.events().iter().filter(|e| e["type"] == "message" && e["text"].as_str().is_some_and(|t| t.contains("採用できません"))).count() == 2);
+        assert_eq!(snapshot(&h.root), everything_before);
         assert!(!h.types().contains(&"capture_saved".to_string()));
-        assert_eq!(h.tmp_files().len(), 1);
-        // 確認つき → ng_hands で記録、番号 02
-        h.send(EngineCommand::CaptureAccept { confirm_ng: true });
-        let saved = h.wait("capture_saved", |e| e["type"] == "capture_saved");
-        assert_eq!(saved["file_path"], "001_konnichiwa/02.mp4");
-        assert_eq!(saved["quality_flag"], "ng_hands");
-        assert_eq!(saved["usable"], false);
-        let index = std::fs::read_to_string(h.data.join("index.tsv")).unwrap();
-        assert!(index.lines().last().unwrap().contains("\tng_hands\t"), "{index}");
+        assert_eq!(h.tmp_files().len(), 1, "録画は一時領域に残ったまま");
+        // 状態は判定済みのまま(破棄・撮り直しが選べる)
+        h.send(EngineCommand::CaptureDiscard);
+        h.wait_phase("idle");
+        assert!(h.tmp_files().is_empty());
+        assert_eq!(words_dir_state_after(&h), data_before, "ng の跡は index.tsv にも残らない");
+        // 撮り直し: 次の録画は同じ語の同じ番号(01 ではなく既存の次の 02。ng で番号は進んでいない)
+        h.record("001");
+        let rec = h.wait_phase("recording");
+        assert_eq!(rec["word"]["rep_idx"], 2);
         let (_, res, root, _) = h.finish();
         res.unwrap();
         let _ = std::fs::remove_dir_all(root);
     }
 
-    // 判定そのものの失敗: 判定できなかったと出し、確認つきなら flag 空で記録
+    // 判定そのものの失敗: 判定できなかったと出し、採用は断られる(使えるかどうか分からないテイクは記録しない)
     #[test]
-    fn judge_failure_is_reported_and_needs_confirmation() {
+    fn judge_failure_is_reported_and_cannot_be_accepted() {
         let h = Harness::start(Opts {
             judge: Err("モデルが読めません"),
+            ..Opts::default()
+        });
+        h.wait_phase("idle");
+        let before = snapshot(&h.root);
+        h.record("011");
+        h.wait_phase("recording");
+        h.send(EngineCommand::CaptureStop);
+        let judged = h.wait_phase("judged");
+        assert_eq!(judged["verdict"]["reasons"][0], "judge_failed");
+        assert!(judged["verdict"]["summary"].as_str().unwrap().contains("判定できませんでした"));
+        h.send(EngineCommand::CaptureAccept);
+        h.wait("断りの警告", |e| e["type"] == "message" && e["level"] == "warn" && e["text"].as_str().unwrap().contains("採用できません"));
+        assert!(!h.data.join("011_kare").exists());
+        assert!(!h.types().contains(&"capture_saved".to_string()));
+        h.send(EngineCommand::CaptureDiscard);
+        h.wait_phase("idle");
+        assert_eq!(snapshot(&h.root), before, "登録先も一時領域も録画前に戻る");
+        let (_, res, root, _) = h.finish();
+        res.unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // 長さだけが範囲外のテイク(ng_duration の判定)も採用は断られる
+    #[test]
+    fn out_of_range_duration_cannot_be_accepted() {
+        let h = Harness::start(Opts {
+            judge: Ok(outcome(2.0, 0.0, 1500)),
             ..Opts::default()
         });
         h.wait_phase("idle");
@@ -2861,14 +2914,13 @@ mod tests {
         h.wait_phase("recording");
         h.send(EngineCommand::CaptureStop);
         let judged = h.wait_phase("judged");
-        assert_eq!(judged["verdict"]["reasons"][0], "judge_failed");
-        assert!(judged["verdict"]["summary"].as_str().unwrap().contains("判定できませんでした"));
-        h.send(EngineCommand::CaptureAccept { confirm_ng: false });
-        h.wait("断りの警告", |e| e["type"] == "message" && e["level"] == "warn");
-        assert!(!h.data.join("011_kare").exists());
-        h.send(EngineCommand::CaptureAccept { confirm_ng: true });
-        let saved = h.wait("capture_saved", |e| e["type"] == "capture_saved");
-        assert_eq!(saved["quality_flag"], "");
+        assert_eq!(judged["verdict"]["reasons"][0], "too_short");
+        assert_eq!(judged["verdict"]["quality_flag"], "ng_duration");
+        let before = snapshot(&h.root);
+        h.send(EngineCommand::CaptureAccept);
+        h.wait("断りの警告", |e| e["type"] == "message" && e["level"] == "warn" && e["text"].as_str().unwrap().contains("採用できません"));
+        assert_eq!(snapshot(&h.root), before);
+        assert!(!h.types().contains(&"capture_saved".to_string()));
         let (_, res, root, _) = h.finish();
         res.unwrap();
         let _ = std::fs::remove_dir_all(root);
@@ -2966,7 +3018,7 @@ mod tests {
         h.wait_phase("idle");
         let before = words_dir_state_after(&h);
         h.send(EngineCommand::CaptureStop);
-        h.send(EngineCommand::CaptureAccept { confirm_ng: true });
+        h.send(EngineCommand::CaptureAccept);
         h.send(EngineCommand::CaptureDiscard);
         h.send(EngineCommand::Toggle);
         h.record("999");

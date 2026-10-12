@@ -187,12 +187,10 @@ pub(super) enum Command {
     },
     /// 撮影モードだけ: 録画停止(カウントダウン中なら取り消し)
     CaptureStop,
-    /// 撮影モードだけ: 採用(登録先へ移して index.tsv に記帳)。使えないと判定されたテイクは
-    /// `confirm_ng: true` のときだけ、NG フラグ付きで記録する
-    CaptureAccept {
-        #[serde(default)]
-        confirm_ng: bool,
-    },
+    /// 撮影モードだけ: 採用(登録先へ移して index.tsv に記帳)。使えると判定されたテイクだけ。
+    /// 使えないと判定されたテイクは、エンジンが警告を返して拒否する(破棄か撮り直しだけ。ユーザー決定 2026-10-12)。
+    /// 以前あった `confirm_ng` は廃止(古い画面が付けて送ってきても、未知のフィールドとして読み捨てる)
+    CaptureAccept,
     /// 撮影モードだけ: 破棄(一時ファイルを消す。撮り直しは破棄してから次の録画)
     CaptureDiscard,
 }
@@ -325,9 +323,8 @@ pub(super) enum Event {
         word_id: String,
         label: String,
         rep_idx: u32,
-        /// index.tsv に書いた値("ok" | "ng_hands" | "ng_duration" | "")
+        /// index.tsv に書いた値。撮影モードは使えると判定されたテイクしか登録しないので、常に "ok"
         quality_flag: String,
-        usable: bool,
         longest_run_secs: f64,
         duration_secs: f64,
         data_dir: String,
@@ -357,7 +354,9 @@ pub(super) struct VerdictView {
     pub(super) left_run_secs: f64,
     pub(super) right_run_secs: f64,
     pub(super) duration_secs: f64,
-    /// 採用したときに index.tsv へ書く値("ok" | "ng_hands" | "ng_duration" | 判定できなかったときは "")
+    /// 判定結果の種別("ok" | "ng_hands" | "ng_duration" | 判定できなかったときは "")。
+    /// index.tsv に書かれるのは "ok"(使えると判定され、採用されたテイク)だけ。ほかの値は、使えない理由を画面に出すためで、
+    /// 使えないテイクは採用できない(破棄か撮り直し)ので書き込み経路は無い
     pub(super) quality_flag: String,
 }
 
@@ -818,7 +817,7 @@ impl KeySource for JsonKeys {
                 Ok(Input::Cmd(
                     Command::CaptureRecord { .. }
                     | Command::CaptureStop
-                    | Command::CaptureAccept { .. }
+                    | Command::CaptureAccept
                     | Command::CaptureDiscard,
                 )) => {
                     self.emitter.message(
@@ -1869,7 +1868,6 @@ mod tests {
             label: "かれ".into(),
             rep_idx: 4,
             quality_flag: "ok".into(),
-            usable: true,
             longest_run_secs: 1.67,
             duration_secs: 4.2,
             data_dir: "/data/raw_jsl".into(),
@@ -1884,7 +1882,6 @@ mod tests {
                 "label": "かれ",
                 "rep_idx": 4,
                 "quality_flag": "ok",
-                "usable": true,
                 "longest_run_secs": 1.67,
                 "duration_secs": 4.2,
                 "data_dir": "/data/raw_jsl"
@@ -1904,14 +1901,11 @@ mod tests {
             Command::CaptureRecord { word_id: None }
         );
         assert_eq!(parse_command(r#"{"cmd":"capture_stop"}"#).unwrap().unwrap(), Command::CaptureStop);
+        assert_eq!(parse_command(r#"{"cmd":"capture_accept"}"#).unwrap().unwrap(), Command::CaptureAccept);
         assert_eq!(
             parse_command(r#"{"cmd":"capture_accept","confirm_ng":true}"#).unwrap().unwrap(),
-            Command::CaptureAccept { confirm_ng: true }
-        );
-        assert_eq!(
-            parse_command(r#"{"cmd":"capture_accept"}"#).unwrap().unwrap(),
-            Command::CaptureAccept { confirm_ng: false },
-            "confirm_ng 省略 = false(使えないテイクは確認なしでは記録しない)"
+            Command::CaptureAccept,
+            "廃止した confirm_ng を付けてきても読み捨てるだけ(使えないテイクの採用は拒否されるので、NG 記録の経路にはならない)"
         );
         assert_eq!(parse_command(r#"{"cmd":"capture_discard"}"#).unwrap().unwrap(), Command::CaptureDiscard);
         // start: mode 省略 = live。capture では data_dir / countdown_secs を受ける
@@ -2790,7 +2784,7 @@ mod tests {
                 Input::Cmd(Command::Start(start_file(SegKind::Auto, Some(None)))),
                 Input::Cmd(Command::CaptureRecord { word_id: Some("001".into()) }),
                 Input::Cmd(Command::CaptureStop),
-                Input::Cmd(Command::CaptureAccept { confirm_ng: true }),
+                Input::Cmd(Command::CaptureAccept),
                 Input::Cmd(Command::CaptureDiscard),
                 Input::Cmd(Command::Quit),
             ],

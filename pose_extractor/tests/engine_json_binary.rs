@@ -704,7 +704,7 @@ fn live_mode_never_writes_to_temp_or_data_dir() {
     e.wait_for("ready", Duration::from_secs(120));
     e.send(r#"{"cmd":"toggle"}"#);
     e.send(r#"{"cmd":"capture_record","word_id":"001"}"#);
-    e.send(r#"{"cmd":"capture_accept","confirm_ng":true}"#);
+    e.send(r#"{"cmd":"capture_accept"}"#);
     e.send(r#"{"cmd":"toggle"}"#);
     // (映像が来ないカメラでは、ループが 1 枚目を待っているあいだコマンドは読まれない。
     //  撮影用のコマンドが警告されて無視されることは、ユニットテスト live_mode_ignores_capture_commands で確認している)
@@ -791,12 +791,12 @@ fn capture_file_input_end_to_end() {
     eprintln!("判定: {}", v);
     assert!(v["summary"].as_str().unwrap().len() > 5);
     assert!(v["duration_secs"].as_f64().unwrap() > 2.5, "約 3.2 秒以上録画したはず: {v}");
-    let usable = v["usable"].as_bool().unwrap();
-    e.send(&json!({"cmd":"capture_accept","confirm_ng":!usable}).to_string());
+    // 使えない判定の動画だとこのテストの前提(採用して登録)が成り立たない。入力動画を変えて試すこと
+    assert!(v["usable"].as_bool().unwrap(), "入力動画が「使えない」と判定された(採用は拒否される): {v}");
+    e.send(r#"{"cmd":"capture_accept"}"#);
     let saved = e.wait_for("capture_saved", Duration::from_secs(30));
     assert_eq!(saved["file_path"], "011_kare/01.mp4");
-    assert_eq!(saved["usable"], usable);
-    assert_eq!(saved["quality_flag"], if usable { "ok" } else { v["quality_flag"].as_str().unwrap() });
+    assert_eq!(saved["quality_flag"], "ok");
     let dest = data.join("011_kare/01.mp4");
     assert!(dest.is_file());
     assert_eq!(std::fs::read_dir(&tmp_dir).unwrap().count(), 0, "移したので一時領域は空");

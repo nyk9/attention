@@ -112,21 +112,91 @@ pub fn origin_note(origin: DataDirOrigin) -> String {
     }
 }
 
-/// 採用ボタンの文言。登録名を添えて、押す前に何が起きるか分かるようにする。
-/// 使えないテイクは「NG として記録」と明示する(番号は進み、目標数には数えない)
+/// 採用ボタンの文言(使えると判定されたテイクだけに出す)。登録名を添えて、押す前に何が起きるか分かるようにする。
+/// 使えないと判定されたテイクには採用ボタンを出さない(破棄か撮り直しだけ)ので、「NG として記録」という文言は無い
 // [TEST向き] 純関数
 pub fn accept_label(v: &CaptureView) -> String {
     let name = v.word.as_ref().map(planned_name).unwrap_or_default();
-    let usable = v.verdict.as_ref().is_some_and(|d| d.usable);
-    if usable {
-        format!("採用して登録({name})")
-    } else {
-        format!("NG として記録({name})")
-    }
+    format!("採用して登録({name})")
 }
 
-/// 使えないテイクを NG で記録したときの説明
-pub const NG_ACCEPT_NOTE: &str = "NG として記録すると、番号は進み、目標のテイク数には数えられません";
+/// 使えないと判定されたテイクのとき、採用ボタンの代わりに出す説明(ユーザー決定 2026-10-12: ng のテイクは捨てる)。
+/// 記録には残らず、番号も進まない
+pub const UNUSABLE_NOTE: &str =
+    "使えないと判定されたテイクは登録できません。記録にも残らず、番号も進みません。撮り直すか、破棄してください";
+
+/// 本物のデータへの書き込み前の確認。**本物**とは、登録先が環境変数 ATTENTION_DATA_DIR の指定でない場合
+/// (既定の場所・本体チェックアウトへのフォールバック)。そのアプリ起動中の最初の採用だけ確認し、
+/// 一度「はい」と答えたら以後は聞かない。環境変数指定(テスト用の場所)では聞かない
+// [TEST向き] 純関数
+pub fn needs_real_data_confirmation(origin: DataDirOrigin, already_confirmed: bool) -> bool {
+    origin != DataDirOrigin::Env && !already_confirmed
+}
+
+/// 確認の文言
+// [TEST向き] 純関数
+pub fn confirm_prompt(data_dir: &str, planned_name: &str) -> String {
+    format!("撮影済みの本物のデータ({data_dir})に {planned_name} を書き込みます。よろしいですか")
+}
+
+/// 採用ボタンを押したときの扱い
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcceptStep {
+    /// そのまま採用をエンジンへ送る
+    Send,
+    /// 確認を出す(まだ送らない)
+    Ask,
+}
+
+/// 本物のデータへの書き込みの確認の状態。**アプリ起動中の最初の採用だけ**確認するための記憶
+/// (撮影セッションを開始し直しても、起動中は覚えている)と、いま確認を出しているかどうか。
+/// 確認が必要かの判定は `needs_real_data_confirmation`
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AcceptGate {
+    /// この起動中に「はい」と答えた
+    confirmed: bool,
+    /// 確認を出している最中
+    asking: bool,
+}
+
+impl AcceptGate {
+    pub fn asking(&self) -> bool {
+        self.asking
+    }
+
+    /// 採用ボタンが押された。確認が必要なら `Ask`(確認を出す。送らない)、不要なら `Send`
+    pub fn press_accept(&mut self, origin: DataDirOrigin) -> AcceptStep {
+        if needs_real_data_confirmation(origin, self.confirmed) {
+            self.asking = true;
+            AcceptStep::Ask
+        } else {
+            self.asking = false;
+            AcceptStep::Send
+        }
+    }
+
+    /// 確認に「はい」。確認を出していたときだけ true(= 採用を送ってよい)。以後この起動中は聞かない
+    pub fn confirm(&mut self) -> bool {
+        if !self.asking {
+            return false;
+        }
+        self.asking = false;
+        self.confirmed = true;
+        true
+    }
+
+    /// 確認に「いいえ」(やめる)。何も変えず、判定済みの表示に戻る。確認済みにはしない
+    pub fn cancel(&mut self) {
+        self.asking = false;
+    }
+
+    /// 判定済みでなくなったら確認を閉じる(破棄・撮り直し・エンジン終了などで、前のテイクの確認が次のテイクに残らないように)
+    pub fn sync_phase(&mut self, judged: bool) {
+        if !judged {
+            self.asking = false;
+        }
+    }
+}
 
 /// 直近の登録結果の 1 行
 // [TEST向き] 純関数
@@ -144,7 +214,7 @@ pub fn reason_hint(code: &str) -> &'static str {
         "hands_short" => "手を枠の中で、もう少し長く見せてください",
         "too_short" => "もう少し長く撮ってください",
         "too_long" => "もう少し短く撮ってください",
-        "judge_failed" => "判定できませんでした。登録するかは自分で決めてください",
+        "judge_failed" => "判定できませんでした。使えるか分からないテイクは登録できないので、撮り直してください",
         _ => "",
     }
 }
@@ -234,14 +304,64 @@ mod tests {
     }
 
     #[test]
-    fn accept_label_names_the_destination_and_marks_ng() {
+    fn accept_label_names_the_destination() {
         let mut v = view(CapturePhase::Judged);
         v.word = Some(word());
         v.verdict = Some(verdict(true));
         assert_eq!(accept_label(&v), "採用して登録(011_kare/04.mp4)");
-        v.verdict = Some(verdict(false));
-        assert_eq!(accept_label(&v), "NG として記録(011_kare/04.mp4)");
-        assert!(NG_ACCEPT_NOTE.contains("目標") && NG_ACCEPT_NOTE.contains("番号"));
+        assert!(!accept_label(&v).contains("NG"), "NG として記録する経路は無い");
+        assert!(UNUSABLE_NOTE.contains("登録できません") && UNUSABLE_NOTE.contains("番号も進みません"));
+        assert!(!UNUSABLE_NOTE.contains("NG として記録"));
+    }
+
+    // 確認が要るのは「環境変数指定でない」かつ「この起動中にまだ確認していない」とき
+    #[test]
+    fn real_data_confirmation_is_needed_only_off_env_and_before_the_first_yes() {
+        assert!(needs_real_data_confirmation(DataDirOrigin::Default, false));
+        assert!(needs_real_data_confirmation(DataDirOrigin::MainCheckout, false));
+        assert!(!needs_real_data_confirmation(DataDirOrigin::Env, false), "テスト用の場所では聞かない");
+        assert!(!needs_real_data_confirmation(DataDirOrigin::Default, true));
+        assert!(!needs_real_data_confirmation(DataDirOrigin::MainCheckout, true));
+        assert_eq!(
+            confirm_prompt("/repo/transformer_burn/data/raw_jsl", "011_kare/04.mp4"),
+            "撮影済みの本物のデータ(/repo/transformer_burn/data/raw_jsl)に 011_kare/04.mp4 を書き込みます。よろしいですか"
+        );
+    }
+
+    // 「はい」→ 採用を送る・以後は聞かない。「いいえ」→ 何も送らず、確認済みにもしない(次の採用でまた聞く)
+    #[test]
+    fn accept_gate_asks_once_per_app_run_and_no_resets_nothing() {
+        let mut g = AcceptGate::default();
+        assert!(!g.asking());
+        // 本物のデータ: 最初は確認を出す(まだ送らない)
+        assert_eq!(g.press_accept(DataDirOrigin::Default), AcceptStep::Ask);
+        assert!(g.asking());
+        // 「いいえ」: 閉じるだけ。確認済みにならない
+        g.cancel();
+        assert!(!g.asking());
+        assert!(!g.confirm(), "確認を出していないときの「はい」は無効(何も送らない)");
+        assert_eq!(g.press_accept(DataDirOrigin::Default), AcceptStep::Ask, "「いいえ」の後はまた聞く");
+        // 「はい」: 送ってよい。以後この起動中は聞かない
+        assert!(g.confirm());
+        assert!(!g.asking());
+        assert_eq!(g.press_accept(DataDirOrigin::Default), AcceptStep::Send);
+        assert_eq!(g.press_accept(DataDirOrigin::MainCheckout), AcceptStep::Send);
+        assert!(!g.asking());
+    }
+
+    #[test]
+    fn accept_gate_never_asks_for_env_dirs_and_closes_when_not_judged() {
+        let mut g = AcceptGate::default();
+        assert_eq!(g.press_accept(DataDirOrigin::Env), AcceptStep::Send);
+        assert!(!g.asking());
+        // 環境変数指定で送っても、本物の場所の確認済みにはならない(別の場所に変われば聞く)
+        assert_eq!(g.press_accept(DataDirOrigin::Default), AcceptStep::Ask);
+        // 判定済みでなくなったら確認は閉じる(次のテイクに残らない)。確認済みにはならない
+        g.sync_phase(true);
+        assert!(g.asking(), "判定済みのあいだは出したまま");
+        g.sync_phase(false);
+        assert!(!g.asking());
+        assert_eq!(g.press_accept(DataDirOrigin::Default), AcceptStep::Ask);
     }
 
     #[test]
@@ -251,7 +371,6 @@ mod tests {
             label: "かれ".into(),
             rep_idx: 4,
             quality_flag: "ok".into(),
-            usable: true,
         };
         assert_eq!(saved_text(&s), "登録しました: 011_kare/04.mp4(有効なテイク)");
     }

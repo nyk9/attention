@@ -101,6 +101,8 @@ struct LiveApp {
     guide: GuideState,
     /// 診断用: 前回ログに出した撮影ガイドの表示内容(変化したときだけ出す)
     last_guide_log: String,
+    /// 本物のデータへの書き込み前の確認の状態(撮影の採用。アプリ起動中の最初の採用だけ確認する)
+    accept_gate: capture_rec::AcceptGate,
 }
 
 impl LiveApp {
@@ -165,6 +167,7 @@ impl LiveApp {
             frames_shown: 0,
             guide: GuideState::from_choice(data_choice),
             last_guide_log: String::new(),
+            accept_gate: capture_rec::AcceptGate::default(),
         };
 
         // 開発・検証用: ATTENTION_APP_MODE=capture-guide で撮影ガイドモードから始める
@@ -266,9 +269,34 @@ impl LiveApp {
         self.send_capture(cmds, cx);
     }
 
+    /// 採用ボタン。使えると判定されたテイクだけ(`accept_command` が決める)。
+    /// 登録先が本物のデータ(環境変数指定でない場所)で、この起動中にまだ確認していなければ、送る前に確認を出す
     fn capture_accept(&mut self, cx: &mut Context<Self>) {
-        let cmds: Vec<Command> = self.model.accept_command().into_iter().collect();
-        self.send_capture(cmds, cx);
+        if self.model.accept_command().is_none() {
+            return;
+        }
+        match self.accept_gate.press_accept(self.guide.data_dir_choice.origin) {
+            capture_rec::AcceptStep::Send => {
+                let cmds: Vec<Command> = self.model.accept_command().into_iter().collect();
+                self.send_capture(cmds, cx);
+            }
+            capture_rec::AcceptStep::Ask => cx.notify(),
+        }
+    }
+
+    /// 確認に「はい」: 採用を送る。以後この起動中は確認しない
+    fn capture_accept_yes(&mut self, cx: &mut Context<Self>) {
+        if self.accept_gate.confirm() {
+            let cmds: Vec<Command> = self.model.accept_command().into_iter().collect();
+            self.send_capture(cmds, cx);
+        }
+        cx.notify();
+    }
+
+    /// 確認に「いいえ」: 何も送らず、判定済みの表示に戻る
+    fn capture_accept_no(&mut self, cx: &mut Context<Self>) {
+        self.accept_gate.cancel();
+        cx.notify();
     }
 
     fn capture_discard(&mut self, cx: &mut Context<Self>) {
@@ -291,6 +319,8 @@ impl LiveApp {
             "record" => self.capture_record(cx),
             "stop" => self.capture_stop(cx),
             "accept" => self.capture_accept(cx),
+            "accept_yes" => self.capture_accept_yes(cx),
+            "accept_no" => self.capture_accept_no(cx),
             "discard" => self.capture_discard(cx),
             "retake" => self.capture_retake(cx),
             "space" => self.toggle(cx),
@@ -355,6 +385,12 @@ impl LiveApp {
 
     /// Inbox から最新の状態を取り出して反映する(UI スレッドで定期的に呼ばれる)
     fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 判定済みでなくなったら(破棄・撮り直し・エンジン終了など)、採用の確認は閉じる
+        let judged = self.model.capture_running_judged();
+        if self.accept_gate.asking() && !judged {
+            self.accept_gate.sync_phase(false);
+            cx.notify();
+        }
         // 撮影ガイド: お題と進捗を定期的に読み直す(読むだけ。エンジンが動いていなくても表示する)
         if self.model.mode.shows_guide() && self.guide.reload_due(Instant::now()) {
             self.guide.reload_progress(Instant::now());
@@ -1137,27 +1173,52 @@ impl LiveApp {
                 }
                 CapturePhase::Judged => {
                     let usable = c.verdict.as_ref().is_some_and(|v| v.usable);
-                    let accept = Button::new("cap-accept")
-                        .large()
-                        .label(SharedString::from(capture_rec::accept_label(c)))
-                        .on_click(cx.listener(|this, _, _w, cx| this.capture_accept(cx)));
-                    buttons = buttons
-                        .child(if usable { accept.primary() } else { accept.danger() })
-                        .child(
-                            Button::new("cap-retake")
-                                .large()
-                                .outline()
-                                .label("撮り直し")
-                                .disabled(word_id.is_none())
-                                .on_click(cx.listener(|this, _, _w, cx| this.capture_retake(cx))),
-                        )
-                        .child(
-                            Button::new("cap-discard")
-                                .large()
-                                .outline()
-                                .label("破棄")
-                                .on_click(cx.listener(|this, _, _w, cx| this.capture_discard(cx))),
-                        );
+                    if usable && self.accept_gate.asking() {
+                        // 本物のデータへの書き込み前の確認(アプリ起動中の最初の採用だけ)。「はい」で採用を送る
+                        let name = c.word.as_ref().map(capture_rec::planned_name).unwrap_or_default();
+                        buttons = buttons
+                            .child(
+                                Button::new("cap-accept-yes")
+                                    .large()
+                                    .primary()
+                                    .label(SharedString::from(format!("本当に書き込む({name})")))
+                                    .on_click(cx.listener(|this, _, _w, cx| this.capture_accept_yes(cx))),
+                            )
+                            .child(
+                                Button::new("cap-accept-no")
+                                    .large()
+                                    .outline()
+                                    .label("やめる")
+                                    .on_click(cx.listener(|this, _, _w, cx| this.capture_accept_no(cx))),
+                            );
+                    } else {
+                        // 使えないテイクには採用ボタンを出さない(破棄か撮り直しだけ)
+                        if usable {
+                            buttons = buttons.child(
+                                Button::new("cap-accept")
+                                    .large()
+                                    .primary()
+                                    .label(SharedString::from(capture_rec::accept_label(c)))
+                                    .on_click(cx.listener(|this, _, _w, cx| this.capture_accept(cx))),
+                            );
+                        }
+                        buttons = buttons
+                            .child(
+                                Button::new("cap-retake")
+                                    .large()
+                                    .outline()
+                                    .label("撮り直し")
+                                    .disabled(word_id.is_none())
+                                    .on_click(cx.listener(|this, _, _w, cx| this.capture_retake(cx))),
+                            )
+                            .child(
+                                Button::new("cap-discard")
+                                    .large()
+                                    .outline()
+                                    .label("破棄")
+                                    .on_click(cx.listener(|this, _, _w, cx| this.capture_discard(cx))),
+                            );
+                    }
                 }
             }
         }
@@ -1171,7 +1232,23 @@ impl LiveApp {
             );
         }
         if running && c.phase == CapturePhase::Judged && !c.verdict.as_ref().is_some_and(|v| v.usable) {
-            card = card.child(div().text_size(px(15.)).text_color(muted).child(capture_rec::NG_ACCEPT_NOTE));
+            card = card.child(div().text_size(px(16.)).text_color(muted).child(capture_rec::UNUSABLE_NOTE));
+        }
+        if running && c.phase == CapturePhase::Judged && self.accept_gate.asking() {
+            let name = c.word.as_ref().map(capture_rec::planned_name).unwrap_or_default();
+            let dest = if c.data_dir.is_empty() { self.guide.data_dir.to_string_lossy().to_string() } else { c.data_dir.clone() };
+            card = card.child(
+                div()
+                    .p_3()
+                    .rounded_md()
+                    .bg(rgb(0x5d3a00))
+                    .border_1()
+                    .border_color(rgb(0xffb300))
+                    .text_size(px(17.))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(0xffffff))
+                    .child(wrappable_path(&capture_rec::confirm_prompt(&dest, &name))),
+            );
         }
 
         // 録画の fps・コマ落ち・注意
@@ -1196,7 +1273,7 @@ impl LiveApp {
                 div()
                     .text_size(px(16.))
                     .font_weight(FontWeight::BOLD)
-                    .text_color(if s.usable { rgb(0x69f0ae) } else { rgb(0xffb300) })
+                    .text_color(rgb(0x69f0ae))
                     .child(SharedString::from(capture_rec::saved_text(s))),
             );
         }

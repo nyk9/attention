@@ -101,6 +101,24 @@ fn capture_recording_view_sources_have_no_write_apis() {
     }
 }
 
+/// 撮影モードの画面側に、ng のテイクを記録する経路が無いこと(ユーザー決定 2026-10-12: ng のテイクは捨てる)。
+/// 採用のコマンドは中身を持たず、画面のソースに「NG として記録」のボタン文言も `confirm_ng` も無い
+#[test]
+fn capture_view_has_no_way_to_record_an_ng_take() {
+    assert_eq!(crate::protocol::Command::CaptureAccept.to_line(), r#"{"cmd":"capture_accept"}"#);
+    for name in ["capture_rec.rs", "state.rs", "main.rs"] {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join(name);
+        let full = std::fs::read_to_string(&path).unwrap();
+        let text = match full.find("\n#[cfg(test)]\nmod tests {") {
+            Some(i) => &full[..i],
+            None => full.as_str(),
+        };
+        for bad in ["confirm_ng", "format!(\"NG として記録", "NG_ACCEPT_NOTE"] {
+            assert!(!text.contains(bad), "{} に ng を記録する経路の名残 `{bad}` がある", path.display());
+        }
+    }
+}
+
 /// 画面側が撮影(録画)を頼む唯一の手段は、エンジンへ JSON の 1 行を送ること
 #[test]
 fn recording_is_only_requested_through_engine_commands() {
@@ -108,7 +126,7 @@ fn recording_is_only_requested_through_engine_commands() {
     let lines = [
         Command::CaptureRecord { word_id: Some("001".into()) }.to_line(),
         Command::CaptureStop.to_line(),
-        Command::CaptureAccept { confirm_ng: false }.to_line(),
+        Command::CaptureAccept.to_line(),
         Command::CaptureDiscard.to_line(),
     ];
     for l in lines {

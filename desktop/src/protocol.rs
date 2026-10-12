@@ -189,11 +189,9 @@ pub enum EngineEvent {
         label: String,
         #[serde(default)]
         rep_idx: u32,
-        /// index.tsv に書いた値("ok" | "ng_hands" | "ng_duration" | "")
+        /// index.tsv に書いた値。使えると判定されたテイクしか登録されないので、常に "ok"
         #[serde(default)]
         quality_flag: String,
-        #[serde(default)]
-        usable: bool,
         #[serde(default)]
         longest_run_secs: f64,
         #[serde(default)]
@@ -272,8 +270,9 @@ pub enum Command {
     CaptureRecord { word_id: Option<String> },
     /// 録画停止(カウントダウン中なら取り消し)
     CaptureStop,
-    /// 採用(登録先へ移して index.tsv に記帳)。使えないと判定されたテイクは `confirm_ng` のときだけ NG 付きで記録
-    CaptureAccept { confirm_ng: bool },
+    /// 採用(登録先へ移して index.tsv に記帳)。使えると判定されたテイクだけ。使えないテイクはエンジンが拒否する
+    /// (破棄か撮り直しだけ。以前あった `confirm_ng` は廃止)
+    CaptureAccept,
     /// 破棄(一時ファイルを消す)
     CaptureDiscard,
 }
@@ -310,7 +309,7 @@ impl Command {
                 None => json!({"cmd": "capture_record"}),
             },
             Command::CaptureStop => json!({"cmd": "capture_stop"}),
-            Command::CaptureAccept { confirm_ng } => json!({"cmd": "capture_accept", "confirm_ng": confirm_ng}),
+            Command::CaptureAccept => json!({"cmd": "capture_accept"}),
             Command::CaptureDiscard => json!({"cmd": "capture_discard"}),
         };
         v.to_string()
@@ -514,16 +513,15 @@ mod tests {
         }
         let line = json!({
             "type": "capture_saved", "file_path": "011_kare/04.mp4", "abs_path": "/data/raw_jsl/011_kare/04.mp4",
-            "word_id": "011", "label": "かれ", "rep_idx": 4, "quality_flag": "ok", "usable": true,
+            "word_id": "011", "label": "かれ", "rep_idx": 4, "quality_flag": "ok",
             "longest_run_secs": 1.67, "duration_secs": 4.2, "data_dir": "/data/raw_jsl",
         })
         .to_string();
         match parse_event(&line).unwrap().unwrap() {
-            EngineEvent::CaptureSaved { file_path, rep_idx, quality_flag, usable, .. } => {
+            EngineEvent::CaptureSaved { file_path, rep_idx, quality_flag, .. } => {
                 assert_eq!(file_path, "011_kare/04.mp4");
                 assert_eq!(rep_idx, 4);
                 assert_eq!(quality_flag, "ok");
-                assert!(usable);
             }
             other => panic!("{other:?}"),
         }
@@ -566,14 +564,7 @@ mod tests {
         );
         assert_eq!(Command::CaptureRecord { word_id: None }.to_line(), r#"{"cmd":"capture_record"}"#);
         assert_eq!(Command::CaptureStop.to_line(), r#"{"cmd":"capture_stop"}"#);
-        assert_eq!(
-            Command::CaptureAccept { confirm_ng: true }.to_line(),
-            r#"{"cmd":"capture_accept","confirm_ng":true}"#
-        );
-        assert_eq!(
-            Command::CaptureAccept { confirm_ng: false }.to_line(),
-            r#"{"cmd":"capture_accept","confirm_ng":false}"#
-        );
+        assert_eq!(Command::CaptureAccept.to_line(), r#"{"cmd":"capture_accept"}"#, "confirm_ng は廃止した");
         assert_eq!(Command::CaptureDiscard.to_line(), r#"{"cmd":"capture_discard"}"#);
     }
 

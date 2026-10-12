@@ -74,7 +74,6 @@ pub struct SavedView {
     pub label: String,
     pub rep_idx: u32,
     pub quality_flag: String,
-    pub usable: bool,
 }
 
 /// 撮影モードの画面の状態(エンジンの `capture_state` / `capture_saved` を畳み込んだもの)
@@ -274,13 +273,12 @@ impl AppModel {
                     };
                 }
             }
-            EngineEvent::CaptureSaved { file_path, label, rep_idx, quality_flag, usable, .. } => {
+            EngineEvent::CaptureSaved { file_path, label, rep_idx, quality_flag, .. } => {
                 self.capture.last_saved = Some(SavedView {
                     file_path: file_path.clone(),
                     label: label.clone(),
                     rep_idx: *rep_idx,
                     quality_flag: quality_flag.clone(),
-                    usable: *usable,
                 });
                 let flag_text = quality_flag_text(quality_flag);
                 self.push_log(LogLevel::Info, format!("登録しました: {file_path}({flag_text})"));
@@ -332,6 +330,11 @@ impl AppModel {
         self.mode == AppMode::Capture && self.phase == Phase::Running
     }
 
+    /// 撮影が動いていて、判定済み(採用か破棄を選ぶ段階)か。採用の確認を閉じるかの判断に使う
+    pub fn capture_running_judged(&self) -> bool {
+        self.capture_running() && self.capture.phase == CapturePhase::Judged
+    }
+
     /// 録画開始。待機中で、画面にお題の語が出ているときだけ。語は画面が出しているもの(エンジンはそれを録画する)
     pub fn record_command(&self, displayed_word_id: Option<&str>) -> Option<Command> {
         (self.capture_running() && self.capture.phase == CapturePhase::Idle)
@@ -345,13 +348,13 @@ impl AppModel {
             .then_some(Command::CaptureStop)
     }
 
-    /// 採用。判定済みのときだけ。使えないと判定されたテイクは、「NG として記録」を押したときの意味で confirm_ng=true
+    /// 採用。判定済みで、**使えると判定されたテイクだけ**(使えない判定・判定できなかったテイクには None。
+    /// 破棄か撮り直しだけ。ユーザー決定 2026-10-12)。エンジンも同じ理由で拒否する
     pub fn accept_command(&self) -> Option<Command> {
         if !(self.capture_running() && self.capture.phase == CapturePhase::Judged) {
             return None;
         }
-        let usable = self.capture.verdict.as_ref().is_some_and(|v| v.usable);
-        Some(Command::CaptureAccept { confirm_ng: !usable })
+        self.capture.verdict.as_ref().is_some_and(|v| v.usable).then_some(Command::CaptureAccept)
     }
 
     /// 破棄。カウントダウン・録画中・判定済みのとき(判定中は、判定が終わるまで破棄できない)
@@ -384,7 +387,8 @@ impl AppModel {
     }
 }
 
-/// index.tsv に書かれる quality_flag の説明(画面用)
+/// index.tsv の quality_flag の説明(画面用)。撮影モードが書くのは "ok" だけ(使えないテイクは登録しない)。
+/// ng_* の説明は、撮影セッション(ingest)が書く値や、判定結果の種別を表示するための汎用の対応表
 pub fn quality_flag_text(flag: &str) -> &'static str {
     match flag {
         "ok" => "有効なテイク",
@@ -702,7 +706,7 @@ mod tests {
         assert_eq!(m.space_command(word), None);
         // 判定済み(使える): 採用 / 撮り直し / 破棄。スペースは何もしない
         m.apply(&cap_state("judged", Some(true)));
-        assert_eq!(m.accept_command(), Some(Command::CaptureAccept { confirm_ng: false }));
+        assert_eq!(m.accept_command(), Some(Command::CaptureAccept));
         assert_eq!(m.discard_command(), Some(Command::CaptureDiscard));
         assert_eq!(
             m.retake_commands(word),
@@ -710,9 +714,15 @@ mod tests {
         );
         assert!(m.retake_commands(None).is_empty());
         assert_eq!(m.space_command(word), None, "判定済みでスペースを押しても、採用も撮り直しもしない");
-        // 判定済み(使えない): 採用は NG の確認つき
+        // 判定済み(使えない): 採用は作らない(NG として記録する経路は無い)。破棄・撮り直しは作れる
         m.apply(&cap_state("judged", Some(false)));
-        assert_eq!(m.accept_command(), Some(Command::CaptureAccept { confirm_ng: true }));
+        assert_eq!(m.accept_command(), None);
+        assert_eq!(m.discard_command(), Some(Command::CaptureDiscard));
+        assert_eq!(m.retake_commands(word).len(), 2);
+        // 判定済みなのに判定の内容が無い(来るはずのない形)ときも、採用は作らない
+        m.apply(&cap_state("judged", None));
+        assert_eq!(m.capture.phase, CapturePhase::Judged);
+        assert_eq!(m.accept_command(), None);
         // 知らない段階名は無視(直前の状態のまま)
         m.apply(&cap_state("future_phase", None));
         assert_eq!(m.capture.phase, CapturePhase::Judged);
@@ -745,14 +755,14 @@ mod tests {
         m.apply(&cap_state("recording", None));
         m.apply(
             &parse_event(
-                r#"{"type":"capture_saved","file_path":"011_kare/04.mp4","label":"かれ","rep_idx":4,"quality_flag":"ng_hands","usable":false,"data_dir":"/d"}"#,
+                r#"{"type":"capture_saved","file_path":"011_kare/04.mp4","label":"かれ","rep_idx":4,"quality_flag":"ok","data_dir":"/d"}"#,
             )
             .unwrap()
             .unwrap(),
         );
         let saved = m.capture.last_saved.clone().unwrap();
-        assert_eq!((saved.file_path.as_str(), saved.rep_idx, saved.usable), ("011_kare/04.mp4", 4, false));
-        assert!(m.log[0].text.contains("011_kare/04.mp4") && m.log[0].text.contains("NG"), "{:?}", m.log[0]);
+        assert_eq!((saved.file_path.as_str(), saved.rep_idx), ("011_kare/04.mp4", 4));
+        assert!(m.log[0].text.contains("011_kare/04.mp4") && m.log[0].text.contains("有効"), "{:?}", m.log[0]);
         // 次の capture_state が来ても、直近の登録結果は残る
         m.apply(&cap_state("idle", None));
         assert!(m.capture.last_saved.is_some());

@@ -32,6 +32,7 @@
 //! - 映像・特徴量をディスクに書かない(既存のオプトイン `LIVE_DEBUG_DUMP_DIR` の挙動は live.rs のまま)
 //! - 認識経路の生フレームには触れない。プレビューは参照から縮小コピーを作る
 
+use super::capture;
 use super::*;
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
@@ -58,7 +59,7 @@ const OUT_QUEUE: usize = 64;
 /// 区切り方の指定("auto" | "manual")
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum SegKind {
+pub(super) enum SegKind {
     #[default]
     Auto,
     Manual,
@@ -83,13 +84,13 @@ fn mode_name(mode: SegmentMode) -> &'static str {
 /// カメラのデバイス番号。文字列("0")でも数値(0)でも受ける
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(untagged)]
-enum DeviceId {
+pub(super) enum DeviceId {
     Text(String),
     Number(i64),
 }
 
 impl DeviceId {
-    fn as_string(&self) -> String {
+    pub(super) fn as_string(&self) -> String {
         match self {
             DeviceId::Text(s) => s.trim().to_string(),
             DeviceId::Number(n) => n.to_string(),
@@ -99,7 +100,7 @@ impl DeviceId {
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-enum SourceSpec {
+pub(super) enum SourceSpec {
     /// 省略時のデバイスは "0"(FaceTime HD カメラ)
     Camera {
         #[serde(default)]
@@ -113,9 +114,9 @@ enum SourceSpec {
 /// プレビューの設定。省略した項目は既定値
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
 #[serde(default)]
-struct PreviewCfg {
-    max_fps: f64,
-    width: u32,
+pub(super) struct PreviewCfg {
+    pub(super) max_fps: f64,
+    pub(super) width: u32,
 }
 
 impl Default for PreviewCfg {
@@ -137,21 +138,40 @@ where
     Option::<T>::deserialize(d).map(Some)
 }
 
+/// `start` の動作モード。省略は "live"(従来どおりのライブ認識。何も保存しない)。
+/// "capture" は撮影モード(録画・判定・登録。live/capture.rs に閉じている。docs/desktop-capture-design.md §4.2)
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum StartMode {
+    #[default]
+    Live,
+    Capture,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-struct StartCmd {
-    source: SourceSpec,
+pub(super) struct StartCmd {
+    pub(super) source: SourceSpec,
     /// 省略時は既定のデモ用モデル
     #[serde(default)]
-    model_dir: Option<String>,
+    pub(super) model_dir: Option<String>,
     #[serde(default)]
-    segmenter: SegKind,
+    pub(super) segmenter: SegKind,
     #[serde(default, deserialize_with = "double_option")]
-    preview: Option<Option<PreviewCfg>>,
+    pub(super) preview: Option<Option<PreviewCfg>>,
+    /// 省略時は "live"
+    #[serde(default)]
+    pub(super) mode: StartMode,
+    /// 撮影モードの登録先(`raw_jsl` のフォルダ)。撮影モードでは必須。ライブ認識では使わない
+    #[serde(default)]
+    pub(super) data_dir: Option<String>,
+    /// 撮影モードのカウントダウン秒数(省略 = 3 秒。0〜10 に丸める)。ライブ認識では使わない
+    #[serde(default)]
+    pub(super) countdown_secs: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
-enum Command {
+pub(super) enum Command {
     Start(StartCmd),
     /// Enter 相当(手動の開始/停止。`Key::Toggle`)
     Toggle,
@@ -159,6 +179,20 @@ enum Command {
         mode: SegKind,
     },
     Quit,
+    /// 撮影モードだけ: 録画開始(カウントダウンのあと録画)。`word_id` は画面が出しているお題の語
+    /// (省略時はエンジンが「次の語」を決める)
+    CaptureRecord {
+        #[serde(default)]
+        word_id: Option<String>,
+    },
+    /// 撮影モードだけ: 録画停止(カウントダウン中なら取り消し)
+    CaptureStop,
+    /// 撮影モードだけ: 採用(登録先へ移して index.tsv に記帳)。使えると判定されたテイクだけ。
+    /// 使えないと判定されたテイクは、エンジンが警告を返して拒否する(破棄か撮り直しだけ。ユーザー決定 2026-10-12)。
+    /// 以前あった `confirm_ng` は廃止(古い画面が付けて送ってきても、未知のフィールドとして読み捨てる)
+    CaptureAccept,
+    /// 撮影モードだけ: 破棄(一時ファイルを消す。撮り直しは破棄してから次の録画)
+    CaptureDiscard,
 }
 
 /// 1 行をコマンドとして読む。空行は Ok(None)(無視)。解釈できなければ理由つきの Err
@@ -176,13 +210,13 @@ fn parse_command(line: &str) -> Result<Option<Command>, String> {
 // ===== イベント(エンジン → GUI)=====
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
-struct VocabEntry {
+pub(super) struct VocabEntry {
     tag: String,
     label: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
-struct RankedItem {
+pub(super) struct RankedItem {
     tag: String,
     label: String,
     p: f64,
@@ -191,14 +225,14 @@ struct RankedItem {
 /// 左右の手の 21 点の (x, y)。画像の幅・高さで正規化したまま(0〜1 を少し外れることがある)。
 /// 手が未検出の枠は null
 #[derive(Debug, Clone, Serialize, PartialEq)]
-struct HandsPoints {
+pub(super) struct HandsPoints {
     left: Option<Vec<[f64; 2]>>,
     right: Option<Vec<[f64; 2]>>,
 }
 
 /// 元フレームに対する正規化座標の矩形(Palm 検出に渡す範囲)
 #[derive(Debug, Clone, Copy, Serialize, PartialEq)]
-struct CropRect {
+pub(super) struct CropRect {
     x: f64,
     y: f64,
     w: f64,
@@ -207,7 +241,7 @@ struct CropRect {
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum Event {
+pub(super) enum Event {
     Ready {
         vocab: Vec<VocabEntry>,
         model_dir: String,
@@ -257,6 +291,73 @@ enum Event {
     Segmenter {
         mode: &'static str,
     },
+    /// 撮影モードだけ: 撮影の状態(待機・カウントダウン・録画中・判定中・判定済み)。
+    /// 状態が変わったときは必ず届く。カウントダウン/録画中の秒数は最大 10 回/秒で更新される
+    CaptureState {
+        /// "idle" | "countdown" | "recording" | "judging" | "judged"
+        phase: &'static str,
+        /// カウントダウンの残り秒数(countdown 以外は 0)
+        countdown_left: f64,
+        /// 録画した長さ(秒。録画に書いたコマ数 ÷ fps)
+        rec_secs: f64,
+        /// 自動停止する長さ(秒)
+        max_secs: f64,
+        /// 録画に使う(使った)fps。countdown のあいだは実測値、録画が始まるまで不明なら null
+        fps: Option<f64>,
+        /// 録画キューがあふれて書けなかったコマ数(0 でなければ再生が少し速くなる)
+        dropped: u64,
+        /// 録画する(した)語と、登録先になる見込みのテイク番号。録画を始める前は null
+        word: Option<CaptureWord>,
+        /// 登録先(`raw_jsl`)。常に画面に出す
+        data_dir: String,
+        /// 判定(judged のときだけ)
+        verdict: Option<VerdictView>,
+        /// 画面に出す注意(fps が出ていない、自動停止した、など)
+        notes: Vec<String>,
+    },
+    /// 撮影モードだけ: 採用して登録した結果(登録先・判定・長さ)
+    CaptureSaved {
+        /// `data_dir` からの相対パス("011_kare/04.mp4")
+        file_path: String,
+        abs_path: String,
+        word_id: String,
+        label: String,
+        rep_idx: u32,
+        /// index.tsv に書いた値。撮影モードは使えると判定されたテイクしか登録しないので、常に "ok"
+        quality_flag: String,
+        longest_run_secs: f64,
+        duration_secs: f64,
+        data_dir: String,
+    },
+}
+
+/// 撮影で録画する語
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub(super) struct CaptureWord {
+    pub(super) word_id: String,
+    pub(super) romaji: String,
+    pub(super) label: String,
+    /// 登録先になる見込みのテイク番号(採用の瞬間に決め直すので、他のツールが先に足していれば変わる)
+    pub(super) rep_idx: u32,
+}
+
+/// 判定の結果(画面に出す)
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub(super) struct VerdictView {
+    pub(super) usable: bool,
+    /// 使えない理由の機械可読な符号: "hands_short" | "too_short" | "too_long" | "judge_failed"
+    pub(super) reasons: Vec<&'static str>,
+    /// 画面にそのまま出す 1 文("使えそう: ..." / "使えない: ...")
+    pub(super) summary: String,
+    /// 手が連続して検出できた最長区間(左右の良い方、秒)
+    pub(super) longest_run_secs: f64,
+    pub(super) left_run_secs: f64,
+    pub(super) right_run_secs: f64,
+    pub(super) duration_secs: f64,
+    /// 判定結果の種別("ok" | "ng_hands" | "ng_duration" | 判定できなかったときは "")。
+    /// index.tsv に書かれるのは "ok"(使えると判定され、採用されたテイク)だけ。ほかの値は、使えない理由を画面に出すためで、
+    /// 使えないテイクは採用できない(破棄か撮り直し)ので書き込み経路は無い
+    pub(super) quality_flag: String,
 }
 
 /// 数値は有限であること(NaN / Inf を JSON に出さない)。非有限は 0 にする
@@ -268,12 +369,12 @@ fn finite(x: f64) -> f64 {
     }
 }
 
-fn round_to(x: f64, decimals: i32) -> f64 {
+pub(super) fn round_to(x: f64, decimals: i32) -> f64 {
     let k = 10f64.powi(decimals);
     finite((finite(x) * k).round() / k)
 }
 
-fn r4(x: f64) -> f64 {
+pub(super) fn r4(x: f64) -> f64 {
     round_to(x, 4)
 }
 
@@ -315,7 +416,7 @@ fn hands_from_feature(feature: &[f32; DICT_FEATURE_DIM]) -> HandsPoints {
 /// 中央正方クロップ・相対矩形は固定の矩形。FullFrame は全体。人物追従(フレームごとに変わる)と
 /// 複数タイルは 1 つの矩形で表せないので全体を返す
 // [TEST向き] 1620x1080 の中央正方 → x=0.1667, w=0.6667
-fn crop_rect(roi: PalmRoiMode, w: usize, h: usize) -> CropRect {
+pub(super) fn crop_rect(roi: PalmRoiMode, w: usize, h: usize) -> CropRect {
     let full = CropRect {
         x: 0.0,
         y: 0.0,
@@ -513,7 +614,7 @@ enum Outgoing {
 
 /// 出力スレッドへの送り口。clone して複数の場所で持てる
 #[derive(Clone)]
-struct Emitter {
+pub(super) struct Emitter {
     tx: SyncSender<Outgoing>,
     /// 標準出力に書けなくなったら true(画面側が落ちた = 閉じたパイプ)。ループはこれを見て終了する
     broken: Arc<AtomicBool>,
@@ -521,12 +622,12 @@ struct Emitter {
 
 impl Emitter {
     /// 必ず届けたいイベント(キューが一杯なら空くまで待つ)
-    fn send(&self, e: Event) {
+    pub(super) fn send(&self, e: Event) {
         let _ = self.tx.send(Outgoing::Event(e));
     }
 
     /// 間引いてよいイベント。キューが一杯なら捨てて false を返す
-    fn try_send(&self, e: Event) -> bool {
+    pub(super) fn try_send(&self, e: Event) -> bool {
         !matches!(
             self.tx.try_send(Outgoing::Event(e)),
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_))
@@ -537,27 +638,27 @@ impl Emitter {
         self.tx.try_send(Outgoing::Preview(job)).is_ok()
     }
 
-    fn message(&self, level: &'static str, text: impl Into<String>) {
+    pub(super) fn message(&self, level: &'static str, text: impl Into<String>) {
         self.send(Event::Message {
             level,
             text: text.into(),
         });
     }
 
-    fn is_broken(&self) -> bool {
+    pub(super) fn is_broken(&self) -> bool {
         self.broken.load(Ordering::SeqCst)
     }
 }
 
 /// 出力スレッドを止めて待つための持ち手
-struct WriterHandle {
+pub(super) struct WriterHandle {
     emitter: Emitter,
     handle: std::thread::JoinHandle<()>,
 }
 
 impl WriterHandle {
     /// 溜まっているイベントをすべて書き出してから、出力スレッドを止める
-    fn finish(self) {
+    pub(super) fn finish(self) {
         let _ = self.emitter.tx.send(Outgoing::Shutdown);
         let _ = self.handle.join();
     }
@@ -572,7 +673,7 @@ fn write_line(out: &mut impl Write, ev: &Event) -> std::io::Result<()> {
 
 /// 出力スレッドを起こす。`out` へ 1 イベント = 1 行で書く。
 /// 書き込みに失敗したら(画面が閉じた)`broken` を立てて、以降は読み捨てる(送り手を詰まらせない)
-fn spawn_writer(mut out: impl Write + Send + 'static) -> (Emitter, WriterHandle) {
+pub(super) fn spawn_writer(mut out: impl Write + Send + 'static) -> (Emitter, WriterHandle) {
     let (tx, rx) = sync_channel::<Outgoing>(OUT_QUEUE);
     let broken = Arc::new(AtomicBool::new(false));
     let emitter = Emitter {
@@ -612,14 +713,14 @@ fn spawn_writer(mut out: impl Write + Send + 'static) -> (Emitter, WriterHandle)
 
 /// 終了要求の旗(quit・標準入力の EOF・SIGTERM/SIGINT のどれかで立つ)。clone して共有する
 #[derive(Clone, Default)]
-struct StopFlag(Arc<AtomicBool>);
+pub(super) struct StopFlag(Arc<AtomicBool>);
 
 impl StopFlag {
-    fn set(&self) {
+    pub(super) fn set(&self) {
         self.0.store(true, Ordering::SeqCst);
     }
 
-    fn is_set(&self) -> bool {
+    pub(super) fn is_set(&self) -> bool {
         self.0.load(Ordering::SeqCst)
     }
 }
@@ -628,7 +729,7 @@ impl StopFlag {
 
 /// 標準入力スレッドからメインスレッドへ渡すもの
 #[derive(Debug)]
-enum Input {
+pub(super) enum Input {
     Cmd(Command),
     /// 標準入力が閉じられた(quit と同じ扱い)
     Eof,
@@ -711,6 +812,18 @@ impl KeySource for JsonKeys {
                 Ok(Input::Cmd(Command::Start(_))) => {
                     self.emitter
                         .message("warn", "start は受け付け済みです(2 回目以降は無視します)");
+                }
+                // 撮影モード専用のコマンド。ライブ認識では受け付けない(録画・保存の経路に入らせない)
+                Ok(Input::Cmd(
+                    Command::CaptureRecord { .. }
+                    | Command::CaptureStop
+                    | Command::CaptureAccept
+                    | Command::CaptureDiscard,
+                )) => {
+                    self.emitter.message(
+                        "warn",
+                        "撮影用のコマンドです。ライブ認識では録画も保存もしないので無視しました",
+                    );
                 }
                 Ok(Input::Eof) | Err(TryRecvError::Disconnected) => return Some(Key::Quit),
                 Err(TryRecvError::Empty) => return None,
@@ -836,7 +949,7 @@ struct PreviewState {
 }
 
 /// `LiveUi` の JSON 版。イベントを作って出力スレッドへ送る
-struct JsonUi {
+pub(super) struct JsonUi {
     emitter: Emitter,
     labels: Labels,
     roi: PalmRoiMode,
@@ -848,7 +961,7 @@ struct JsonUi {
 }
 
 impl JsonUi {
-    fn new(
+    pub(super) fn new(
         emitter: Emitter,
         labels: Labels,
         roi: PalmRoiMode,
@@ -971,7 +1084,7 @@ struct Built {
 
 /// プレビュー設定の確定。省略 → 既定 / null → 無し / 値 → 範囲に丸める(丸めたら warn)
 // [TEST向き] 純粋関数に近い(警告文を返す)
-fn resolve_preview(req: &Option<Option<PreviewCfg>>) -> (Option<PreviewCfg>, Vec<String>) {
+pub(super) fn resolve_preview(req: &Option<Option<PreviewCfg>>) -> (Option<PreviewCfg>, Vec<String>) {
     let mut warns = Vec::new();
     let cfg = match req {
         None => PreviewCfg::default(),
@@ -1021,6 +1134,7 @@ fn wait_for_start(rx: &Receiver<Input>, emitter: &Emitter, stop: &StopFlag) -> O
 /// 全体の流れ: start を待つ → 部品を作る → ready → ループ → 後始末 → stopped。
 /// `build` は部品の作り方(本番は ONNX とカメラ/動画、テストでは偽物)。
 /// 回復不能な失敗は Err で返す(呼び出し側が `error` イベントにして非 0 で終わる)
+#[cfg(test)]
 fn serve(
     rx: Receiver<Input>,
     emitter: &Emitter,
@@ -1031,6 +1145,32 @@ fn serve(
         emitter.send(Event::Stopped { dropped_frames: 0 });
         return Ok(());
     };
+    serve_live(rx, emitter, stop, start, build)
+}
+
+/// `start` を受けたあとの入口。`mode` で撮影モード(live/capture.rs)かライブ認識かを分ける。
+/// **ライブ認識と撮影モードが分かれるのはここだけ**: 撮影モードの録画・保存のコードは `capture` に閉じていて、
+/// ライブ認識の経路(`serve_live` 以降、`run_session`、`JsonUi`)から呼ぶ箇所は無い
+/// (live/capture.rs のテストで、この 1 か所以外から呼ばれていないことを固定している)
+fn serve_dispatch(rx: Receiver<Input>, emitter: &Emitter, stop: &StopFlag) -> Result<()> {
+    let Some(start) = wait_for_start(&rx, emitter, stop) else {
+        emitter.send(Event::Stopped { dropped_frames: 0 });
+        return Ok(());
+    };
+    match start.mode {
+        StartMode::Capture => capture::serve_capture_real(rx, emitter, stop, &start),
+        StartMode::Live => serve_live(rx, emitter, stop, start, |s| build_real(s, stop, emitter)),
+    }
+}
+
+/// ライブ認識の本体(`start` を受け取ったあと)。何も保存しない
+fn serve_live(
+    rx: Receiver<Input>,
+    emitter: &Emitter,
+    stop: &StopFlag,
+    start: StartCmd,
+    build: impl FnOnce(&StartCmd) -> Result<Built>,
+) -> Result<()> {
     let built = match build(&start) {
         Ok(b) => b,
         // 部品を作っている最中に終了要求が来て、入力元を開かずに引き返した(カメラを触っていない)
@@ -1126,7 +1266,7 @@ fn serve(
 /// 部品を作る途中で終了要求(quit・標準入力の EOF・SIGTERM)に気づいて引き返したことを表すエラー。
 /// `serve` がこれを受けたら、異常ではなく `stopped` だけを出して正常に終わる
 #[derive(Debug)]
-struct StopRequested;
+pub(super) struct StopRequested;
 
 impl std::fmt::Display for StopRequested {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1229,7 +1369,7 @@ pub fn run_engine_json() -> Result<()> {
     );
     spawn_stop_watcher(stop.clone());
 
-    let result = serve(rx, &emitter, &stop, |start| build_real(start, &stop, &emitter));
+    let result = serve_dispatch(rx, &emitter, &stop);
     if let Err(e) = &result {
         emitter.send(Event::Error {
             text: format!("{:#}", e),
@@ -1322,22 +1462,39 @@ fn install_signal_handlers() {
     }
 }
 
+/// その PID のプロセスが生きているか(`kill(pid, 0)`: 信号は送らず、存在と権限だけ確かめる)。
+/// 撮影モードが、強制終了で残った一時フォルダの持ち主が生きているかを調べるのに使う
+pub(super) fn pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: シグナル 0 は何も送らず、プロセスの有無を返すだけ
+        let r = unsafe { sys::kill(pid as std::os::raw::c_int, 0) };
+        // 権限が無い(EPERM)なら存在はしている
+        r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(1)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
 /// いま動いている入力元(ffmpeg)の PID。終了要求のとき、ループが 1 枚目のフレームを待っている最中でも
 /// 止められるように、監視スレッドが使う
 static CHILD_PID: Mutex<Option<u32>> = Mutex::new(None);
 
-fn register_child_pid(pid: u32) {
+pub(super) fn register_child_pid(pid: u32) {
     *lock(&CHILD_PID) = Some(pid);
 }
 
 /// 入力元を drop する**前**に呼ぶ。以降は監視スレッドが PID に触れない
 /// (drop で ffmpeg が回収されたあとに、別プロセスが同じ PID を使い回していても誤って止めないため)
-fn clear_child_pid() {
+pub(super) fn clear_child_pid() {
     *lock(&CHILD_PID) = None;
 }
 
 /// 登録済みの入力元(ffmpeg)を強制終了する。PID はロックの中で使うので、`clear_child_pid` 後には届かない
-fn kill_registered_child() {
+pub(super) fn kill_registered_child() {
     let guard = lock(&CHILD_PID);
     if let Some(pid) = *guard {
         #[cfg(unix)]
@@ -1629,6 +1786,146 @@ mod tests {
         );
     }
 
+    // 撮影モードのイベントの形(golden)。画面(desktop/src/protocol.rs)の parse_capture_state_and_saved と同じ形
+    #[test]
+    fn golden_capture_state() {
+        let ev = Event::CaptureState {
+            phase: "judged",
+            countdown_left: 0.0,
+            rec_secs: 4.2,
+            max_secs: 10.0,
+            fps: Some(30.0),
+            dropped: 0,
+            word: Some(CaptureWord {
+                word_id: "011".into(),
+                romaji: "kare".into(),
+                label: "かれ".into(),
+                rep_idx: 4,
+            }),
+            data_dir: "/data/raw_jsl".into(),
+            verdict: Some(VerdictView {
+                usable: false,
+                reasons: vec!["hands_short"],
+                summary: "使えない: 手が 1.0 秒続いて検出されていません(最長 0.67 秒)".into(),
+                longest_run_secs: 0.67,
+                left_run_secs: 0.0,
+                right_run_secs: 0.67,
+                duration_secs: 4.2,
+                quality_flag: "ng_hands".into(),
+            }),
+            notes: vec!["注意".into()],
+        };
+        assert_eq!(
+            to_json(&ev),
+            json!({
+                "type": "capture_state",
+                "phase": "judged",
+                "countdown_left": 0.0,
+                "rec_secs": 4.2,
+                "max_secs": 10.0,
+                "fps": 30.0,
+                "dropped": 0,
+                "word": {"word_id": "011", "romaji": "kare", "label": "かれ", "rep_idx": 4},
+                "data_dir": "/data/raw_jsl",
+                "verdict": {
+                    "usable": false,
+                    "reasons": ["hands_short"],
+                    "summary": "使えない: 手が 1.0 秒続いて検出されていません(最長 0.67 秒)",
+                    "longest_run_secs": 0.67,
+                    "left_run_secs": 0.0,
+                    "right_run_secs": 0.67,
+                    "duration_secs": 4.2,
+                    "quality_flag": "ng_hands"
+                },
+                "notes": ["注意"]
+            })
+        );
+        // 待機: word / verdict / fps は null
+        let idle = Event::CaptureState {
+            phase: "idle",
+            countdown_left: 0.0,
+            rec_secs: 0.0,
+            max_secs: 10.0,
+            fps: None,
+            dropped: 0,
+            word: None,
+            data_dir: "/data/raw_jsl".into(),
+            verdict: None,
+            notes: vec![],
+        };
+        let v = to_json(&idle);
+        assert!(v["word"].is_null() && v["verdict"].is_null() && v["fps"].is_null(), "{v}");
+        assert_eq!(v["phase"], "idle");
+        assert_eq!(v["notes"], json!([]));
+    }
+
+    #[test]
+    fn golden_capture_saved() {
+        let ev = Event::CaptureSaved {
+            file_path: "011_kare/04.mp4".into(),
+            abs_path: "/data/raw_jsl/011_kare/04.mp4".into(),
+            word_id: "011".into(),
+            label: "かれ".into(),
+            rep_idx: 4,
+            quality_flag: "ok".into(),
+            longest_run_secs: 1.67,
+            duration_secs: 4.2,
+            data_dir: "/data/raw_jsl".into(),
+        };
+        assert_eq!(
+            to_json(&ev),
+            json!({
+                "type": "capture_saved",
+                "file_path": "011_kare/04.mp4",
+                "abs_path": "/data/raw_jsl/011_kare/04.mp4",
+                "word_id": "011",
+                "label": "かれ",
+                "rep_idx": 4,
+                "quality_flag": "ok",
+                "longest_run_secs": 1.67,
+                "duration_secs": 4.2,
+                "data_dir": "/data/raw_jsl"
+            })
+        );
+    }
+
+    // 撮影モードのコマンドと start のモード指定(画面の capture_command_lines と同じ形を読める)
+    #[test]
+    fn parse_capture_commands_and_start_mode() {
+        assert_eq!(
+            parse_command(r#"{"cmd":"capture_record","word_id":"011"}"#).unwrap().unwrap(),
+            Command::CaptureRecord { word_id: Some("011".into()) }
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"capture_record"}"#).unwrap().unwrap(),
+            Command::CaptureRecord { word_id: None }
+        );
+        assert_eq!(parse_command(r#"{"cmd":"capture_stop"}"#).unwrap().unwrap(), Command::CaptureStop);
+        assert_eq!(parse_command(r#"{"cmd":"capture_accept"}"#).unwrap().unwrap(), Command::CaptureAccept);
+        assert_eq!(
+            parse_command(r#"{"cmd":"capture_accept","confirm_ng":true}"#).unwrap().unwrap(),
+            Command::CaptureAccept,
+            "廃止した confirm_ng を付けてきても読み捨てるだけ(使えないテイクの採用は拒否されるので、NG 記録の経路にはならない)"
+        );
+        assert_eq!(parse_command(r#"{"cmd":"capture_discard"}"#).unwrap().unwrap(), Command::CaptureDiscard);
+        // start: mode 省略 = live。capture では data_dir / countdown_secs を受ける
+        let Command::Start(s) = parse_command(r#"{"cmd":"start","source":{"kind":"camera"}}"#).unwrap().unwrap() else {
+            panic!()
+        };
+        assert_eq!((s.mode, s.data_dir, s.countdown_secs), (StartMode::Live, None, None));
+        let Command::Start(s) = parse_command(
+            r#"{"cmd":"start","mode":"capture","source":{"kind":"file","path":"/v.mp4"},"data_dir":"/d","countdown_secs":0}"#,
+        )
+        .unwrap()
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(s.mode, StartMode::Capture);
+        assert_eq!(s.data_dir.as_deref(), Some("/d"));
+        assert_eq!(s.countdown_secs, Some(0.0));
+        assert!(parse_command(r#"{"cmd":"start","mode":"nope","source":{"kind":"camera"}}"#).is_err());
+    }
+
     #[test]
     fn message_classification() {
         assert_eq!(
@@ -1660,6 +1957,9 @@ mod tests {
         assert_eq!(
             c,
             Command::Start(StartCmd {
+            mode: StartMode::Live,
+            data_dir: None,
+            countdown_secs: None,
                 source: SourceSpec::Camera {
                     device: Some(DeviceId::Text("0".into()))
                 },
@@ -2233,6 +2533,9 @@ mod tests {
 
     fn start_file(seg: SegKind, preview: Option<Option<PreviewCfg>>) -> StartCmd {
         StartCmd {
+            mode: StartMode::Live,
+            data_dir: None,
+            countdown_secs: None,
             source: SourceSpec::File { path: "dummy.mp4".into() },
             model_dir: None,
             segmenter: seg,
@@ -2471,6 +2774,35 @@ mod tests {
         assert!(ev.iter().any(|e| e["type"] == "message" && e["level"] == "warn"));
     }
 
+    // ライブ認識(mode 省略)に撮影用のコマンドが来ても、録画も保存も始まらず、警告して無視する
+    // (撮影モードのイベントは一切出ない)
+    #[test]
+    fn live_mode_ignores_capture_commands() {
+        let (built, probes) = fake_built(vec![1; 3], true, PalmRoiMode::FullFrame);
+        let (ev, res, _tx) = run_fake(
+            vec![
+                Input::Cmd(Command::Start(start_file(SegKind::Auto, Some(None)))),
+                Input::Cmd(Command::CaptureRecord { word_id: Some("001".into()) }),
+                Input::Cmd(Command::CaptureStop),
+                Input::Cmd(Command::CaptureAccept),
+                Input::Cmd(Command::CaptureDiscard),
+                Input::Cmd(Command::Quit),
+            ],
+            built,
+            true,
+        );
+        res.unwrap();
+        let t = types(&ev);
+        assert!(!t.iter().any(|x| x.starts_with("capture_")), "{t:?}");
+        let warns: Vec<&Value> = ev
+            .iter()
+            .filter(|e| e["type"] == "message" && e["text"].as_str().is_some_and(|t| t.contains("撮影用のコマンド")))
+            .collect();
+        assert_eq!(warns.len(), 4, "4 つのコマンドそれぞれに警告: {ev:?}");
+        assert_eq!(t.last().unwrap(), "stopped");
+        assert!(probes.dropped.load(Ordering::SeqCst));
+    }
+
     // 手動 + 動画ファイル: 開始と同時に録画し、終端で認識(live_wizard と同じ)
     #[test]
     fn manual_file_records_whole_video() {
@@ -2494,6 +2826,9 @@ mod tests {
         let (emitter, writer) = spawn_writer(buf.clone());
         let (tx, rx) = mpsc::channel();
         let start = StartCmd {
+            mode: StartMode::Live,
+            data_dir: None,
+            countdown_secs: None,
             source: SourceSpec::Camera { device: None },
             model_dir: None,
             segmenter: SegKind::Manual,
@@ -2540,6 +2875,9 @@ mod tests {
             PalmRoiMode::FullFrame,
         );
         let start = StartCmd {
+            mode: StartMode::Live,
+            data_dir: None,
+            countdown_secs: None,
             source: SourceSpec::Camera { device: None },
             model_dir: None,
             segmenter: SegKind::Manual,
@@ -2731,6 +3069,9 @@ mod tests {
         let (emitter, writer) = spawn_writer(sink.clone());
         let (tx, rx) = mpsc::channel();
         let start = StartCmd {
+            mode: StartMode::Live,
+            data_dir: None,
+            countdown_secs: None,
             source: SourceSpec::File {
                 path: video.display().to_string(),
             },

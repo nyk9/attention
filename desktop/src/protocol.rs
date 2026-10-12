@@ -22,6 +22,41 @@ pub struct RankedItem {
     pub p: f64,
 }
 
+/// 撮影で録画する語
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct CaptureWord {
+    pub word_id: String,
+    #[serde(default)]
+    pub romaji: String,
+    pub label: String,
+    /// 登録先になる見込みのテイク番号(採用の瞬間に決め直す)
+    #[serde(default)]
+    pub rep_idx: u32,
+}
+
+/// 録画の判定(エンジンが決めた結果。画面はそのまま見せる)
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct Verdict {
+    pub usable: bool,
+    /// "hands_short" | "too_short" | "too_long" | "judge_failed"
+    #[serde(default)]
+    pub reasons: Vec<String>,
+    /// 画面にそのまま出す 1 文
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub longest_run_secs: f64,
+    #[serde(default)]
+    pub left_run_secs: f64,
+    #[serde(default)]
+    pub right_run_secs: f64,
+    #[serde(default)]
+    pub duration_secs: f64,
+    /// 採用したときに index.tsv へ書く値
+    #[serde(default)]
+    pub quality_flag: String,
+}
+
 /// 左右の手の 21 点の (x, y)。0〜1 に正規化済み(少し外れることがある)。未検出の枠は null。
 /// 映像は反転していない座標で来る。
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -111,6 +146,59 @@ pub enum EngineEvent {
         /// "auto" | "manual"
         mode: String,
     },
+    /// 撮影モード(録画あり)の状態。pose_extractor/src/live/json_engine.rs の `Event::CaptureState` と同じ形
+    CaptureState {
+        /// "idle" | "countdown" | "recording" | "judging" | "judged"
+        phase: String,
+        /// カウントダウンの残り秒数
+        #[serde(default)]
+        countdown_left: f64,
+        /// 録画した長さ(秒)
+        #[serde(default)]
+        rec_secs: f64,
+        /// 自動停止する長さ(秒)
+        #[serde(default)]
+        max_secs: f64,
+        #[serde(default)]
+        fps: Option<f64>,
+        /// 録画が間に合わず捨てたコマ数
+        #[serde(default)]
+        dropped: u64,
+        /// 録画する語。録画を始める前は null
+        #[serde(default)]
+        word: Option<CaptureWord>,
+        /// 登録先(raw_jsl)。エンジンが実際に使うパス
+        #[serde(default)]
+        data_dir: String,
+        /// 判定(judged のとき)
+        #[serde(default)]
+        verdict: Option<Verdict>,
+        /// 画面に出す注意
+        #[serde(default)]
+        notes: Vec<String>,
+    },
+    /// 採用して登録した結果
+    CaptureSaved {
+        /// 登録先からの相対パス("011_kare/04.mp4")
+        file_path: String,
+        #[serde(default)]
+        abs_path: String,
+        #[serde(default)]
+        word_id: String,
+        #[serde(default)]
+        label: String,
+        #[serde(default)]
+        rep_idx: u32,
+        /// index.tsv に書いた値。使えると判定されたテイクしか登録されないので、常に "ok"
+        #[serde(default)]
+        quality_flag: String,
+        #[serde(default)]
+        longest_run_secs: f64,
+        #[serde(default)]
+        duration_secs: f64,
+        #[serde(default)]
+        data_dir: String,
+    },
     /// 知らない `type` のイベント(エンジンの方が新しいとき)。呼び出し側は読み捨てる。
     /// Rust メモ: `#[serde(other)]` は、「タグ(type)が他のどの変種にも当てはまらなかったとき」に使う
     /// 変種を指定する属性。中身を持たない変種にしか付けられず、元のキーは捨てられる
@@ -167,9 +255,26 @@ pub enum Command {
         source: SourceSpec,
         segmenter: SegmenterMode,
     },
+    /// 撮影モード(録画あり)で起動する。`data_dir` は登録先(raw_jsl)。エンジンはここにだけ書く。
+    /// 認識モデルは読み込まず、語の推論はしない
+    StartCapture {
+        source: SourceSpec,
+        data_dir: String,
+        /// 省略 = エンジンの既定(3 秒)
+        countdown_secs: Option<f64>,
+    },
     Toggle,
     SetSegmenter(SegmenterMode),
     Quit,
+    /// 録画開始(カウントダウンのあと録画)。`word_id` は画面が出しているお題の語
+    CaptureRecord { word_id: Option<String> },
+    /// 録画停止(カウントダウン中なら取り消し)
+    CaptureStop,
+    /// 採用(登録先へ移して index.tsv に記帳)。使えると判定されたテイクだけ。使えないテイクはエンジンが拒否する
+    /// (破棄か撮り直しだけ。以前あった `confirm_ng` は廃止)
+    CaptureAccept,
+    /// 破棄(一時ファイルを消す)
+    CaptureDiscard,
 }
 
 impl Command {
@@ -185,9 +290,27 @@ impl Command {
                 // model_dir と preview は省略 = エンジンの既定(デモ用モデル / 10fps・幅 640)
                 json!({"cmd": "start", "source": source, "segmenter": segmenter.name()})
             }
+            Command::StartCapture { source, data_dir, countdown_secs } => {
+                let source = match source {
+                    SourceSpec::Camera { device } => json!({"kind": "camera", "device": device}),
+                    SourceSpec::File { path } => json!({"kind": "file", "path": path}),
+                };
+                let mut v = json!({"cmd": "start", "mode": "capture", "source": source, "data_dir": data_dir});
+                if let Some(c) = countdown_secs {
+                    v["countdown_secs"] = json!(c);
+                }
+                v
+            }
             Command::Toggle => json!({"cmd": "toggle"}),
             Command::SetSegmenter(mode) => json!({"cmd": "set_segmenter", "mode": mode.name()}),
             Command::Quit => json!({"cmd": "quit"}),
+            Command::CaptureRecord { word_id } => match word_id {
+                Some(id) => json!({"cmd": "capture_record", "word_id": id}),
+                None => json!({"cmd": "capture_record"}),
+            },
+            Command::CaptureStop => json!({"cmd": "capture_stop"}),
+            Command::CaptureAccept => json!({"cmd": "capture_accept"}),
+            Command::CaptureDiscard => json!({"cmd": "capture_discard"}),
         };
         v.to_string()
     }
@@ -335,6 +458,114 @@ mod tests {
         assert!(parse_event(r#"{"type":"status","state":"idle"}"#).is_err());
         // 空行は無視
         assert_eq!(parse_event("   ").unwrap(), None);
+    }
+
+    // pose_extractor 側の golden テスト(golden_capture_state / golden_capture_saved)と同じ形の行を読めること
+    #[test]
+    fn parse_capture_state_and_saved() {
+        let line = json!({
+            "type": "capture_state",
+            "phase": "judged",
+            "countdown_left": 0.0,
+            "rec_secs": 4.2,
+            "max_secs": 10.0,
+            "fps": 30.0,
+            "dropped": 0,
+            "word": {"word_id": "011", "romaji": "kare", "label": "かれ", "rep_idx": 4},
+            "data_dir": "/data/raw_jsl",
+            "verdict": {
+                "usable": false,
+                "reasons": ["hands_short"],
+                "summary": "使えない: 手が 1.0 秒続いて検出されていません(最長 0.67 秒)",
+                "longest_run_secs": 0.67,
+                "left_run_secs": 0.0,
+                "right_run_secs": 0.67,
+                "duration_secs": 4.2,
+                "quality_flag": "ng_hands",
+            },
+            "notes": ["注意"],
+        })
+        .to_string();
+        match parse_event(&line).unwrap().unwrap() {
+            EngineEvent::CaptureState { phase, rec_secs, word, data_dir, verdict, notes, fps, .. } => {
+                assert_eq!(phase, "judged");
+                assert_eq!(rec_secs, 4.2);
+                assert_eq!(fps, Some(30.0));
+                assert_eq!(word.unwrap().rep_idx, 4);
+                assert_eq!(data_dir, "/data/raw_jsl");
+                let v = verdict.unwrap();
+                assert!(!v.usable);
+                assert_eq!(v.reasons, vec!["hands_short"]);
+                assert_eq!(v.quality_flag, "ng_hands");
+                assert_eq!(notes.len(), 1);
+            }
+            other => panic!("{other:?}"),
+        }
+        // 待機(word と verdict は null、省略された項目は既定値)
+        let line = r#"{"type":"capture_state","phase":"idle","word":null,"verdict":null,"data_dir":"/d"}"#;
+        match parse_event(line).unwrap().unwrap() {
+            EngineEvent::CaptureState { phase, word, verdict, notes, dropped, .. } => {
+                assert_eq!(phase, "idle");
+                assert!(word.is_none() && verdict.is_none() && notes.is_empty());
+                assert_eq!(dropped, 0);
+            }
+            other => panic!("{other:?}"),
+        }
+        let line = json!({
+            "type": "capture_saved", "file_path": "011_kare/04.mp4", "abs_path": "/data/raw_jsl/011_kare/04.mp4",
+            "word_id": "011", "label": "かれ", "rep_idx": 4, "quality_flag": "ok",
+            "longest_run_secs": 1.67, "duration_secs": 4.2, "data_dir": "/data/raw_jsl",
+        })
+        .to_string();
+        match parse_event(&line).unwrap().unwrap() {
+            EngineEvent::CaptureSaved { file_path, rep_idx, quality_flag, .. } => {
+                assert_eq!(file_path, "011_kare/04.mp4");
+                assert_eq!(rep_idx, 4);
+                assert_eq!(quality_flag, "ok");
+            }
+            other => panic!("{other:?}"),
+        }
+        // phase が無い capture_state は壊れたイベント(Unknown ではなくエラー)
+        assert!(parse_event(r#"{"type":"capture_state"}"#).is_err());
+    }
+
+    // 撮影モードのコマンドの形(pose_extractor 側の parse_capture_commands_and_start_mode と同じ)
+    #[test]
+    fn capture_command_lines() {
+        let v: serde_json::Value = serde_json::from_str(
+            &Command::StartCapture {
+                source: SourceSpec::Camera { device: "0".into() },
+                data_dir: "/a b/raw_jsl".into(),
+                countdown_secs: None,
+            }
+            .to_line(),
+        )
+        .unwrap();
+        assert_eq!(
+            v,
+            json!({"cmd": "start", "mode": "capture", "source": {"kind": "camera", "device": "0"}, "data_dir": "/a b/raw_jsl"})
+        );
+        let v: serde_json::Value = serde_json::from_str(
+            &Command::StartCapture {
+                source: SourceSpec::File { path: "/v.mp4".into() },
+                data_dir: "/d".into(),
+                countdown_secs: Some(0.0),
+            }
+            .to_line(),
+        )
+        .unwrap();
+        assert_eq!(
+            v,
+            json!({"cmd": "start", "mode": "capture", "source": {"kind": "file", "path": "/v.mp4"}, "data_dir": "/d", "countdown_secs": 0.0})
+        );
+        assert_eq!(
+            Command::CaptureRecord { word_id: Some("011".into()) }.to_line(),
+            r#"{"cmd":"capture_record","word_id":"011"}"#
+        );
+        assert_eq!(Command::CaptureRecord { word_id: None }.to_line(), r#"{"cmd":"capture_record"}"#);
+        assert_eq!(Command::CaptureStop.to_line(), r#"{"cmd":"capture_stop"}"#);
+        assert_eq!(Command::CaptureAccept.to_line(), r#"{"cmd":"capture_accept"}"#, "confirm_ng は廃止した");
+        assert_eq!(Command::CaptureDiscard.to_line(), r#"{"cmd":"capture_discard"}"#);
     }
 
     #[test]

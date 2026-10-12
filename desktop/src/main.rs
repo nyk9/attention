@@ -15,6 +15,7 @@
 mod capture_guide;
 #[cfg(test)]
 mod capture_guide_tests;
+mod capture_rec;
 mod engine;
 mod overlay;
 mod protocol;
@@ -23,7 +24,7 @@ mod state;
 use capture_guide::{hand_run, progress as guide_progress, GuideState};
 use engine::{AppInbox, EngineHandle, EngineLocation, Incoming, OverlayKind};
 use gpui::{
-    actions, div, img, prelude::*, px, rgb, size, App, Application, Bounds, Context, FocusHandle,
+    actions, div, img, prelude::*, px, rgb, rgba, size, App, Application, Bounds, Context, FocusHandle,
     Focusable, FontWeight, IntoElement, KeyBinding, ObjectFit, Render, RenderImage, SharedString,
     StyledImage, TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
@@ -34,7 +35,8 @@ use gpui_component::{
     v_flex, ActiveTheme, Disableable, Root, Sizable, Theme, ThemeMode,
 };
 use protocol::{Command, SegmenterMode, SourceSpec};
-use state::{format_secs, hands_text, percent, AppMode, AppModel, LogLevel, Phase, Recognized};
+use capture_rec::Tone;
+use state::{format_secs, hands_text, percent, AppMode, AppModel, CapturePhase, LogLevel, Phase, Recognized};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -99,6 +101,8 @@ struct LiveApp {
     guide: GuideState,
     /// 診断用: 前回ログに出した撮影ガイドの表示内容(変化したときだけ出す)
     last_guide_log: String,
+    /// 本物のデータへの書き込み前の確認の状態(撮影の採用。アプリ起動中の最初の採用だけ確認する)
+    accept_gate: capture_rec::AcceptGate,
 }
 
 impl LiveApp {
@@ -126,6 +130,21 @@ impl LiveApp {
             .detach();
         }
 
+        // 開発・検証用: ATTENTION_APP_CAPTURE_SCRIPT="record:2,stop:6,accept:20" のように、起動からの秒数で
+        // 撮影(録画)のボタン操作を自動で行う(画面を手で触れない環境で、ボタン → コマンド → エンジン → 表示の
+        // 一連を確かめるため)。操作は実際のボタンと同じメソッドを通る(送ってよいかは AppModel が決める)
+        if let Ok(script) = std::env::var("ATTENTION_APP_CAPTURE_SCRIPT") {
+            for step in script.split(',') {
+                let Some((action, secs)) = step.trim().split_once(':') else { continue };
+                let (Ok(secs), action) = (secs.trim().parse::<f64>(), action.trim().to_string()) else { continue };
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(Duration::from_secs_f64(secs)).await;
+                    let _ = this.update(cx, |this, cx| this.run_script_action(&action, cx));
+                })
+                .detach();
+            }
+        }
+
         // 撮影ガイドのデータディレクトリ: ATTENTION_DATA_DIR、無ければ <リポジトリ>/transformer_burn/data/raw_jsl、
         // それも無ければ git worktree の本体チェックアウトの raw_jsl
         let root = engine::resolve_root(
@@ -148,11 +167,16 @@ impl LiveApp {
             frames_shown: 0,
             guide: GuideState::from_choice(data_choice),
             last_guide_log: String::new(),
+            accept_gate: capture_rec::AcceptGate::default(),
         };
 
         // 開発・検証用: ATTENTION_APP_MODE=capture-guide で撮影ガイドモードから始める
         if std::env::var("ATTENTION_APP_MODE").is_ok_and(|v| v.trim() == "capture-guide") {
             app.model.mode = AppMode::CaptureGuide;
+        }
+        // ATTENTION_APP_MODE=capture で撮影(録画あり)から始める
+        if std::env::var("ATTENTION_APP_MODE").is_ok_and(|v| v.trim() == "capture") {
+            app.model.mode = AppMode::Capture;
         }
 
         // 開発・検証用: 動画ファイルがあれば、カメラを使わずに自動で開始する
@@ -173,12 +197,15 @@ impl LiveApp {
         self.guide.reset_session();
         let kind = match self.model.mode {
             AppMode::Live => OverlayKind::Live,
-            AppMode::CaptureGuide => OverlayKind::CaptureGuide,
+            AppMode::CaptureGuide | AppMode::Capture => OverlayKind::CaptureGuide,
         };
         let result: Result<EngineHandle, String> = engine::locate().and_then(|loc: EngineLocation| {
             let mut h = EngineHandle::spawn_with(&loc, kind)?;
-            // 区切り方は、開始前に選んでおいた値(model.segmenter)をそのまま送る
-            h.send(&self.model.start_command(source))?;
+            // 区切り方は、開始前に選んでおいた値(model.segmenter)をそのまま送る。
+            // 撮影(録画)では、登録先(R0 で解決したデータの場所)を付けた撮影モードの start を送る
+            // 登録先は絶対パスにして送る(エンジンは別の作業フォルダで動くので、相対パスだと別の場所を指す)
+            let data_dir = std::path::absolute(&self.guide.data_dir).unwrap_or_else(|_| self.guide.data_dir.clone());
+            h.send(&self.model.start_command(source, &data_dir))?;
             Ok(h)
         });
         match result {
@@ -210,7 +237,105 @@ impl LiveApp {
         cx.notify();
     }
 
+    /// 画面が出しているお題の語の ID(撮影で録画する語。エンジンはこの語として録画する)
+    fn displayed_word_id(&self) -> Option<String> {
+        match &self.guide.progress {
+            Some(Ok(v)) => v.next.as_ref().map(|n| n.word_id.clone()),
+            _ => None,
+        }
+    }
+
+    /// 撮影のコマンドを送る(送ってよいかは AppModel が決める。ここは送るだけ)
+    fn send_capture(&mut self, cmds: Vec<Command>, cx: &mut Context<Self>) {
+        if let Some(e) = self.engine.as_mut() {
+            for c in cmds {
+                if let Err(err) = e.send(&c) {
+                    self.model.push_log(LogLevel::Warn, err);
+                    break;
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn capture_record(&mut self, cx: &mut Context<Self>) {
+        let w = self.displayed_word_id();
+        let cmds: Vec<Command> = self.model.record_command(w.as_deref()).into_iter().collect();
+        self.send_capture(cmds, cx);
+    }
+
+    fn capture_stop(&mut self, cx: &mut Context<Self>) {
+        let cmds: Vec<Command> = self.model.stop_command().into_iter().collect();
+        self.send_capture(cmds, cx);
+    }
+
+    /// 採用ボタン。使えると判定されたテイクだけ(`accept_command` が決める)。
+    /// 登録先が本物のデータ(環境変数指定でない場所)で、この起動中にまだ確認していなければ、送る前に確認を出す
+    fn capture_accept(&mut self, cx: &mut Context<Self>) {
+        if self.model.accept_command().is_none() {
+            return;
+        }
+        match self.accept_gate.press_accept(self.guide.data_dir_choice.origin) {
+            capture_rec::AcceptStep::Send => {
+                let cmds: Vec<Command> = self.model.accept_command().into_iter().collect();
+                self.send_capture(cmds, cx);
+            }
+            capture_rec::AcceptStep::Ask => cx.notify(),
+        }
+    }
+
+    /// 確認に「はい」: 採用を送る。以後この起動中は確認しない
+    fn capture_accept_yes(&mut self, cx: &mut Context<Self>) {
+        if self.accept_gate.confirm() {
+            let cmds: Vec<Command> = self.model.accept_command().into_iter().collect();
+            self.send_capture(cmds, cx);
+        }
+        cx.notify();
+    }
+
+    /// 確認に「いいえ」: 何も送らず、判定済みの表示に戻る
+    fn capture_accept_no(&mut self, cx: &mut Context<Self>) {
+        self.accept_gate.cancel();
+        cx.notify();
+    }
+
+    fn capture_discard(&mut self, cx: &mut Context<Self>) {
+        let cmds: Vec<Command> = self.model.discard_command().into_iter().collect();
+        self.send_capture(cmds, cx);
+    }
+
+    fn capture_retake(&mut self, cx: &mut Context<Self>) {
+        let w = self.displayed_word_id();
+        let cmds = self.model.retake_commands(w.as_deref());
+        self.send_capture(cmds, cx);
+    }
+
+    /// 開発・検証用の自動操作(ATTENTION_APP_CAPTURE_SCRIPT)。実際のボタンと同じメソッドを呼ぶ
+    fn run_script_action(&mut self, action: &str, cx: &mut Context<Self>) {
+        if debug_enabled() {
+            eprintln!("[script] {action}");
+        }
+        match action {
+            "record" => self.capture_record(cx),
+            "stop" => self.capture_stop(cx),
+            "accept" => self.capture_accept(cx),
+            "accept_yes" => self.capture_accept_yes(cx),
+            "accept_no" => self.capture_accept_no(cx),
+            "discard" => self.capture_discard(cx),
+            "retake" => self.capture_retake(cx),
+            "space" => self.toggle(cx),
+            _ => {}
+        }
+    }
+
     fn toggle(&mut self, cx: &mut Context<Self>) {
+        // 撮影(録画)では、スペースキーは録画の開始/停止
+        if self.model.mode == AppMode::Capture {
+            let w = self.displayed_word_id();
+            let cmds: Vec<Command> = self.model.space_command(w.as_deref()).into_iter().collect();
+            self.send_capture(cmds, cx);
+            return;
+        }
         // 撮影ガイドでは送らない(スペースキーで届いても何もしない)
         if self.model.toggle_allowed() {
             if let Some(e) = self.engine.as_mut() {
@@ -260,8 +385,14 @@ impl LiveApp {
 
     /// Inbox から最新の状態を取り出して反映する(UI スレッドで定期的に呼ばれる)
     fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 判定済みでなくなったら(破棄・撮り直し・エンジン終了など)、採用の確認は閉じる
+        let judged = self.model.capture_running_judged();
+        if self.accept_gate.asking() && !judged {
+            self.accept_gate.sync_phase(false);
+            cx.notify();
+        }
         // 撮影ガイド: お題と進捗を定期的に読み直す(読むだけ。エンジンが動いていなくても表示する)
-        if self.model.mode == AppMode::CaptureGuide && self.guide.reload_due(Instant::now()) {
+        if self.model.mode.shows_guide() && self.guide.reload_due(Instant::now()) {
             self.guide.reload_progress(Instant::now());
             cx.notify();
         }
@@ -299,6 +430,10 @@ impl LiveApp {
                             }
                             other => eprintln!("[event] {}", format!("{other:?}").chars().take(100).collect::<String>()),
                         }
+                    }
+                    // 登録できたら、次の語・本数をすぐ読み直す(3 秒ごとの読み直しを待たない)
+                    if matches!(ev, protocol::EngineEvent::CaptureSaved { .. }) {
+                        self.guide.force_reload();
                     }
                     self.model.apply(&ev)
                 }
@@ -346,7 +481,7 @@ impl LiveApp {
     /// 診断用(ATTENTION_APP_DEBUG): 撮影ガイドの画面に渡す文字・色の判定を、変わったときだけ標準エラーへ出す。
     /// 画面のスクリーンショットが撮れない環境で、描画に渡る状態を確かめるため。映像・座標の生データは出さない
     fn log_guide(&mut self) {
-        if !debug_enabled() || self.model.mode != AppMode::CaptureGuide {
+        if !debug_enabled() || !self.model.mode.shows_guide() {
             return;
         }
         let g = &self.guide;
@@ -357,8 +492,20 @@ impl LiveApp {
             Some(Err(e)) => format!("読めない: {}", e.lines().next().unwrap_or("")),
             None => "未読み込み".into(),
         };
+        let cap = if self.model.mode == AppMode::Capture {
+            let b = capture_rec::banner(&self.model.capture);
+            format!(
+                " capture=[{} | dest={} | verdict={} | notes={}]",
+                b.text,
+                capture_rec::dest_line(&self.model.capture.data_dir, &self.guide.data_dir.to_string_lossy()),
+                self.model.capture.verdict.as_ref().map(|v| v.summary.as_str()).unwrap_or("-"),
+                self.model.capture.notes.len()
+            )
+        } else {
+            String::new()
+        };
         let text = format!(
-            "hands={} run={} pass={} last={} edge={:?} crop_red={} progress={}",
+            "hands={} run={} pass={} last={} edge={:?} crop_red={} progress={}{cap}",
             capture_guide::hands_big_text(g.hands.as_deref()),
             capture_guide::run_text(cur),
             hand_run::passes(cur),
@@ -449,7 +596,7 @@ impl Render for LiveApp {
                             .child(self.render_log(cx))
                             .child(self.render_vocab(border, muted, cx))
                             .into_any_element(),
-                        AppMode::CaptureGuide => v_flex()
+                        AppMode::CaptureGuide | AppMode::Capture => v_flex()
                             // on_children_prepainted は id を付ける前(Div)にしか呼べない
                             .when(dbg, |d| d.on_children_prepainted(|b, _, _| log_bounds("right(guide)", &b)))
                             .id("guide-column")
@@ -459,6 +606,7 @@ impl Render for LiveApp {
                             .flex_shrink_0()
                             .gap_3()
                             .overflow_y_scroll()
+                            .when(self.model.mode == AppMode::Capture, |d| d.child(self.render_capture_panel(cx)))
                             .child(self.render_guide_topic(cx))
                             .child(self.render_guide_hands(cx))
                             .child(self.render_guide_edge(cx))
@@ -481,6 +629,7 @@ impl LiveApp {
         let mut frame = div()
             .when(debug_enabled(), |d| d.on_children_prepainted(|b, _, _| log_bounds("preview-content", &b)))
             .id("preview")
+            .relative()
             .flex_1()
             .min_h(px(240.))
             .w_full()
@@ -507,6 +656,66 @@ impl LiveApp {
                     .child(placeholder),
             ),
         };
+        // 撮影(録画): 録画中は常に「録画中」、カウントダウン中は大きな数字を、映像の上に重ねる(音に頼らない)
+        if self.model.mode == AppMode::Capture && self.model.phase == Phase::Running {
+            let c = &self.model.capture;
+            match c.phase {
+                CapturePhase::Recording => {
+                    frame = frame.child(
+                        div()
+                            .absolute()
+                            .top_3()
+                            .left_3()
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .bg(rgb(0xb71c1c))
+                            .text_color(rgb(0xffffff))
+                            .text_size(px(26.))
+                            .font_weight(FontWeight::BOLD)
+                            .child(SharedString::from(format!("● 録画中 {}", format_secs(c.rec_secs)))),
+                    );
+                }
+                CapturePhase::Countdown => {
+                    frame = frame.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .px_8()
+                                    .py_2()
+                                    .rounded_lg()
+                                    .bg(rgba(0x000000b3))
+                                    .text_color(rgb(0xffffff))
+                                    .text_size(px(180.))
+                                    .line_height(px(200.))
+                                    .font_weight(FontWeight::BOLD)
+                                    .child(SharedString::from(capture_rec::countdown_digit(c.countdown_left))),
+                            )
+                            .child(
+                                div()
+                                    .mt_2()
+                                    .px_4()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(rgba(0x000000b3))
+                                    .text_color(rgb(0xffb300))
+                                    .text_size(px(24.))
+                                    .font_weight(FontWeight::BOLD)
+                                    .child("録画開始まで(席に戻ってください。取り消しはスペース)"),
+                            ),
+                    );
+                }
+                _ => {}
+            }
+        }
         frame
     }
 
@@ -518,6 +727,22 @@ impl LiveApp {
             // 撮影ガイドは記録しないので「待機中/記録中」ではなく、録画しないことを明示する
             (Phase::Running, _) if self.model.mode == AppMode::CaptureGuide => {
                 ("撮影ガイド中(録画しません)".into(), rgb(0x80deea).into())
+            }
+            // 撮影(録画): 録画中は常に「● 録画中」と文字で示す
+            (Phase::Running, _) if self.model.mode == AppMode::Capture => {
+                let c = &self.model.capture;
+                match c.phase {
+                    CapturePhase::Recording => {
+                        (format!("● 録画中 {}", format_secs(c.rec_secs)).into(), rgb(0xff5252).into())
+                    }
+                    CapturePhase::Countdown => (
+                        format!("録画開始まで {} 秒", capture_rec::countdown_digit(c.countdown_left)).into(),
+                        rgb(0xffb300).into(),
+                    ),
+                    CapturePhase::Judging => ("判定中".into(), rgb(0x90a4ae).into()),
+                    CapturePhase::Judged => ("判定済み".into(), rgb(0x80deea).into()),
+                    CapturePhase::Idle => ("撮影(待機中。録画していません)".into(), rgb(0x80deea).into()),
+                }
             }
             (Phase::Running, Some(s)) if s.recording => {
                 (format!("記録中 {}", format_secs(s.rec_secs)).into(), rgb(0xff5252).into())
@@ -562,7 +787,8 @@ impl LiveApp {
         let recording = self.model.status.as_ref().is_some_and(|s| s.recording);
         let toggle_label = if recording { "手動で停止(スペース)" } else { "手動で開始(スペース)" };
 
-        let guide_mode = self.model.mode == AppMode::CaptureGuide;
+        let guide_mode = self.model.mode.shows_guide();
+        let capture_mode = self.model.mode == AppMode::Capture;
         let mut start = Button::new("start")
             .primary()
             .large()
@@ -582,7 +808,15 @@ impl LiveApp {
                     .items_center()
                     .child(div().text_size(px(16.)).child("モード"))
                     .child(mode_button("mode-live", "ライブ認識", !guide_mode, AppMode::Live, mode_ok, cx))
-                    .child(mode_button("mode-guide", "撮影ガイド", guide_mode, AppMode::CaptureGuide, mode_ok, cx))
+                    .child(mode_button(
+                        "mode-guide",
+                        "撮影ガイド(録画なし)",
+                        self.model.mode == AppMode::CaptureGuide,
+                        AppMode::CaptureGuide,
+                        mode_ok,
+                        cx,
+                    ))
+                    .child(mode_button("mode-capture", "撮影(録画あり)", capture_mode, AppMode::Capture, mode_ok, cx))
                     .child(
                         div()
                             .text_size(px(14.))
@@ -615,7 +849,13 @@ impl LiveApp {
                         )
                     }),
             )
-            .child(if guide_mode {
+            .child(if capture_mode {
+                div()
+                    .text_size(px(16.))
+                    .text_color(cx.theme().muted_foreground)
+                    .child("撮影(録画あり): 右の「録画開始」を押すと、カウントダウンのあとに録画します。録画中は画面に「● 録画中」と出ます。採用するまで登録先には何も書きません。語の認識はしません")
+                    .into_any_element()
+            } else if guide_mode {
                 div()
                     .text_size(px(16.))
                     .text_color(cx.theme().muted_foreground)
@@ -827,7 +1067,244 @@ fn guide_card(cx: &mut Context<LiveApp>) -> gpui::Div {
         .bg(cx.theme().secondary)
 }
 
+/// 見出しの色(背景, 文字)。コントラスト比は背景と文字の組で 4.5 以上
+fn tone_colors(t: Tone) -> (gpui::Hsla, gpui::Hsla) {
+    match t {
+        Tone::Neutral => (rgb(0x37474f).into(), rgb(0xffffff).into()),
+        Tone::Recording => (rgb(0xb71c1c).into(), rgb(0xffffff).into()),
+        Tone::Warning => (rgb(0xffb300).into(), rgb(0x0b0b0b).into()),
+        Tone::Good => (rgb(0x00c853).into(), rgb(0x0b0b0b).into()),
+        Tone::Bad => (rgb(0x7f0000).into(), rgb(0xffffff).into()),
+    }
+}
+
+/// パスを折り返せるようにする(`/` の後ろに幅 0 の空白を入れる。表示だけで、中身は変えない)
+fn wrappable_path(p: &str) -> SharedString {
+    SharedString::from(p.replace('/', "/\u{200B}"))
+}
+
 impl LiveApp {
+    /// 撮影(録画あり)の操作パネル。録画の状態・カウントダウン・判定・採用/破棄/撮り直し・登録先
+    fn render_capture_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
+        let c = &self.model.capture;
+        let running = self.model.phase == Phase::Running;
+        let banner = capture_rec::banner(c);
+        let (bg, fg) = tone_colors(banner.tone);
+        let word_id = self.displayed_word_id();
+
+        let mut card = guide_card(cx)
+            .child(div().text_size(px(16.)).text_color(muted).child("撮影(録画あり)"))
+            .child(
+                div()
+                    .px_4()
+                    .py_2()
+                    .rounded_lg()
+                    .bg(bg)
+                    .text_color(fg)
+                    .text_size(px(32.))
+                    .line_height(px(40.))
+                    .font_weight(FontWeight::BOLD)
+                    .child(SharedString::from(if running { banner.text } else { "エンジンが動いていません".to_string() })),
+            );
+
+        // 判定(判定済みのとき): エンジンの 1 文をそのまま + 数字 + 補足
+        if running && c.phase == CapturePhase::Judged {
+            if let Some(v) = &c.verdict {
+                card = card
+                    .child(
+                        div()
+                            .text_size(px(20.))
+                            .font_weight(FontWeight::BOLD)
+                            .child(SharedString::from(v.summary.clone())),
+                    )
+                    .child(div().text_size(px(15.)).child(SharedString::from(capture_rec::verdict_detail(v))));
+                for r in &v.reasons {
+                    let hint = capture_rec::reason_hint(r);
+                    if !hint.is_empty() {
+                        card = card.child(div().text_size(px(16.)).text_color(rgb(0xffb300)).child(hint));
+                    }
+                }
+            }
+        }
+
+        // ボタン(段階に応じて、押せるものだけを出す)
+        let mut buttons = h_flex().gap_2().flex_wrap();
+        if running {
+            match c.phase {
+                CapturePhase::Idle => {
+                    buttons = buttons.child(
+                        Button::new("cap-record")
+                            .primary()
+                            .large()
+                            .label("録画開始(スペース)")
+                            .disabled(word_id.is_none())
+                            .on_click(cx.listener(|this, _, _w, cx| this.capture_record(cx))),
+                    );
+                }
+                CapturePhase::Countdown => {
+                    buttons = buttons.child(
+                        Button::new("cap-cancel")
+                            .large()
+                            .outline()
+                            .label("取り消し(スペース)")
+                            .on_click(cx.listener(|this, _, _w, cx| this.capture_stop(cx))),
+                    );
+                }
+                CapturePhase::Recording => {
+                    buttons = buttons
+                        .child(
+                            Button::new("cap-stop")
+                                .danger()
+                                .large()
+                                .label("停止(スペース)")
+                                .on_click(cx.listener(|this, _, _w, cx| this.capture_stop(cx))),
+                        )
+                        .child(
+                            Button::new("cap-abort")
+                                .large()
+                                .outline()
+                                .label("録画を捨てる")
+                                .on_click(cx.listener(|this, _, _w, cx| this.capture_discard(cx))),
+                        );
+                }
+                CapturePhase::Judging => {
+                    buttons = buttons.child(Button::new("cap-judging").large().outline().label("判定中…").disabled(true));
+                }
+                CapturePhase::Judged => {
+                    let usable = c.verdict.as_ref().is_some_and(|v| v.usable);
+                    if usable && self.accept_gate.asking() {
+                        // 本物のデータへの書き込み前の確認(アプリ起動中の最初の採用だけ)。「はい」で採用を送る
+                        let name = c.word.as_ref().map(capture_rec::planned_name).unwrap_or_default();
+                        buttons = buttons
+                            .child(
+                                Button::new("cap-accept-yes")
+                                    .large()
+                                    .primary()
+                                    .label(SharedString::from(format!("本当に書き込む({name})")))
+                                    .on_click(cx.listener(|this, _, _w, cx| this.capture_accept_yes(cx))),
+                            )
+                            .child(
+                                Button::new("cap-accept-no")
+                                    .large()
+                                    .outline()
+                                    .label("やめる")
+                                    .on_click(cx.listener(|this, _, _w, cx| this.capture_accept_no(cx))),
+                            );
+                    } else {
+                        // 使えないテイクには採用ボタンを出さない(破棄か撮り直しだけ)
+                        if usable {
+                            buttons = buttons.child(
+                                Button::new("cap-accept")
+                                    .large()
+                                    .primary()
+                                    .label(SharedString::from(capture_rec::accept_label(c)))
+                                    .on_click(cx.listener(|this, _, _w, cx| this.capture_accept(cx))),
+                            );
+                        }
+                        buttons = buttons
+                            .child(
+                                Button::new("cap-retake")
+                                    .large()
+                                    .outline()
+                                    .label("撮り直し")
+                                    .disabled(word_id.is_none())
+                                    .on_click(cx.listener(|this, _, _w, cx| this.capture_retake(cx))),
+                            )
+                            .child(
+                                Button::new("cap-discard")
+                                    .large()
+                                    .outline()
+                                    .label("破棄")
+                                    .on_click(cx.listener(|this, _, _w, cx| this.capture_discard(cx))),
+                            );
+                    }
+                }
+            }
+        }
+        card = card.child(buttons);
+        if running && c.phase == CapturePhase::Idle && word_id.is_none() {
+            card = card.child(
+                div()
+                    .text_size(px(16.))
+                    .text_color(rgb(0xffb300))
+                    .child("お題の語が読めていないので録画できません(下の「次の語」を確認してください)"),
+            );
+        }
+        if running && c.phase == CapturePhase::Judged && !c.verdict.as_ref().is_some_and(|v| v.usable) {
+            card = card.child(div().text_size(px(16.)).text_color(muted).child(capture_rec::UNUSABLE_NOTE));
+        }
+        if running && c.phase == CapturePhase::Judged && self.accept_gate.asking() {
+            let name = c.word.as_ref().map(capture_rec::planned_name).unwrap_or_default();
+            let dest = if c.data_dir.is_empty() { self.guide.data_dir.to_string_lossy().to_string() } else { c.data_dir.clone() };
+            card = card.child(
+                div()
+                    .p_3()
+                    .rounded_md()
+                    .bg(rgb(0x5d3a00))
+                    .border_1()
+                    .border_color(rgb(0xffb300))
+                    .text_size(px(17.))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(0xffffff))
+                    .child(wrappable_path(&capture_rec::confirm_prompt(&dest, &name))),
+            );
+        }
+
+        // 録画の fps・コマ落ち・注意
+        if running && c.phase != CapturePhase::Idle {
+            card = card.child(
+                div()
+                    .text_size(px(15.))
+                    .text_color(muted)
+                    .child(SharedString::from(format!("録画の fps: {}", capture_rec::fps_text(c.fps)))),
+            );
+        }
+        if let Some(d) = capture_rec::dropped_text(c.dropped) {
+            card = card.child(div().text_size(px(16.)).text_color(rgb(0xffb300)).child(SharedString::from(format!("注意: {d}"))));
+        }
+        for n in &c.notes {
+            card = card.child(div().text_size(px(15.)).text_color(rgb(0xffb300)).child(SharedString::from(format!("注意: {n}"))));
+        }
+
+        // 直近の登録
+        if let Some(s) = &c.last_saved {
+            card = card.child(
+                div()
+                    .text_size(px(16.))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(0x69f0ae))
+                    .child(SharedString::from(capture_rec::saved_text(s))),
+            );
+        }
+
+        // 登録先(常に表示)と、その決まり方。本物のデータに書き込むときは、そのことを文字で明示する
+        let origin = self.guide.data_dir_choice.origin;
+        let dest = capture_rec::dest_line(&c.data_dir, &self.guide.data_dir.to_string_lossy());
+        card.child(
+            v_flex()
+                .gap_0p5()
+                .child(
+                    div()
+                        .text_size(px(15.))
+                        .font_weight(FontWeight::BOLD)
+                        .child(wrappable_path(&dest)),
+                )
+                .child(
+                    div()
+                        .text_size(px(14.))
+                        .text_color(if origin == capture_guide::progress::DataDirOrigin::Env { muted } else { rgb(0xffb300).into() })
+                        .child(SharedString::from(capture_rec::origin_note(origin))),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .text_color(muted)
+                        .child("書き込みは、録画の一時ファイル(リポジトリの外)と、採用したときの登録先への取り込みだけです"),
+                ),
+        )
+    }
+
     /// お題と進捗(読み取りのみ)
     fn render_guide_topic(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;

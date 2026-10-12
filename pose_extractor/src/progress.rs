@@ -41,7 +41,7 @@ pub struct IndexRow {
 }
 
 /// スキャンで見つかったテイクファイル
-struct ScannedTake {
+pub(crate) struct ScannedTake {
     rel_path: String,
     word_id: String,
     romaji: String,
@@ -49,19 +49,19 @@ struct ScannedTake {
     abs: PathBuf,
 }
 
-const INDEX_FILE: &str = "index.tsv";
-const WORDS_FILE: &str = "words.tsv";
+pub(crate) const INDEX_FILE: &str = "index.tsv";
+pub(crate) const WORDS_FILE: &str = "words.tsv";
 const INDEX_HEADER: &str =
     "file_path\tword_id\tword_romaji\tword_label_ja\trep_idx\trecorded_at\tduration_ms\tquality_flag\tnotes";
 
 /// 撮影プロトコルの目安(3-4秒/動画)から大きく外れたら警告する範囲
-const DURATION_MIN_MS: u64 = 2000;
-const DURATION_MAX_MS: u64 = 10000;
+pub(crate) const DURATION_MIN_MS: u64 = 2000;
+pub(crate) const DURATION_MAX_MS: u64 = 10000;
 
 /// 「手が連続して検出できた最長区間」がこの秒数に満たなければ ng_hands フラグ
 /// (撮り直し推奨)。一人撮影では録画の前後に手を下げた時間ができるため、動画
 /// 全体の平均カバレッジではなく、連続して手が検出できた最長区間の長さで判定する。
-const MIN_HAND_RUN_SECONDS: f32 = 1.0;
+pub(crate) const MIN_HAND_RUN_SECONDS: f32 = 1.0;
 /// 連続区間の判定で許容する瞬断(誤検出・モーションブラーによる1サンプル分の谷)。
 /// これを超えて検出が途切れたら別区間として数え直す。
 const MAX_RUN_GAP_SAMPLES: usize = 1;
@@ -299,7 +299,15 @@ fn load_words(data_dir: &Path) -> Result<Vec<WordSpec>> {
         println!("(romaji / stage / target_takes は自由に編集してください。語彙はろう者協力者レビュー前の暫定です)");
     }
 
-    let content = std::fs::read_to_string(&path)?;
+    read_words(data_dir)
+}
+
+/// words.tsv を**読むだけ**(無くてもテンプレートを書き出さない)。撮影モード(live/capture.rs)は
+/// 本物のデータに書き込むので、書き出す `load_words` ではなくこちらを使う
+pub(crate) fn read_words(data_dir: &Path) -> Result<Vec<WordSpec>> {
+    let path = data_dir.join(WORDS_FILE);
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("words.tsv を読めません: {}", path.display()))?;
     let mut words = Vec::new();
     for (lineno, line) in content.lines().enumerate() {
         let line = line.trim_end();
@@ -353,7 +361,7 @@ fn parse_rep_stem(stem: &str) -> Option<u32> {
 }
 
 /// data_dir を走査して実在するテイクファイルを集める
-fn scan_takes(data_dir: &Path) -> Result<(Vec<ScannedTake>, Vec<String>)> {
+pub(crate) fn scan_takes(data_dir: &Path) -> Result<(Vec<ScannedTake>, Vec<String>)> {
     let mut takes = Vec::new();
     let mut warnings = Vec::new();
 
@@ -421,7 +429,7 @@ fn scan_takes(data_dir: &Path) -> Result<(Vec<ScannedTake>, Vec<String>)> {
 }
 
 /// 既存 index.tsv を読む(無ければ空)。quality_flag / notes の保持が目的
-fn load_index(path: &Path) -> Result<Vec<IndexRow>> {
+pub(crate) fn load_index(path: &Path) -> Result<Vec<IndexRow>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -455,7 +463,7 @@ fn load_index(path: &Path) -> Result<Vec<IndexRow>> {
 /// - 既存行: そのまま保持(quality_flag / notes を消さない)
 /// - 新規ファイル: ffprobe して行を作る
 /// - 実体が消えたファイルの行: 落とす(警告を出す)
-fn merge_index(
+pub(crate) fn merge_index(
     scanned: &[ScannedTake],
     existing: &[IndexRow],
     words: &[WordSpec],
@@ -553,10 +561,8 @@ fn sanitize_tsv(s: &str) -> String {
     s.replace(['\t', '\n', '\r'], " ")
 }
 
-fn write_index(path: &Path, rows: &[IndexRow]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+/// index.tsv の本文(ヘッダ + 全行)
+fn render_index(rows: &[IndexRow]) -> String {
     let mut out = String::new();
     out.push_str(INDEX_HEADER);
     out.push('\n');
@@ -574,15 +580,75 @@ fn write_index(path: &Path, rows: &[IndexRow]) -> Result<()> {
             sanitize_tsv(&r.notes),
         ));
     }
-    std::fs::write(path, out).with_context(|| format!("write {}", path.display()))?;
-    Ok(())
+    out
+}
+
+/// 書き込み途中の index.tsv(一時ファイル)。`commit` で本物に置き換える。
+/// 一時ファイルに全部書いて fsync してから `rename` で置き換えるので、書き込みの途中で落ちても
+/// 元の index.tsv は壊れない(rename は同じフォルダ内なら一瞬で終わる)
+pub(crate) struct StagedIndex {
+    tmp: PathBuf,
+    dest: PathBuf,
+}
+
+impl StagedIndex {
+    /// 本物の index.tsv を置き換える
+    pub(crate) fn commit(self) -> Result<()> {
+        let r = std::fs::rename(&self.tmp, &self.dest).with_context(|| {
+            format!("rename {} -> {}", self.tmp.display(), self.dest.display())
+        });
+        if r.is_err() {
+            // 置き換えられなかった一時ファイルを残さない(本物の index.tsv はそのまま)
+            let _ = std::fs::remove_file(&self.tmp);
+        }
+        r
+    }
+
+    /// 置き換えずに一時ファイルを捨てる
+    pub(crate) fn abort(self) {
+        let _ = std::fs::remove_file(&self.tmp);
+    }
+}
+
+/// index.tsv の新しい中身を一時ファイルに書く(本物はまだ触らない)
+pub(crate) fn stage_index(path: &Path, rows: &[IndexRow]) -> Result<StagedIndex> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| INDEX_FILE.to_string());
+    let tmp = path.with_file_name(format!(".{}.tmp-{}", name, std::process::id()));
+    let result = (|| -> Result<()> {
+        let mut f = std::fs::File::create(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
+        f.write_all(render_index(rows).as_bytes())
+            .with_context(|| format!("write {}", tmp.display()))?;
+        f.sync_all().with_context(|| format!("sync {}", tmp.display()))?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(StagedIndex {
+        tmp,
+        dest: path.to_path_buf(),
+    })
+}
+
+/// index.tsv を書く。一時ファイル経由のアトミックな置き換え(`stage_index` + `commit`)
+pub(crate) fn write_index(path: &Path, rows: &[IndexRow]) -> Result<()> {
+    stage_index(path, rows)?.commit()
 }
 
 // ===== 進捗集計 =====
 
 /// word_id ごとの (有効テイク数, NGテイク数)。
 /// quality_flag が "ng" で始まる行は有効数に数えない
-fn take_counts(rows: &[IndexRow]) -> HashMap<String, (u32, u32)> {
+pub(crate) fn take_counts(rows: &[IndexRow]) -> HashMap<String, (u32, u32)> {
     let mut counts: HashMap<String, (u32, u32)> = HashMap::new();
     for r in rows {
         let e = counts.entry(r.word_id.clone()).or_default();
@@ -658,7 +724,7 @@ fn print_progress(words: &[WordSpec], rows: &[IndexRow]) {
 
 /// 次に撮るべき単語: stage 順 → words.tsv の行順で、
 /// 有効テイク数が目標未満かつスキップされていない最初の単語
-fn next_word<'a>(
+pub(crate) fn next_word<'a>(
     words: &'a [WordSpec],
     rows: &[IndexRow],
     skipped: &HashSet<String>,
@@ -689,9 +755,22 @@ fn announce_next(words: &[WordSpec], rows: &[IndexRow], skipped: &HashSet<String
     }
 }
 
+/// 実ファイルのスキャン結果から見た、その語の次のテイク番号(最大番号 + 1)。
+/// `merge_index` の結果の行は実ファイルと 1 対 1 なので、`next_rep_idx` と同じ値になる(ffprobe を呼ばない版)
+// [TEST向き] 純粋関数
+pub(crate) fn scanned_next_rep(scanned: &[ScannedTake], word_id: &str) -> u32 {
+    scanned
+        .iter()
+        .filter(|t| t.word_id == word_id)
+        .map(|t| t.rep_idx)
+        .max()
+        .unwrap_or(0)
+        + 1
+}
+
 /// 既存テイクの最大番号 + 1(欠番があっても衝突しない)
 // [TEST向き] 純粋関数
-fn next_rep_idx(rows: &[IndexRow], word_id: &str) -> u32 {
+pub(crate) fn next_rep_idx(rows: &[IndexRow], word_id: &str) -> u32 {
     rows.iter()
         .filter(|r| r.word_id == word_id)
         .map(|r| r.rep_idx)
@@ -727,7 +806,7 @@ fn list_watch_files(dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 /// rename を試し、別ボリューム間(クロスデバイス)なら copy + remove にフォールバック
-fn move_file(src: &Path, dest: &Path) -> Result<()> {
+pub(crate) fn move_file(src: &Path, dest: &Path) -> Result<()> {
     if std::fs::rename(src, dest).is_ok() {
         return Ok(());
     }
@@ -747,7 +826,7 @@ fn ingest(
     checker: Option<&mut HandChecker>,
 ) -> Result<()> {
     let rep = next_rep_idx(rows, &word.word_id);
-    let dir_name = format!("{}_{}", word.word_id, word.romaji);
+    let dir_name = take_dir_name(word);
     let dest_dir = data_dir.join(&dir_name);
     std::fs::create_dir_all(&dest_dir)?;
 
@@ -757,7 +836,7 @@ fn ingest(
         .map(|s| s.to_lowercase())
         .unwrap_or_default();
 
-    let mut dest_name = format!("{:02}.mp4", rep);
+    let mut dest_name = take_file_name(rep, "mp4");
     let mut dest = dest_dir.join(&dest_name);
 
     if src_ext == "mp4" {
@@ -784,7 +863,7 @@ fn ingest(
                 // 詰め替え失敗時は元の拡張子のまま移動(取り込み自体は続行)
                 eprintln!("  mp4への詰め替えに失敗、元の形式のまま取り込みます");
                 let _ = std::fs::remove_file(&dest); // 失敗時の中途半端なファイルを掃除
-                dest_name = format!("{:02}.{}", rep, src_ext);
+                dest_name = take_file_name(rep, &src_ext);
                 dest = dest_dir.join(&dest_name);
                 move_file(src, &dest)?;
             }
@@ -811,11 +890,7 @@ fn ingest(
         match c.coverage(&dest) {
             Ok((left, right)) => {
                 let best = left.max(right);
-                quality_flag = if best >= MIN_HAND_RUN_SECONDS {
-                    "ok".to_string()
-                } else {
-                    "ng_hands".to_string()
-                };
+                quality_flag = quality_flag_for_run(best).to_string();
                 println!(
                     "  手検出: L連続{:.1}秒 R連続{:.1}秒 → {}",
                     left, right, quality_flag
@@ -831,19 +906,66 @@ fn ingest(
         }
     }
 
+    rows.push(new_take_row(
+        word,
+        rep,
+        &dest_name,
+        now_recorded_at(),
+        duration_ms,
+        quality_flag,
+    ));
+    Ok(())
+}
+
+/// 取り込み先のフォルダ名(`<word_id>_<romaji>`)
+// [TEST向き] 純粋関数
+pub(crate) fn take_dir_name(word: &WordSpec) -> String {
+    format!("{}_{}", word.word_id, word.romaji)
+}
+
+/// テイクのファイル名(`<NN>.<ext>`。2 桁にゼロ埋め)
+// [TEST向き] 純粋関数
+pub(crate) fn take_file_name(rep: u32, ext: &str) -> String {
+    format!("{:02}.{}", rep, ext)
+}
+
+/// 「手が連続して検出できた最長区間(秒)」から quality_flag を決める。
+/// `MIN_HAND_RUN_SECONDS` 以上なら "ok"、満たなければ "ng_hands"(撮り直し推奨。目標数には数えない)
+// [TEST向き] 純粋関数。境界(ちょうど 1.0 秒は ok)
+pub(crate) fn quality_flag_for_run(best_run_secs: f32) -> &'static str {
+    if best_run_secs >= MIN_HAND_RUN_SECONDS {
+        "ok"
+    } else {
+        "ng_hands"
+    }
+}
+
+/// いまの時刻を index.tsv の recorded_at の形式にする
+pub(crate) fn now_recorded_at() -> String {
     let now: chrono::DateTime<chrono::Local> = SystemTime::now().into();
-    rows.push(IndexRow {
-        file_path: format!("{}/{}", dir_name, dest_name),
+    now.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+/// index.tsv の新しい 1 行(`dest_name` は `<NN>.<ext>`)
+pub(crate) fn new_take_row(
+    word: &WordSpec,
+    rep: u32,
+    dest_name: &str,
+    recorded_at: String,
+    duration_ms: u64,
+    quality_flag: String,
+) -> IndexRow {
+    IndexRow {
+        file_path: format!("{}/{}", take_dir_name(word), dest_name),
         word_id: word.word_id.clone(),
         word_romaji: word.romaji.clone(),
         word_label_ja: word.label_ja.clone(),
         rep_idx: rep,
-        recorded_at: now.format("%Y-%m-%d %H:%M:%S").to_string(),
+        recorded_at,
         duration_ms,
         quality_flag,
         notes: String::new(),
-    });
-    Ok(())
+    }
 }
 
 // ===== build-dict 用エクスポート =====
@@ -974,14 +1096,14 @@ fn longest_run_seconds(hits: &[bool], samples_per_sec: f32) -> f32 {
 
 /// 取り込んだテイクに Palm + Hand 検出をサンプルフレームだけ実行して
 /// 左右それぞれ「連続して検出できた最長区間」を秒で返す(全フレームは回さないので数秒で終わる)
-struct HandChecker {
+pub(crate) struct HandChecker {
     palm: Session,
     hand: Session,
     anchors: Vec<[f32; 2]>,
 }
 
 impl HandChecker {
-    fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         let palm = Session::builder()?
             .commit_from_file(crate::PALM_MODEL)
             .with_context(|| format!("failed to load palm model: {}", crate::PALM_MODEL))?;
@@ -996,7 +1118,7 @@ impl HandChecker {
     }
 
     /// 毎秒3フレーム程度をサンプリングして (左手の連続検出最長秒数, 右手の連続検出最長秒数) を返す
-    fn coverage(&mut self, video: &PathBuf) -> Result<(f32, f32)> {
+    pub(crate) fn coverage(&mut self, video: &PathBuf) -> Result<(f32, f32)> {
         let info = crate::probe_video(video)?;
         let step = ((info.fps / 3.0).round() as usize).max(1);
         let samples_per_sec = info.fps as f32 / step as f32;
@@ -1181,6 +1303,114 @@ mod tests {
         // words.tsv に無い語(stage 不明)はフィルタ指定時は除外、無指定なら通す
         assert!(!should_export("ok", None, Some(1)));
         assert!(should_export("ok", None, None));
+    }
+
+    // [TEST向き] 判定の境界: ちょうど MIN_HAND_RUN_SECONDS は ok(撮影セッションの取り込みと撮影モードが共有する規則)
+    #[test]
+    fn quality_flag_for_run_boundary() {
+        assert_eq!(quality_flag_for_run(MIN_HAND_RUN_SECONDS), "ok");
+        assert_eq!(quality_flag_for_run(MIN_HAND_RUN_SECONDS + 0.33), "ok");
+        assert_eq!(quality_flag_for_run(MIN_HAND_RUN_SECONDS - 0.01), "ng_hands");
+        assert_eq!(quality_flag_for_run(0.0), "ng_hands");
+    }
+
+    #[test]
+    fn take_names_and_row() {
+        let w = WordSpec {
+            word_id: "011".into(),
+            romaji: "kare".into(),
+            label_ja: "かれ".into(),
+            stage: 2,
+            target_takes: 10,
+        };
+        assert_eq!(take_dir_name(&w), "011_kare");
+        assert_eq!(take_file_name(4, "mp4"), "04.mp4");
+        assert_eq!(take_file_name(12, "mov"), "12.mov");
+        let r = new_take_row(&w, 4, "04.mp4", "2026-10-12 10:00:00".into(), 4200, "ok".into());
+        assert_eq!(r.file_path, "011_kare/04.mp4");
+        assert_eq!((r.rep_idx, r.duration_ms), (4, 4200));
+        assert_eq!((r.word_id.as_str(), r.word_romaji.as_str(), r.word_label_ja.as_str()), ("011", "kare", "かれ"));
+        assert_eq!((r.quality_flag.as_str(), r.notes.as_str()), ("ok", ""));
+    }
+
+    // index.tsv の書き込みは一時ファイル経由: commit するまで本物は変わらず、commit で置き換わり、一時ファイルは残らない
+    #[test]
+    fn write_index_is_atomic_via_a_temp_file() {
+        let dir = std::env::temp_dir().join(format!("index_atomic_test_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(INDEX_FILE);
+        let row = |n: u32, flag: &str| IndexRow {
+            file_path: format!("001_a/{:02}.mp4", n),
+            word_id: "001".into(),
+            word_romaji: "a".into(),
+            word_label_ja: "あ".into(),
+            rep_idx: n,
+            recorded_at: "2026-10-12 10:00:00".into(),
+            duration_ms: 4000,
+            quality_flag: flag.into(),
+            notes: "メモ\tタブ入り".into(),
+        };
+        write_index(&path, &[row(1, "ok")]).unwrap();
+        let v1 = std::fs::read_to_string(&path).unwrap();
+        assert!(v1.starts_with(INDEX_HEADER) && v1.lines().count() == 2, "{v1}");
+        assert!(!v1.lines().nth(1).unwrap().contains("メモ\tタブ"), "TSV に書けない文字は潰される");
+
+        // stage しただけでは本物は変わらない(書き込み途中で落ちても元が残る)
+        let staged = stage_index(&path, &[row(1, "ok"), row(2, "ng_hands")]).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), v1);
+        // abort すれば何も変わらず、一時ファイルも残らない
+        staged.abort();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), v1);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "一時ファイルが残っている");
+
+        // commit で置き換わる
+        let staged = stage_index(&path, &[row(1, "ok"), row(2, "ng_hands")]).unwrap();
+        staged.commit().unwrap();
+        let v2 = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(v2.lines().count(), 3);
+        assert!(v2.lines().nth(2).unwrap().contains("\tng_hands\t"));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "commit のあとに一時ファイルが残っている");
+        // 読み戻せる
+        assert_eq!(load_index(&path).unwrap().len(), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // 読むだけの read_words は、words.tsv が無くてもテンプレートを書き出さない(load_words との違い)
+    #[test]
+    fn read_words_never_creates_words_tsv() {
+        let dir = std::env::temp_dir().join(format!("read_words_test_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let e = read_words(&dir).unwrap_err();
+        assert!(format!("{e:#}").contains("words.tsv を読めません"), "{e:#}");
+        assert!(!dir.join(WORDS_FILE).exists());
+        std::fs::write(dir.join(WORDS_FILE), "word_id\tromaji\tlabel_ja\tstage\ttarget_takes\n").unwrap();
+        assert!(read_words(&dir).is_err(), "語が 1 つも無い");
+        std::fs::write(
+            dir.join(WORDS_FILE),
+            "word_id\tromaji\tlabel_ja\tstage\ttarget_takes\n# メモ\n001\ta\tあ\t1\t3\nbad line\n",
+        )
+        .unwrap();
+        let w = read_words(&dir).unwrap();
+        assert_eq!(w.len(), 1);
+        assert_eq!((w[0].word_id.as_str(), w[0].target_takes), ("001", 3));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // 実ファイルの最大番号 + 1(ffprobe を呼ばない版)。merge_index の結果に対する next_rep_idx と同じになる
+    #[test]
+    fn scanned_next_rep_matches_next_rep_idx() {
+        let dir = std::env::temp_dir().join(format!("scanned_rep_test_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("001_a")).unwrap();
+        for f in ["01.mp4", "03.mp4", "x.mp4", "05.txt"] {
+            std::fs::write(dir.join("001_a").join(f), b"x").unwrap();
+        }
+        let (scanned, _w) = scan_takes(&dir).unwrap();
+        assert_eq!(scanned_next_rep(&scanned, "001"), 4, "欠番(02)があっても最大 + 1");
+        assert_eq!(scanned_next_rep(&scanned, "002"), 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

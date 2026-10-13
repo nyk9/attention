@@ -41,3 +41,7 @@ transformer_burn/tests/temp_checkpoint_test*/
 # 1.0 前の gpui の版を固定するため、ここだけ Cargo.lock を追跡する(上の Cargo.lock の無視を打ち消す)
 desktop/target/
 !desktop/Cargo.lock
+
+# lan_handoff: LAN 配信ツール。配信される依存を固定するため Cargo.lock を追跡する(上の Cargo.lock の無視を打ち消す)
+lan_handoff/target/
+!lan_handoff/Cargo.lock

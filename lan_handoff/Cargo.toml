@@ -1,0 +1,39 @@
+[package]
+name = "lan_handoff"
+version = "0.1.0"
+edition = "2021"
+description = "同一LAN内で学習データ(動画・dict・ONNX)を Mac から Windows へ渡す一時配信サーバーとクライアント(TLS+指紋ピン留め)"
+
+[lib]
+name = "lan_handoff"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lan-handoff"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+# axum はボディ/レスポンス型だけを使う(ルーターやサーバーは使わない)
+axum = { version = "0.7", default-features = false }
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+hex = "0.4"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+if-addrs = "0.13"
+percent-encoding = "2"
+rand = "0.8"
+rayon = "1"
+rcgen = "0.13"
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls-manual-roots-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "fs", "sync", "io-util", "net"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["fs"] }
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"

@@ -59,7 +59,7 @@
 
 実装は `pose_extractor/src/live/json_engine.rs`(`live.rs` の子モジュール)。`live.rs` 本体の変更は、`LiveUi` にデフォルト実装つきの `preview` メソッドを足して `run_session` がフレームごとに呼ぶ点と、`mod json_engine;` の宣言だけ。`main.rs` の差分は `--engine-json` の判定と分岐の数行。ターミナル UI の挙動は変わらない。**§3.2 の提案からの変更・追加は以下のとおりで、これ以外は仕様どおり**。
 
-- 標準入力の最初の `start` で設定を受ける。`model_dir` 省略時は既定のデモ用モデル(作業ディレクトリ `pose_extractor/` 基準の相対パス。ONNX の `models/*.onnx` も同じ)。`preview` は省略 = 既定(max_fps=10, width=640)、`null` = プレビュー無し、`max_fps` は最大 30・`width` は 16〜4096 に丸める(丸めたら warn)
+- 標準入力の最初の `start` で設定を受ける。`model_dir` 省略時は既定モデル `../transformer_burn/models/rec_t10_full`(2026-10-12 に暫定の `rec_demo_center_signspan` から変更。`preprocess.json` を持つので前処理はそこから決まり、`ready.preprocess` は `"preprocess.json"` になる。環境変数 `ATTENTION_MODEL_DIR`(空文字は無視)でも既定を差し替えられ、優先順位は start の `model_dir` > 環境変数 > コード内の既定。アプリはエンジン起動時に環境変数を引き継ぐ(アプリ側に指定の UI は無い)。見つからないときのエラーには探した絶対パス・由来・環境変数名が入る。作業ディレクトリ `pose_extractor/` 基準の相対パス。ONNX の `models/*.onnx` も同じ)。`preview` は省略 = 既定(max_fps=10, width=640)、`null` = プレビュー無し、`max_fps` は最大 30・`width` は 16〜4096 に丸める(丸めたら warn)
 - `ready` に `preprocess` フィールドを追加(`"preprocess.json"` = モデルから / `"default"` = live_wizard と同じ既定)。`default` のときは info の `message` も出す。`vocab` は words.tsv の並びで、words.tsv に無いモデルのタグは末尾にタグ名のまま足す
 - イベント `{"type":"segmenter","mode":"auto"|"manual"}` を追加(`set_segmenter` が実際に反映されたとき。記録中は反映を記録終了まで延期し、info の `message` で知らせる)
 - 動画ファイル入力は、終端で `stopped` を出して終了する。「動画 + manual」は live_wizard と同じく再生開始と同時に録画を始め、終端で認識する。**start の直後に標準入力を閉じると quit 扱いで即終了するので、動画入力を手で試すときは入力を開けたままにする**(例は報告のコマンド)

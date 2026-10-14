@@ -287,7 +287,7 @@ impl Command {
                     SourceSpec::Camera { device } => json!({"kind": "camera", "device": device}),
                     SourceSpec::File { path } => json!({"kind": "file", "path": path}),
                 };
-                // model_dir と preview は省略 = エンジンの既定(デモ用モデル / 10fps・幅 640)
+                // model_dir と preview は省略 = エンジンの既定(rec_t10_full / 10fps・幅 640)
                 json!({"cmd": "start", "source": source, "segmenter": segmenter.name()})
             }
             Command::StartCapture { source, data_dir, countdown_secs } => {

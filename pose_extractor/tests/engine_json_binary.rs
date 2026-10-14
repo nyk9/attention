@@ -37,6 +37,8 @@ impl Engine {
     /// `envs` の環境変数を足して起動する
     fn spawn_with_env(path_prefix: Option<&Path>, envs: &[(&str, &str)]) -> Self {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_pose-extract"));
+        // 開発者のシェルに ATTENTION_MODEL_DIR があっても、テストの既定モデルを変えないようにする
+        cmd.env_remove("ATTENTION_MODEL_DIR");
         cmd.envs(envs.iter().copied());
         cmd.arg("--engine-json")
             .current_dir(manifest_dir())
@@ -196,7 +198,7 @@ fn models_present() -> bool {
         .iter()
         .all(|p| manifest_dir().join(p).exists())
         && manifest_dir()
-            .join("../transformer_burn/models/rec_demo_center_signspan/model.bin")
+            .join("../transformer_burn/models/rec_t10_full/model.bin")
             .exists()
 }
 
@@ -238,6 +240,46 @@ fn eof_before_start_exits_zero_with_stopped() {
     let code = e.finish(Duration::from_secs(20)).expect("終了しない");
     assert_eq!(code, 0);
     assert_eq!(e.types(), vec!["stopped"]);
+}
+
+// 既定モデルは環境変数 ATTENTION_MODEL_DIR で差し替えられ、見つからなければ
+// 「探した絶対パス・由来(環境変数)・変え方(環境変数名)」を含むエラーになる。
+// 環境変数は子プロセスにだけ渡す(このテストプロセスの環境は触らない)
+#[test]
+fn env_model_dir_is_used_when_model_dir_omitted() {
+    let mut e = Engine::spawn_with_env(None, &[("ATTENTION_MODEL_DIR", "/nonexistent/env_model")]);
+    e.send(
+        &json!({"cmd": "start", "source": {"kind": "file", "path": "/nonexistent/video.mp4"}})
+            .to_string(),
+    );
+    let err = e.wait_for("error", Duration::from_secs(60));
+    let text = err["text"].as_str().unwrap();
+    assert!(text.contains("/nonexistent/env_model/model.bin"), "{text}");
+    assert!(text.contains("環境変数 ATTENTION_MODEL_DIR"), "{text}");
+    e.close_stdin();
+    let code = e.finish(Duration::from_secs(20)).expect("終了しない");
+    assert_ne!(code, 0);
+}
+
+// start の model_dir は環境変数より優先される(由来は「明示的な指定」)。空文字の扱いは単体テスト側
+#[test]
+fn explicit_model_dir_beats_env() {
+    let mut e = Engine::spawn_with_env(None, &[("ATTENTION_MODEL_DIR", "/nonexistent/env_model")]);
+    e.send(
+        &json!({
+            "cmd": "start",
+            "source": {"kind": "file", "path": "/nonexistent/video.mp4"},
+            "model_dir": "/nonexistent/explicit_model",
+        })
+        .to_string(),
+    );
+    let err = e.wait_for("error", Duration::from_secs(60));
+    let text = err["text"].as_str().unwrap();
+    assert!(text.contains("/nonexistent/explicit_model/model.bin"), "{text}");
+    assert!(!text.contains("env_model"), "{text}");
+    assert!(text.contains("明示的な指定"), "{text}");
+    e.close_stdin();
+    e.finish(Duration::from_secs(20)).expect("終了しない");
 }
 
 // ===== 実モデル + 実動画 =====

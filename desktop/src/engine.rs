@@ -716,4 +716,54 @@ mod tests {
         assert!(!process_exists(&video.display().to_string()), "ffmpeg が残っている");
         drop(h);
     }
+    /// クイズ × 動画入力: raw_jsl の動画をカメラの代わりに流し、お題がその動画の語なら「正解」、
+    /// 別の語なら「正解」にならないことを、実エンジンの `result` で確かめる(画面は通さない。判定は quiz.rs)
+    #[test]
+    #[ignore]
+    fn quiz_scores_a_video_result_against_the_target() {
+        use crate::quiz::{Judgement, Quiz, QuizConfig};
+        let Some(loc) = real_engine() else { return eprintln!("skip: エンジンかモデルが無い") };
+        let video = loc.root.join("transformer_burn/data/raw_jsl/001_konnichiwa/05.mp4");
+        if !video.exists() {
+            return eprintln!("skip: 動画が無い");
+        }
+        let mut h = EngineHandle::spawn(&loc).unwrap();
+        let inbox = h.inbox();
+        h.send(&Command::Start {
+            source: crate::protocol::SourceSpec::File { path: video.display().to_string() },
+            segmenter: crate::protocol::SegmenterMode::Auto,
+        })
+        .unwrap();
+        let ev = wait_for(&inbox, 180, |e| matches!(e, Incoming::Event(EngineEvent::Result { .. })));
+        let vocab = ev
+            .iter()
+            .find_map(|e| match e {
+                Incoming::Event(EngineEvent::Ready { vocab, .. }) => Some(vocab.clone()),
+                _ => None,
+            })
+            .expect("ready が来ない");
+        let result = ev
+            .iter()
+            .find_map(|e| match e {
+                Incoming::Event(r @ EngineEvent::Result { .. }) => Some(r.clone()),
+                _ => None,
+            })
+            .expect("result が来ない");
+        if let EngineEvent::Result { tag, ranked, p, .. } = &result {
+            eprintln!("result top1={tag} p={p:.3} ranked={:?}", ranked.iter().map(|r| (&r.tag, r.p)).collect::<Vec<_>>());
+        }
+        // お題を 1 語に絞って 1 問のゲームにする(除外語で絞る = 画面の ATTENTION_QUIZ_EXCLUDE と同じ手段)
+        let judge_with_target = |target: &str| {
+            let excluded = vocab.iter().filter(|v| v.tag != target).map(|v| v.tag.clone()).collect();
+            let mut q = Quiz::new(QuizConfig { excluded_tags: excluded, questions_per_game: 1 });
+            q.start(&vocab, 1, 0.0).unwrap();
+            assert_eq!(q.current_target().unwrap().tag, target);
+            assert!(q.on_event(&result), "待機中の結果は受け付ける");
+            q.current_record().unwrap().judgement
+        };
+        assert_eq!(judge_with_target("konnichiwa"), Judgement::Correct);
+        assert_ne!(judge_with_target("ohayou"), Judgement::Correct);
+        h.request_stop();
+        wait_for(&inbox, 20, |e| matches!(e, Incoming::Exited { .. }));
+    }
 }

@@ -4,8 +4,12 @@
 下記「プロンプト本文」をシステムプロンプト(または会話の先頭)に置き、
 「入力形式」の形でスロット列を渡す。
 
-- 語彙表は words.tsv(`transformer_burn/data/raw_jsl/words.tsv`)から生成した(51語、2026-08-14同期)。
+- 語彙表は words.tsv(`transformer_burn/data/raw_jsl/words.tsv`)から生成した(74語、2026-10-15同期)。
   stage 2 での語彙整理(hai/iie→atteru/chigau、hanasu→iu、samui→samui-kowai 等)を反映済み。
+  052〜074(stage 3 の23語)は撮影前で、認識モデル(`rec_t10_full`、51語)のタグ語彙には
+  まだ無い。語彙表に載せただけで、これらが入力に現れるのはモデルが増えてから。
+  見出しは words.tsv のとおり(例: doko → 何処、naze → 何故)。
+  いつ・何時 / いつ・何月何日 は既存の「・」の語(are-sore など)にならって「文脈でどちらかを選ぶ」を付けた
   **認識モデルのタグ語彙(tag_vocab.json)を増やしたら語彙表も同期すること**
 
 ---
@@ -73,6 +77,29 @@ nana → 7
 hachi → 8
 kyuu → 9
 juu → 10
+dare → 誰
+nani → 何
+doko → 何処
+itsu-nanji → いつ・何時(文脈でどちらかを選ぶ)
+itsu-nangatsunannichi → いつ・何月何日(文脈でどちらかを選ぶ)
+naze → 何故
+douyatte → どうやって
+ikura → いくら
+kyou → 今日
+ashita → 明日
+kinou → 昨日
+raishuu → 来週
+senshuu → 先週
+kazoku → 家族
+tomodachi → 友達
+chichi → 父
+haha → 母
+ani → 兄
+otouto → 弟
+ane → 姉
+imouto → 妹
+sofu → 祖父
+sobo → 祖母
 
 # 整形ルール
 1. 各スロットから、文全体の文脈に最も整合する候補を1つ選ぶ

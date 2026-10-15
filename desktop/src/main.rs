@@ -19,6 +19,7 @@ mod capture_rec;
 mod engine;
 mod overlay;
 mod protocol;
+mod quiz;
 mod state;
 
 use capture_guide::{hand_run, progress as guide_progress, GuideState};
@@ -196,7 +197,7 @@ impl LiveApp {
         self.model.begin_session();
         self.guide.reset_session();
         let kind = match self.model.mode {
-            AppMode::Live => OverlayKind::Live,
+            AppMode::Live | AppMode::Quiz => OverlayKind::Live,
             AppMode::CaptureGuide | AppMode::Capture => OverlayKind::CaptureGuide,
         };
         let result: Result<EngineHandle, String> = engine::locate().and_then(|loc: EngineLocation| {
@@ -596,6 +597,8 @@ impl Render for LiveApp {
                             .child(self.render_log(cx))
                             .child(self.render_vocab(border, muted, cx))
                             .into_any_element(),
+                        // クイズの画面は Q2 で作る(いまはログだけ)
+                        AppMode::Quiz => v_flex().w(px(420.)).h_full().flex_shrink_0().gap_3().child(self.render_log(cx)).into_any_element(),
                         AppMode::CaptureGuide | AppMode::Capture => v_flex()
                             // on_children_prepainted は id を付ける前(Div)にしか呼べない
                             .when(dbg, |d| d.on_children_prepainted(|b, _, _| log_bounds("right(guide)", &b)))

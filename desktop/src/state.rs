@@ -3,6 +3,7 @@
 
 use crate::protocol::{Command, EngineEvent, RankedItem, SegmenterMode, SourceSpec, Verdict, VocabEntry};
 use crate::protocol::CaptureWord;
+use crate::quiz::{Quiz, QuizConfig};
 use std::path::Path;
 use std::collections::VecDeque;
 
@@ -34,6 +35,8 @@ pub enum AppMode {
     /// 撮影(R1)。撮影ガイドの表示に加えて、エンジンが録画・判定・登録をする。
     /// エンジンを撮影モード(`mode: "capture"`)で起動する = **このモードだけが、書き込みうるエンジンを起動する**
     Capture,
+    /// クイズ。エンジンはライブ認識と同じ設定(自動区切り)で起動し、`result` を画面側のクイズの判定に流す
+    Quiz,
 }
 
 impl AppMode {
@@ -140,6 +143,8 @@ pub struct AppModel {
     pub mode: AppMode,
     /// 撮影モード(`AppMode::Capture`)の状態。ほかのモードでは使わない
     pub capture: CaptureView,
+    /// クイズモード(`AppMode::Quiz`)の進行。ほかのモードでは使わない。メモリのみ(保存しない)
+    pub quiz: Quiz,
 }
 
 impl AppModel {
@@ -155,6 +160,7 @@ impl AppModel {
             segmenter: SegmenterMode::Auto,
             mode: AppMode::Live,
             capture: CaptureView::default(),
+            quiz: Quiz::new(QuizConfig::default()),
         }
     }
 
@@ -166,6 +172,7 @@ impl AppModel {
         self.history.clear();
         self.error = None;
         self.capture = CaptureView::default();
+        self.quiz.reset();
     }
 
     pub fn push_log(&mut self, level: LogLevel, text: impl Into<String>) {
@@ -182,6 +189,8 @@ impl AppModel {
         // 録画の途中状態は引きずらない(直近の登録結果だけ残す)
         let last_saved = self.capture.last_saved.take();
         self.capture = CaptureView { last_saved, ..CaptureView::default() };
+        // ゲームの途中でエンジンが止まったら中断する(結果が来ないまま時間切れを積まないように)
+        self.quiz.reset();
     }
 
     /// プレビューと status 以外のイベントの反映(status は `set_status`、preview は画面側で扱う)
@@ -208,6 +217,10 @@ impl AppModel {
                 });
             }
             EngineEvent::Preview { .. } => {}
+            // クイズでは結果をクイズの判定に流す(お題を待っているときだけ受け付ける。判定は Quiz が決める)
+            EngineEvent::Result { .. } if self.mode == AppMode::Quiz => {
+                self.quiz.on_event(ev);
+            }
             // 撮影ガイドでは認識結果を出さない(開始操作を送らないので、カメラでは来ない。
             // 動画入力 + 手動では、エンジンが再生開始と同時に記録し終端で認識するので来ることがある)
             EngineEvent::Result { .. } if self.mode != AppMode::Live => {}
@@ -300,6 +313,11 @@ impl AppModel {
         self.phase == Phase::Idle
     }
 
+    /// クイズが動いている(クイズモードで、エンジンが認識中)か。クイズの操作を受け付けてよい段階
+    pub fn quiz_running(&self) -> bool {
+        self.mode == AppMode::Quiz && self.phase == Phase::Running
+    }
+
     /// 手動の開始/停止(toggle)を送ってよいか。撮影ガイドでは送らない(語の認識をしない)
     pub fn toggle_allowed(&self) -> bool {
         self.mode == AppMode::Live && self.phase == Phase::Running
@@ -313,6 +331,8 @@ impl AppModel {
         let segmenter = match self.mode {
             AppMode::Live => self.segmenter,
             AppMode::CaptureGuide => SegmenterMode::Manual,
+            // クイズはライブ認識と同じ(自動区切り)。画面の区切り方の選択には左右されない
+            AppMode::Quiz => SegmenterMode::Auto,
             AppMode::Capture => {
                 return Command::StartCapture {
                     source,
@@ -809,5 +829,60 @@ mod tests {
         assert_eq!(format_secs(f64::NAN), "0.0 秒");
         assert_eq!(hands_text("LR"), "両手が見えています");
         assert_eq!(hands_text("none"), "手が見えていません");
+    }
+    #[test]
+    fn quiz_mode_routes_results_to_the_quiz_only() {
+        use crate::quiz::Stage;
+        let vocab: Vec<VocabEntry> =
+            ["a", "b", "c"].iter().map(|t| VocabEntry { tag: t.to_string(), label: t.to_string() }).collect();
+        let mut m = AppModel::new();
+        m.mode = AppMode::Quiz;
+        m.quiz.config.excluded_tags.clear();
+        m.begin_session();
+        m.apply(&EngineEvent::Ready { vocab: vocab.clone(), model_dir: String::new(), palm_roi: String::new(),
+            frame_select: String::new(), frames: 10, segmenter: "manual".into(), preprocess: String::new() });
+        assert!(m.quiz_running());
+        // ready の segmenter(manual)は、ライブ以外では選択値を書き換えない
+        assert_eq!(m.segmenter, SegmenterMode::Auto);
+        m.quiz.start(&m.vocab, 1, 0.0).unwrap();
+        let target = m.quiz.current_target().unwrap().tag.clone();
+        let ev = EngineEvent::Result {
+            tag: target.clone(), label: target.clone(), p: 0.9,
+            ranked: vec![RankedItem { tag: target, label: "x".into(), p: 0.9 }],
+            low_confidence: false, span: None, buffered: 0, duration_secs: 1.0,
+            selected_with_hand: 5, selected_total: 10,
+        };
+        m.apply(&ev);
+        assert_eq!(m.quiz.score(), crate::quiz::POINTS_CORRECT);
+        // ライブの履歴・現在の結果には流れない
+        assert!(m.current.is_none() && m.history.is_empty());
+        // エンジン終了でゲームは中断される
+        m.engine_exited();
+        assert_eq!(m.quiz.stage, Stage::Ready);
+        assert!(!m.quiz_running());
+    }
+
+    #[test]
+    fn quiz_starts_the_engine_like_live_auto_and_results_are_ignored_in_capture_modes() {
+        let mut m = AppModel::new();
+        m.mode = AppMode::Quiz;
+        m.segmenter = SegmenterMode::Manual; // ライブ側の選択が手動でも、クイズは自動で起動する
+        let cmd = m.start_command(SourceSpec::Camera { device: "0".into() }, Path::new("/d"));
+        assert_eq!(cmd, Command::Start { source: SourceSpec::Camera { device: "0".into() }, segmenter: SegmenterMode::Auto });
+        // 撮影モードではクイズに流さない(従来どおり無視)
+        for mode in [AppMode::CaptureGuide, AppMode::Capture] {
+            let mut m = AppModel::new();
+            m.mode = mode;
+            m.quiz.config.excluded_tags.clear();
+            m.quiz.start(&[VocabEntry { tag: "a".into(), label: "a".into() }], 1, 0.0).unwrap();
+            m.apply(&result_ev("a", 0.9, false));
+            assert!(m.quiz.records().is_empty(), "{mode:?}");
+        }
+        // モード切替は待機中だけ(既存の規則のまま)
+        let mut m = AppModel::new();
+        assert!(m.mode_selectable());
+        m.phase = Phase::Running;
+        assert!(!m.mode_selectable());
+        assert!(!m.toggle_allowed() || m.mode == AppMode::Live);
     }
 }

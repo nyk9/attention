@@ -231,8 +231,51 @@ struct PoseDictMeta {
     /// どのフレームを選んだか(既定 "uniform" が従来の挙動)。実験6 以前の dict には無い。
     /// **学習と推論でここが食い違うと train/test 不一致になる**
     frame_select: String,
+    /// この dict を作った環境。Mac と Windows で ffmpeg の色変換の丸めが違い sequence が一致しない
+    /// ため(2026-10-14 実測)、環境をまたぐ比較で差の出どころを辿れるように残す。旧 dict には無い。
+    /// 時刻は入れない(dict 結合時の metadata 一致確認を妨げないため)
+    build_env: BuildEnv,
     /// 辞書に含めたタグ数
     tag_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct BuildEnv {
+    /// `std::env::consts::OS`(例: macos / windows)
+    os: String,
+    /// `std::env::consts::ARCH`(例: aarch64 / x86_64)
+    arch: String,
+    /// `ffmpeg -version` の先頭行から取った版(例: "8.1.1")。取得できなければ "unknown"
+    ffmpeg: String,
+}
+
+impl BuildEnv {
+    fn detect() -> Self {
+        let ffmpeg = Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| parse_ffmpeg_version(&s))
+            .unwrap_or_else(|| "unknown".into());
+        Self {
+            os: std::env::consts::OS.into(),
+            arch: std::env::consts::ARCH.into(),
+            ffmpeg,
+        }
+    }
+}
+
+/// `ffmpeg -version` の出力から版の文字列を取り出す。
+/// 先頭行が "ffmpeg version 8.1.1 Copyright ..." の形でなければ "unknown"
+fn parse_ffmpeg_version(output: &str) -> String {
+    output
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("ffmpeg version "))
+        .and_then(|rest| rest.split_whitespace().next())
+        .map(str::to_string)
+        .unwrap_or_else(|| "unknown".into())
 }
 
 #[derive(Debug, Serialize)]
@@ -1122,6 +1165,7 @@ fn build_dict_mode(
             coverage_basis: "selected frames only (the frames that became `sequence`)".into(),
             palm_roi: roi_mode.label(),
             frame_select: select.label(),
+            build_env: BuildEnv::detect(),
             tag_count: tags.len(),
         },
         tags,
@@ -3583,6 +3627,36 @@ fn add_body_anchors_to_dict(dict_in: &Path, video_dir: &Path, dict_out: &Path) -
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn parse_ffmpeg_version_reads_first_line() {
+        let out = "ffmpeg version 8.1.1 Copyright (c) 2000-2026 the FFmpeg developers\nbuilt with Apple clang\n";
+        assert_eq!(parse_ffmpeg_version(out), "8.1.1");
+        // Windows ポータブル版などは版の後ろにビルド名が付く
+        assert_eq!(
+            parse_ffmpeg_version("ffmpeg version 9.0.2-essentials_build-www.gyan.dev Copyright"),
+            "9.0.2-essentials_build-www.gyan.dev"
+        );
+    }
+
+    #[test]
+    fn parse_ffmpeg_version_unknown_when_unrecognized() {
+        assert_eq!(parse_ffmpeg_version(""), "unknown");
+        assert_eq!(parse_ffmpeg_version("something else\n"), "unknown");
+    }
+
+    #[test]
+    fn build_env_serializes_without_timestamp() {
+        let env = BuildEnv {
+            os: "macos".into(),
+            arch: "aarch64".into(),
+            ffmpeg: "8.1.1".into(),
+        };
+        let v = serde_json::to_value(&env).unwrap();
+        assert_eq!(v["os"], "macos");
+        assert_eq!(v["ffmpeg"], "8.1.1");
+        assert_eq!(v.as_object().unwrap().len(), 3);
+    }
 
     /// 計測用テストが環境変数から ROI モードを選ぶための共通パーサ。
     fn parse_roi_mode(name: &str) -> PalmRoiMode {

@@ -433,6 +433,19 @@ mod tests {
     }
 
     #[test]
+    fn human_override_works_on_a_close_question_too() {
+        let (mut q, t) = started();
+        q.on_event(&result(["x1", &t[0], "x2"])); // お題は 2 位 = おしい(1 点)
+        assert_eq!(q.score(), POINTS_CLOSE);
+        assert!(q.mark_correct());
+        let r = q.current_record().unwrap();
+        assert_eq!(r.judgement, Judgement::Close, "AI の判定は残す");
+        assert!(r.human_override);
+        assert_eq!(q.score(), POINTS_CORRECT, "1 点が 3 点に置き換わる(加算ではない)");
+        assert!(!q.mark_correct());
+    }
+
+    #[test]
     fn human_override_is_limited_to_wrong_or_close() {
         // AI が正解 → 不要
         let (mut q, t) = started();

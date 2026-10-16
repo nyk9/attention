@@ -883,6 +883,9 @@ mod tests {
         assert!(m.mode_selectable());
         m.phase = Phase::Running;
         assert!(!m.mode_selectable());
-        assert!(!m.toggle_allowed() || m.mode == AppMode::Live);
+        // 手動の開始/停止(toggle)はライブ認識の認識中だけ。クイズでは送らない(スペースはクイズの操作に使う)
+        assert!(m.toggle_allowed(), "対照: ライブ認識の認識中は送ってよい");
+        m.mode = AppMode::Quiz;
+        assert!(!m.toggle_allowed());
     }
 }

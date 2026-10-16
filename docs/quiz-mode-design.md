@@ -72,6 +72,14 @@ AI が読み違えたときの救済。判定表示中、「おしい」「ち�
 - 動画スモーク(実エンジン、`raw_jsl/001_konnichiwa/05.mp4`、自動区切り): `result` は top-1 konnichiwa(p=0.996)。**このスモークが使ったモデルは `rec_t10_full` ではない**。`pose_extractor/target/release/pose-extract` が古く(2026-10-13 ビルド。`rec_t10_full` を既定にしたコミット 6891039 を含まないソースでビルドされたとみられる)、旧既定の `rec_demo_center_signspan`(`preprocess.json` なし、前処理は center-square + サイン区間の既定)で動いていた(`ready` の `model_dir` で確認)。そのため、判定ロジック(クイズの流れ・点数)の確認には使えるが、`rec_t10_full` の精度の根拠にはならない。お題を konnichiwa に絞ると「正解」。ohayou に絞ると「正解」にならない(`cargo test --release quiz_scores -- --ignored`。テストが断言しているのは `assert_ne!(… , Correct)` = 正解にならない、までで、「ちがう」かどうかは断言していない)。アプリ全体の run のログでは、お題 ohayou が「ちがう 0 点」になっていた。
 - アプリ全体(`ATTENTION_APP_VIDEO` で動画入力。同じ古いバイナリ = `rec_demo_center_signspan`): ready → スタート → お題 konnichiwa → 結果受信 → 「正解 3 点」→ 次へ → 総括、の遷移をログで確認。お題 ohayou の run では「ちがう 0 点」→「正解にする」で「正解※人 3 点」。
 
+### rec_t10_full での再実測と release バイナリの再ビルド(2026-10-16)
+
+- 別ディレクトリ(`cargo build --release --target-dir <スクラッチパッド>`、クリーンビルド 2分23秒)に作った pose-extract で、model_dir なし・環境変数なしの `ready` は `model_dir=rec_t10_full`、`palm_roi=full-frame`、`frame_select=uniform`、`preprocess=preprocess.json`、警告なし。同じ動画(`001_konnichiwa/05.mp4`)の `result` は top-1 konnichiwa **p=0.984**(2位 konbanwa 0.016、3位 iu 0.0001)。クイズの動画スモーク(`quiz_scores_a_video_result_against_the_target`)は、この `rec_t10_full` でも「正解」になった(ohayou に絞ると正解にならない)。
+- その後、ユーザーの承認(2026-10-16、ワーカー側でユーザー本人に確認)を得て、`pose_extractor/target/release/pose-extract` を `cd pose_extractor && cargo build --release`(増分 18.9 秒)で**置き換えた**。置き換え前のバイナリ(2026-10-13 16:53 ビルド、sha256 `5b494012…59d7b`)は作業用のスクラッチパッドに退避した(リポジトリ外・一時置き場。恒久の保管ではない)。置き換え後の sha256 は `f6271749…bb0`。
+- 置き換え後の既定動作: model_dir なし・環境変数なしの `start` で、`ready` が `model_dir=rec_t10_full`、`preprocess=preprocess.json`、警告なし。`result` は konnichiwa p=0.9838。
+- desktop も `cargo build --release` で最新にし、通常起動(`ATTENTION_ROOT` なし、`ATTENTION_APP_MODE=quiz`、動画入力)で、お題 konnichiwa が「○ 正解(3 点)」(`result` p=0.984)、「preprocess.json が無い」メッセージは出なかった。アプリの診断ログは `ready` の `model_dir` を出さないため、アプリ経由で `rec_t10_full` を読んだことは p=0.984(デモモデルは 0.996)と警告の不在からの推定で、`model_dir` の直接確認ではない。
+- 上記は 1 本の動画での確認で、`rec_t10_full` の精度の根拠にはならない。
+
 ## 既知の表示のずれ
 
 - 出題候補が `questions_per_game`(5)に満たないとき、開始前(Ready)の画面は「5問・満点 15 点」と出す(`quiz_view.rs` の Ready の表示。実際の問題数は `start` で候補の数に縮む)。開始後の「N / 総数」「合計 x / 満点」は実際の問題数で出る。現語彙(51 語)から除外 6 語を引いても候補は 45 語あるので、現状は起きない。

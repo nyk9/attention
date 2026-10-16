@@ -19,6 +19,8 @@ mod capture_rec;
 mod engine;
 mod overlay;
 mod protocol;
+mod quiz;
+mod quiz_view;
 mod state;
 
 use capture_guide::{hand_run, progress as guide_progress, GuideState};
@@ -103,6 +105,10 @@ struct LiveApp {
     last_guide_log: String,
     /// 本物のデータへの書き込み前の確認の状態(撮影の採用。アプリ起動中の最初の採用だけ確認する)
     accept_gate: capture_rec::AcceptGate,
+    /// クイズの時計の起点(アプリ起動)
+    started: Instant,
+    /// 診断用: 前回ログに出したクイズの状態(変化したときだけ出す)
+    last_quiz_log: String,
 }
 
 impl LiveApp {
@@ -168,11 +174,21 @@ impl LiveApp {
             guide: GuideState::from_choice(data_choice),
             last_guide_log: String::new(),
             accept_gate: capture_rec::AcceptGate::default(),
+            started: Instant::now(),
+            last_quiz_log: String::new(),
         };
 
         // 開発・検証用: ATTENTION_APP_MODE=capture-guide で撮影ガイドモードから始める
         if std::env::var("ATTENTION_APP_MODE").is_ok_and(|v| v.trim() == "capture-guide") {
             app.model.mode = AppMode::CaptureGuide;
+        }
+        // ATTENTION_APP_MODE=quiz でクイズから始める。ATTENTION_QUIZ_EXCLUDE=a,b で出題から除く語を差し替える
+        // (空文字なら除外なし。動画入力のスモークで、お題を特定の語に絞るのにも使う)
+        if std::env::var("ATTENTION_APP_MODE").is_ok_and(|v| v.trim() == "quiz") {
+            app.model.mode = AppMode::Quiz;
+        }
+        if let Ok(v) = std::env::var("ATTENTION_QUIZ_EXCLUDE") {
+            app.model.quiz.config.excluded_tags = quiz::parse_excluded(&v);
         }
         // ATTENTION_APP_MODE=capture で撮影(録画あり)から始める
         if std::env::var("ATTENTION_APP_MODE").is_ok_and(|v| v.trim() == "capture") {
@@ -196,7 +212,7 @@ impl LiveApp {
         self.model.begin_session();
         self.guide.reset_session();
         let kind = match self.model.mode {
-            AppMode::Live => OverlayKind::Live,
+            AppMode::Live | AppMode::Quiz => OverlayKind::Live,
             AppMode::CaptureGuide | AppMode::Capture => OverlayKind::CaptureGuide,
         };
         let result: Result<EngineHandle, String> = engine::locate().and_then(|loc: EngineLocation| {
@@ -324,11 +340,20 @@ impl LiveApp {
             "discard" => self.capture_discard(cx),
             "retake" => self.capture_retake(cx),
             "space" => self.toggle(cx),
+            "quiz_start" => self.quiz_start(cx),
+            "quiz_pass" => self.quiz_pass(cx),
+            "quiz_correct" => self.quiz_correct(cx),
+            "quiz_next" => self.quiz_next(cx),
             _ => {}
         }
     }
 
     fn toggle(&mut self, cx: &mut Context<Self>) {
+        // クイズでは、スペースキーは「スタート / 次へ」
+        if self.model.mode == AppMode::Quiz {
+            self.quiz_space(cx);
+            return;
+        }
         // 撮影(録画)では、スペースキーは録画の開始/停止
         if self.model.mode == AppMode::Capture {
             let w = self.displayed_word_id();
@@ -385,6 +410,14 @@ impl LiveApp {
 
     /// Inbox から最新の状態を取り出して反映する(UI スレッドで定期的に呼ばれる)
     fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // クイズの時計を進める(時間切れ・自動で次へ)。残り時間バーのために、出題中・判定中は毎回再描画する
+        if self.model.quiz_running() {
+            let now = self.quiz_now();
+            let changed = self.model.quiz.tick(now);
+            if changed || matches!(self.model.quiz.stage, quiz::Stage::Asking { .. } | quiz::Stage::Judged { .. }) {
+                cx.notify();
+            }
+        }
         // 判定済みでなくなったら(破棄・撮り直し・エンジン終了など)、採用の確認は閉じる
         let judged = self.model.capture_running_judged();
         if self.accept_gate.asking() && !judged {
@@ -398,6 +431,7 @@ impl LiveApp {
         }
         let Some(inbox) = self.inbox.clone() else {
             self.log_guide();
+            self.log_quiz();
             return;
         };
         let d = inbox.drain();
@@ -476,6 +510,7 @@ impl LiveApp {
             cx.notify();
         }
         self.log_guide();
+        self.log_quiz();
     }
 
     /// 診断用(ATTENTION_APP_DEBUG): 撮影ガイドの画面に渡す文字・色の判定を、変わったときだけ標準エラーへ出す。
@@ -595,6 +630,17 @@ impl Render for LiveApp {
                             .child(self.render_history(cx))
                             .child(self.render_log(cx))
                             .child(self.render_vocab(border, muted, cx))
+                            .into_any_element(),
+                        AppMode::Quiz => v_flex()
+                            .id("quiz-column")
+                            .w(px(420.))
+                            .h_full()
+                            .min_h_0()
+                            .flex_shrink_0()
+                            .gap_3()
+                            .overflow_y_scroll()
+                            .child(self.render_quiz_panel(cx))
+                            .child(self.render_log(cx))
                             .into_any_element(),
                         AppMode::CaptureGuide | AppMode::Capture => v_flex()
                             // on_children_prepainted は id を付ける前(Div)にしか呼べない
@@ -789,6 +835,7 @@ impl LiveApp {
 
         let guide_mode = self.model.mode.shows_guide();
         let capture_mode = self.model.mode == AppMode::Capture;
+        let quiz_mode = self.model.mode == AppMode::Quiz;
         let mut start = Button::new("start")
             .primary()
             .large()
@@ -807,7 +854,7 @@ impl LiveApp {
                     .gap_3()
                     .items_center()
                     .child(div().text_size(px(16.)).child("モード"))
-                    .child(mode_button("mode-live", "ライブ認識", !guide_mode, AppMode::Live, mode_ok, cx))
+                    .child(mode_button("mode-live", "ライブ認識", self.model.mode == AppMode::Live, AppMode::Live, mode_ok, cx))
                     .child(mode_button(
                         "mode-guide",
                         "撮影ガイド(録画なし)",
@@ -817,6 +864,7 @@ impl LiveApp {
                         cx,
                     ))
                     .child(mode_button("mode-capture", "撮影(録画あり)", capture_mode, AppMode::Capture, mode_ok, cx))
+                    .child(mode_button("mode-quiz", "クイズ", quiz_mode, AppMode::Quiz, mode_ok, cx))
                     .child(
                         div()
                             .text_size(px(14.))
@@ -838,7 +886,7 @@ impl LiveApp {
                             .on_click(cx.listener(|this, _, _w, cx| this.stop(cx))),
                     )
                     // 撮影ガイドでは手動の開始/停止を出さない(語の認識をしない)
-                    .when(!guide_mode, |d| {
+                    .when(!guide_mode && !quiz_mode, |d| {
                         d.child(
                             Button::new("toggle")
                                 .large()
@@ -854,6 +902,12 @@ impl LiveApp {
                     .text_size(px(16.))
                     .text_color(cx.theme().muted_foreground)
                     .child("撮影(録画あり): 右の「録画開始」を押すと、カウントダウンのあとに録画します。録画中は画面に「● 録画中」と出ます。採用するまで登録先には何も書きません。語の認識はしません")
+                    .into_any_element()
+            } else if quiz_mode {
+                div()
+                    .text_size(px(16.))
+                    .text_color(cx.theme().muted_foreground)
+                    .child("クイズ: ライブ認識と同じ自動区切り(手の出入り)で判定します。映像・点数は保存しません")
                     .into_any_element()
             } else if guide_mode {
                 div()
@@ -941,31 +995,7 @@ impl LiveApp {
                         .text_color(if r.low_confidence { cx.theme().warning } else { cx.theme().foreground })
                         .child(SharedString::from(r.label.clone())),
                 )
-                .children(r.top.iter().enumerate().map(|(i, item)| {
-                    h_flex()
-                        .gap_2()
-                        .items_center()
-                        .child(
-                            div()
-                                .w(px(190.))
-                                .flex_shrink_0()
-                                .text_size(px(18.))
-                                .truncate()
-                                .child(SharedString::from(format!("{}. {}", i + 1, item.label))),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .child(Progress::new().value(percent(item.p)).bg(bar_color(i)).h(px(12.))),
-                        )
-                        .child(
-                            div()
-                                .w(px(56.))
-                                .flex_shrink_0()
-                                .text_size(px(16.))
-                                .child(SharedString::from(format!("{:.0}%", percent(item.p)))),
-                        )
-                })),
+                .children(top_bar_rows(&r.top)),
         }
     }
 
@@ -1494,6 +1524,34 @@ fn seg_button(
     } else {
         b.outline()
     }
+}
+
+/// 上位候補の棒グラフ(ライブの認識結果とクイズの判定表示で共有)
+fn top_bar_rows(top: &[protocol::RankedItem]) -> Vec<gpui::Div> {
+    top.iter()
+        .enumerate()
+        .map(|(i, item)| {
+            h_flex()
+                .gap_2()
+                .items_center()
+                .child(
+                    div()
+                        .w(px(190.))
+                        .flex_shrink_0()
+                        .text_size(px(18.))
+                        .truncate()
+                        .child(SharedString::from(format!("{}. {}", i + 1, item.label))),
+                )
+                .child(div().flex_1().child(Progress::new().value(percent(item.p)).bg(bar_color(i)).h(px(12.))))
+                .child(
+                    div()
+                        .w(px(56.))
+                        .flex_shrink_0()
+                        .text_size(px(16.))
+                        .child(SharedString::from(format!("{:.0}%", percent(item.p)))),
+                )
+        })
+        .collect()
 }
 
 fn history_row(r: &Recognized) -> impl IntoElement {

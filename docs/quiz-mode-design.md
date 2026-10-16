@@ -69,8 +69,8 @@ AI が読み違えたときの救済。判定表示中、「おしい」「ち�
 ## 検証(2026-10-16、ワーカーによる)
 
 - `cd desktop && cargo test`: 113 件パス・0 件失敗・7 件 ignore(変更前のベースラインは 95 件パス。追加 18 件 = quiz.rs 16 + state.rs 2)。`cargo build --release` は警告なしで通る。
-- 動画スモーク(実エンジン、`raw_jsl/001_konnichiwa/05.mp4`、自動区切り、モデル `rec_t10_full`): `result` は top-1 konnichiwa(p=0.996)。お題を konnichiwa に絞ると「正解」、ohayou に絞ると「正解」にならない(`cargo test --release quiz_scores -- --ignored`)。
-- アプリ全体(`ATTENTION_APP_VIDEO` で動画入力): ready → スタート → お題 konnichiwa → 結果受信 → 「正解 3 点」→ 次へ → 総括、の遷移をログで確認。お題 ohayou の run では「ちがう 0 点」→「正解にする」で「正解※人 3 点」。
+- 動画スモーク(実エンジン、`raw_jsl/001_konnichiwa/05.mp4`、自動区切り): `result` は top-1 konnichiwa(p=0.996)。**このスモークが使ったモデルは `rec_t10_full` ではない**。`pose_extractor/target/release/pose-extract` が古く(2026-10-13 ビルド。`rec_t10_full` を既定にしたコミット 6891039 を含まないソースでビルドされたとみられる)、旧既定の `rec_demo_center_signspan`(`preprocess.json` なし、前処理は center-square + サイン区間の既定)で動いていた(`ready` の `model_dir` で確認)。そのため、判定ロジック(クイズの流れ・点数)の確認には使えるが、`rec_t10_full` の精度の根拠にはならない。お題を konnichiwa に絞ると「正解」、ohayou に絞ると「正解」にならない(`cargo test --release quiz_scores -- --ignored`)。
+- アプリ全体(`ATTENTION_APP_VIDEO` で動画入力。同じ古いバイナリ = `rec_demo_center_signspan`): ready → スタート → お題 konnichiwa → 結果受信 → 「正解 3 点」→ 次へ → 総括、の遷移をログで確認。お題 ohayou の run では「ちがう 0 点」→「正解にする」で「正解※人 3 点」。
 
 ## 未確認
 
@@ -80,5 +80,5 @@ AI が読み違えたときの救済。判定表示中、「おしい」「ち�
 - **お題を出す直前のサインの結果が新しい問に混ざる可能性**: 待機状態のときだけ受け付ける規則は入れたが、次の問に移った直後にエンジンが前のサインの区切りを確定して `result` を返した場合は、新しい問の答えとして判定される。起きる頻度は未測定。
 - **人間判定の押す余裕**: 判定表示は 3 秒で自動で次へ進む。「正解にする」を押せるのは判定表示の間だけで、3 秒で足りるかは未確認。足りなければ自動送りを止める、総括からも押せるようにする、などが考えられる(未実装)。
 - 点数(3 / 1 / 0)・除外語・5 問・30 秒・3 秒は提案値・仮の値で、デモでの体感は未確認。
-- 語彙は `ready.vocab`(現在 `rec_t10_full` の 51 語)。stage 3 の語(例: kazoku)はモデルに無いので出題されない。
-- エンジン起動時に「モデルに preprocess.json が無いため、既定の前処理を使います」というメッセージが出た(`models/rec_t10_full/preprocess.json` は存在する)。エンジンが読んでいるモデルの場所と一致しているかは、今回は調べていない(クイズの変更とは無関係)。
+- 語彙は `ready.vocab`(51 語。`rec_t10_full` でも、スモークで使った旧既定の `rec_demo_center_signspan` でも 51 語)。stage 3 の語(例: kazoku)はモデルに無いので出題されない。
+- エンジン起動時に「モデルに preprocess.json が無いため、既定の前処理を使います」というメッセージが出た。原因は上記の古い release バイナリ(`preprocess.json` の読み込み失敗ではない)。同じバイナリに `start` の `model_dir` で `rec_t10_full` を指定すると `preprocess.json` を読み、警告は出ない。なお、この古いバイナリは環境変数 `ATTENTION_MODEL_DIR` を無視する。ソースの現在の既定(`pose_extractor/src/live.rs`)は `rec_t10_full`。再ビルド後の実測は未記録。

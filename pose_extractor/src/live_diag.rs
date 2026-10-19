@@ -622,6 +622,82 @@ fn live_diag_report() {
     eprint!("{}", report("全体 stride=2(半分に間引き。カメラ約15fps 相当)", &total[1]));
 }
 
+/// Palm / Hand 1 回あたりの時間を「前処理」と「ONNX 推論」に分けて測る(追跡で何が省けるかの見積り用)。
+/// 環境変数 LIVE_DIAG_VIDEOS / LIVE_DIAG_ROI は `live_diag_report` と同じ。
+/// 実行: `cargo test --release live_diag_timing -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn live_diag_timing() {
+    let roi = match std::env::var("LIVE_DIAG_ROI").as_deref() {
+        Ok("center") => PalmRoiMode::CenterSquare,
+        _ => PalmRoiMode::FullFrame,
+    };
+    let videos: Vec<PathBuf> = match std::env::var("LIVE_DIAG_VIDEOS") {
+        Ok(v) => v.split(':').map(PathBuf::from).collect(),
+        Err(_) => crate::tests::sample_raw_jsl_takes(16),
+    };
+    let anchors = load_palm_anchors();
+    let mut palm = Session::builder().unwrap().commit_from_file(PALM_MODEL).unwrap();
+    let mut hand = Session::builder().unwrap().commit_from_file(HAND_MODEL).unwrap();
+    let ms = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1000.0;
+    // (palm 前処理, palm 推論+出力取り出し+候補, NMS, hand 前処理, hand 推論)
+    let (mut pp, mut pi, mut nm, mut hp, mut hi) = (vec![], vec![], vec![], vec![], vec![]);
+    let mut warm = 5;
+    for video in &videos {
+        let (info, _) = fps_of(video);
+        extract_frames(&video.to_path_buf(), info.width, info.height, |_i, frame| {
+            let (w, h) = (frame.shape()[1] as u32, frame.shape()[0] as u32);
+            let r = palm_rois(roi, w, h)[0];
+            let t = std::time::Instant::now();
+            let pre = preprocess_for_palm_roi(&frame, r)?;
+            let t_pre = ms(t);
+            let t = std::time::Instant::now();
+            let v = Value::from_array((pre.shape.clone(), pre.data.clone()))?;
+            let outs = palm.run(ort::inputs!["input_1" => v])?;
+            let _ = outs["Identity"].try_extract_tensor::<f32>()?;
+            let _ = outs["Identity_1"].try_extract_tensor::<f32>()?;
+            drop(outs);
+            let t_run = ms(t);
+            let t = std::time::Instant::now();
+            let cands = palm_candidates(&mut palm, &frame, &anchors, r)?; // 推論をもう一度含むので NMS 分だけ後で引く
+            let t_cand_total = ms(t);
+            let t = std::time::Instant::now();
+            let boxes = nms_palm_candidates(cands);
+            let t_nms = ms(t);
+            let mut hand_pre = 0.0;
+            let mut hand_run = 0.0;
+            if let Some(b) = boxes.first() {
+                let t = std::time::Instant::now();
+                let hp_ = preprocess_for_hand_landmark(&frame, b)?;
+                hand_pre = ms(t);
+                let t = std::time::Instant::now();
+                let v = Value::from_array((hp_.shape, hp_.data))?;
+                let outs = hand.run(ort::inputs!["input_1" => v])?;
+                let _ = outs["Identity"].try_extract_tensor::<f32>()?;
+                hand_run = ms(t);
+            }
+            let _ = t_cand_total;
+            if warm > 0 {
+                warm -= 1;
+            } else {
+                pp.push(t_pre as f32);
+                pi.push(t_run as f32);
+                nm.push(t_nms as f32);
+                if hand_pre > 0.0 {
+                    hp.push(hand_pre as f32);
+                    hi.push(hand_run as f32);
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+    eprintln!("roi={}  (ms。Palm 前処理=クロップ+リサイズ+正規化 / Palm 推論=ONNX run+出力取り出し)", roi.label());
+    for (n, v) in [("Palm 前処理", &pp), ("Palm 推論", &pi), ("Palm NMS", &nm), ("Hand 前処理(手あり)", &hp), ("Hand 推論(手あり)", &hi)] {
+        eprint!("{}", dist_line(n, v));
+    }
+}
+
 #[cfg(test)]
 mod unit {
     use super::*;

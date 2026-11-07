@@ -584,7 +584,12 @@ fn live_diag_report() {
             Ok(())
         })
         .unwrap();
-        let name = video.file_stem().unwrap().to_string_lossy().to_string();
+        let stem = video.file_stem().unwrap().to_string_lossy().to_string();
+        // raw_jsl は <word_id>_<romaji>/<rep>.mp4 なので、親ディレクトリ名を付けて出力の衝突を避ける
+        let name = match video.parent().and_then(|p| p.file_name()) {
+            Some(d) => format!("{}_{}", d.to_string_lossy(), stem),
+            None => stem,
+        };
         let refs: Vec<&FrameObs> = obs.iter().collect();
         let mut line = format!("{:<28} {:>4} フレーム {:.1}fps", name, obs.len(), fps);
         let mut flags1 = Vec::new();

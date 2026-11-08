@@ -1,4 +1,6 @@
 mod live;
+#[cfg(test)]
+mod live_diag;
 mod progress;
 
 use anyhow::{Context, Result};
@@ -2349,6 +2351,17 @@ fn palm_candidates(
     anchors: &[[f32; 2]],
     roi: Roi,
 ) -> Result<Vec<(f32, [f32; 4], Vec<[f32; 2]>)>> {
+    palm_candidates_above(session, frame, anchors, roi, PALM_SCORE_THRESHOLD)
+}
+
+/// `palm_candidates` のスコア閾値を指定できる版(診断用に低い閾値で呼ぶ。本番は 0.5 固定)。
+fn palm_candidates_above(
+    session: &mut Session,
+    frame: &Array3<u8>,
+    anchors: &[[f32; 2]],
+    roi: Roi,
+    score_threshold: f32,
+) -> Result<Vec<(f32, [f32; 4], Vec<[f32; 2]>)>> {
     let pre = preprocess_for_palm_roi(frame, roi)?;
     let input_value = Value::from_array((pre.shape.clone(), pre.data.clone()))?;
     let outputs = session.run(ort::inputs!["input_1" => input_value])?;
@@ -2369,7 +2382,7 @@ fn palm_candidates(
     for i in 0..anchors.len() {
         let raw = score_data[i] as f64;
         let s = (1.0 / (1.0 + (-raw).exp())) as f32;
-        if s < PALM_SCORE_THRESHOLD {
+        if s < score_threshold {
             continue;
         }
         let off = i * 18;
@@ -2889,6 +2902,17 @@ fn run_hand_landmark(
     frame: &Array3<u8>,
     palm: &PalmBox,
 ) -> Result<Option<Hand>> {
+    let hand = run_hand_landmark_unthresholded(session, frame, palm)?;
+    Ok((hand.confidence >= HAND_CONF_THRESHOLD).then_some(hand))
+}
+
+/// `run_hand_landmark` から presence 閾値の判定だけを除いたもの(閾値未満の手も返す)。
+/// 診断(閾値で捨てられた手の観察)用に分離した。本番経路は `run_hand_landmark` 経由で従来と同じ。
+fn run_hand_landmark_unthresholded(
+    session: &mut Session,
+    frame: &Array3<u8>,
+    palm: &PalmBox,
+) -> Result<Hand> {
     let pre = preprocess_for_hand_landmark(frame, palm)?;
     let input_value = Value::from_array((pre.shape, pre.data))?;
     let outputs = session.run(ort::inputs!["input_1" => input_value])?;
@@ -2904,9 +2928,6 @@ fn run_hand_landmark(
     }
 
     let confidence = conf[0];
-    if confidence < HAND_CONF_THRESHOLD {
-        return Ok(None);
-    }
 
     let hand_score: f32 = handedness[0];
     // z はクロップ面内の深さ尺度なので回転不変。x,y は回転を含む逆アフィンで元画像へ戻す。
@@ -2927,11 +2948,11 @@ fn run_hand_landmark(
         landmarks.push(HandLandmarkPoint { x, y, z });
     }
 
-    Ok(Some(Hand {
+    Ok(Hand {
         confidence,
         handedness: hand_score,
         landmarks,
-    }))
+    })
 }
 
 // [TEST向き] パース処理。195→39×[x,y,z,vis,pres] のインデックスずれを検知(壊れても静かに誤る型)
